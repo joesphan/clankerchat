@@ -400,6 +400,7 @@ interface Job {
 interface RouteDecision {
   woke: string | null; // name of the live session that was messaged
   cwd: string | null; // inferred repo for a worker
+  confidence: "high" | "low"; // high = the task itself names the project
   reason: string;
 }
 
@@ -432,10 +433,10 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
     ``,
     `Steps:`,
     `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
-    `2. Otherwise pick "cwd" for a worker: the mapped path if given; else the single best-matching repo folder above, resolved to an absolute path; null only if nothing plausibly matches.`,
+    `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
     ``,
     `Reply with ONLY one line of JSON, no prose:`,
-    `{"woke": <session name or null>, "cwd": <absolute path or null>, "reason": "<=10 words"}`,
+    `{"woke": <session name or null>, "cwd": <absolute path or null>, "confidence": "high"|"low", "reason": "<=10 words"}`,
   ].join("\n");
 }
 
@@ -469,6 +470,7 @@ async function runRouter(job: Job, mappedCwd: string | null): Promise<RouteDecis
         typeof d.cwd === "string" && d.cwd && fs.existsSync(d.cwd)
           ? path.resolve(d.cwd)
           : null,
+      confidence: d.confidence === "high" ? "high" : "low",
       reason: typeof d.reason === "string" ? d.reason : "",
     };
   } catch {
@@ -691,12 +693,14 @@ async function dispatch(job: Job): Promise<void> {
     // Route: wake a live local session if one fits, else decide the worker's repo.
     let cwd = job.cwd;
     let woke: string | null = null;
+    let routeConfidence: "high" | "low" = "high"; // explicit mapping is always trusted
     if (!job.skipWake && (!cwd || config.wake)) {
       const decision = await runRouter(job, cwd);
       if (decision) {
         woke = decision.woke;
         if (!cwd && decision.cwd) cwd = decision.cwd;
-        log(`router: woke=${woke ?? "-"} cwd=${cwd ?? "-"} (${decision.reason})`);
+        routeConfidence = decision.confidence;
+        log(`router: woke=${woke ?? "-"} cwd=${cwd ?? "-"} conf=${routeConfidence} (${decision.reason})`);
       }
     }
 
@@ -734,7 +738,7 @@ async function dispatch(job: Job): Promise<void> {
       );
       return;
     }
-    if (!job.cwd && !sandboxed) rememberMapping(job.threadName, cwd);
+    if (!job.cwd && !sandboxed && routeConfidence === "high") rememberMapping(job.threadName, cwd);
 
     const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS];
     if (config.fullAuto) {

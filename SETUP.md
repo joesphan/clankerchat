@@ -235,9 +235,10 @@ clearly works on that project and is idle, it is woken with the question
 (it answers in the thread). Otherwise the message goes to a headless
 `claude -p` worker spawned in the repo for that thread — the mapped repo if
 `daemon.json` knows it, else inferred from the thread name/question against
-the folders under `reposRoot`. Successful inferences are written back to
-`daemon.json` (learned). Machine must have the `claude` CLI installed and
-logged in.
+the folders under `reposRoot`. Inferences the router marks high-confidence
+(the task itself names the project) are written back to `daemon.json`
+(learned); weaker matches route for that run only. Machine must have the
+`claude` CLI installed and logged in.
 
 1. Copy `daemon.example.json` to `daemon.json` in the project root.
 2. `allow` — the Discord user IDs permitted to trigger prompts. **This list is
