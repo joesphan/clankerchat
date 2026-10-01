@@ -98,6 +98,9 @@ interface DaemonConfig {
   wakeGraceMs: number;
   /** Folder holding this machine's repos — the inference search space. */
   reposRoot: string;
+  /** Neutral cwd for tasks routing can't place (no mapping, session match,
+   *  or repo match). Unset → unplaceable tasks are refused, as before. */
+  sandbox: string | null;
   /** Thread name (project slug) -> repo path. A HINT map: unmapped threads
    *  are routed by inference, and successful inferences land here. */
   threads: Record<string, string>;
@@ -185,6 +188,10 @@ function loadConfig(): DaemonConfig {
       typeof parsed.reposRoot === "string"
         ? path.resolve(parsed.reposRoot)
         : path.dirname(PROJECT_ROOT), // repo sits in the repos folder by default
+    sandbox:
+      typeof parsed.sandbox === "string" && fs.existsSync(parsed.sandbox)
+        ? path.resolve(parsed.sandbox)
+        : null,
     threads: threads as Record<string, string>,
   };
 }
@@ -532,11 +539,13 @@ async function checkFollowups(): Promise<void> {
   }
 }
 
-function buildWorkerPrompt(job: Job, cwd: string): string {
+function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   return [
     `You are the ${name} overseer worker, spawned because a human replied to this machine's bot in the "${job.threadName}" Discord thread.`,
-    `Work in this repo: ${cwd}`,
+    sandboxed
+      ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
+      : `Work in this repo: ${cwd}`,
     `When done — or if you cannot or should not do the task — reply in that thread by calling the MCP tool mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}". Keep the reply under 2000 chars; never paste secrets.`,
     `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
     ``,
@@ -701,12 +710,21 @@ async function dispatch(job: Job): Promise<void> {
       log(`done: "${job.threadName}" routed to live session "${woke}" (watchdog ${config.wakeGraceMs / 1000}s)`);
       return; // the watchdog spawns a worker if no answer lands in time
     }
+    let sandboxed = false;
     if (!cwd) {
-      await sendToThread(
-        job.threadId,
-        "overseer: could not tell which repo this thread is about — add it to daemon.json (SETUP.md Step 11) and reply again.",
-      );
-      return;
+      // Unplaceable (no mapping, session match, or repo match): run in the
+      // sandbox rather than refusing — but never learn a sandbox "mapping".
+      if (config.sandbox) {
+        cwd = config.sandbox;
+        sandboxed = true;
+        log(`routing could not place "${job.threadName}" — worker runs in sandbox ${cwd}`);
+      } else {
+        await sendToThread(
+          job.threadId,
+          "overseer: could not tell which repo this thread is about, and no sandbox is configured — add it to daemon.json (SETUP.md Step 11) and reply again.",
+        );
+        return;
+      }
     }
     if (!fs.existsSync(cwd)) {
       log(`routed path does not exist: ${cwd} (thread "${job.threadName}")`);
@@ -716,7 +734,7 @@ async function dispatch(job: Job): Promise<void> {
       );
       return;
     }
-    if (!job.cwd) rememberMapping(job.threadName, cwd);
+    if (!job.cwd && !sandboxed) rememberMapping(job.threadName, cwd);
 
     const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS];
     if (config.fullAuto) {
@@ -727,7 +745,7 @@ async function dispatch(job: Job): Promise<void> {
     const sessionId = state.sessions[job.threadName];
     if (sessionId) args.push("--resume", sessionId);
 
-    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd), config.timeoutMs);
+    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd, sandboxed), config.timeoutMs);
     const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
     if (sessionIdOut) {
       state.sessions[job.threadName] = sessionIdOut;

@@ -6,6 +6,7 @@
   "ack": true,
   "wake": true,
   "reposRoot": "C:\\Users\\<you>\\Documents\\GitHub",
+  "sandbox": "C:\\sandbox",
   "threads": {
     "clankerchat": "C:\\path\\to\\clankerchat"
   }

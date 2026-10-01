@@ -247,7 +247,9 @@ logged in.
    **Copy User ID**). Bots can never trigger, regardless of this list.
 3. `reposRoot` — the folder holding this machine's repos; the inference search
    space. `threads` — optional thread name → repo path hints (learned entries
-   land here too). Every thread is watched either way.
+   land here too). Every thread is watched either way. `sandbox` — neutral
+   directory for tasks routing can't place (no mapping, session, or repo
+   match); without it, unplaceable tasks are refused.
 4. `wake` — try to wake a matching live local session instead of spawning.
    The receiving session may ask its human to approve the wake message; set
    `false` to always spawn a worker instead.
