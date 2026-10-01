@@ -14,6 +14,15 @@
  *     intent toggles are needed in the developer portal.
  *
  * stdout is reserved for MCP JSON-RPC. All diagnostics go to stderr.
+ *
+ * Hardening (tyler-hardening branch): an instance runs LOCKED when
+ * CLANKER_ROLE=project. In that mode send/read accept only the thread IDs in
+ * CLANKER_ALLOWED_THREADS, `file_path` attachments must resolve (realpath,
+ * symlink-proof) inside CLANKER_FILE_ROOT ("none" disables attachments), and
+ * list_channels / list_threads / create_thread are refused. Unset role =
+ * upstream behavior, used by the orchestrator/bootstrap instance. Locks are
+ * read lazily from the real environment (per-instance `--env` flags), not
+ * .env, so a shared checkout can serve locked and unlocked instances at once.
  */
 
 import {
@@ -123,6 +132,78 @@ async function awaitReady(): Promise<Client<true>> {
 }
 
 // ---------------------------------------------------------------------------
+// Hardening locks — see header comment. Env is read lazily so per-instance
+// `--env` overrides apply regardless of when .env loading happens.
+// ---------------------------------------------------------------------------
+
+function projectMode(): boolean {
+  return process.env.CLANKER_ROLE?.trim().toLowerCase() === "project";
+}
+
+function allowedThreadIds(): string[] {
+  return (process.env.CLANKER_ALLOWED_THREADS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Project mode: only the pinned thread(s) may be sent to / read from. */
+function assertThreadAllowed(channelId: string): void {
+  if (!projectMode()) return;
+  const allowed = allowedThreadIds();
+  if (allowed.length === 0) {
+    throw new Error(
+      "clankerchat is locked (CLANKER_ROLE=project) but CLANKER_ALLOWED_THREADS is empty — refusing every target.",
+    );
+  }
+  if (!allowed.includes(channelId)) {
+    throw new Error(
+      `clankerchat is locked to thread(s) ${allowed.join(", ")} — channel ${channelId} is not permitted on this instance.`,
+    );
+  }
+}
+
+/** Project mode: refuse the discovery/creation tools outright. */
+function assertNotProjectMode(tool: string): void {
+  if (projectMode()) {
+    throw new Error(`${tool} is disabled on this clankerchat instance (CLANKER_ROLE=project).`);
+  }
+}
+
+/**
+ * Project mode: attachments must realpath inside CLANKER_FILE_ROOT ("none" =
+ * attachments disabled). Returns the realpath to attach. Unlocked instances
+ * keep the upstream behavior (any readable file).
+ */
+function resolveAttachment(file_path: string): { attachment: string; name: string } {
+  if (!projectMode()) {
+    const abs = path.resolve(file_path);
+    if (!fs.existsSync(abs)) {
+      throw new Error(`File not found: ${abs}`);
+    }
+    return { attachment: abs, name: path.basename(abs) };
+  }
+  const root = (process.env.CLANKER_FILE_ROOT ?? "").trim();
+  if (!root || root.toLowerCase() === "none") {
+    throw new Error("Attachments are disabled on this clankerchat instance.");
+  }
+  const rootReal = fs.realpathSync(root); // throws if the root itself is bogus
+  const abs = path.resolve(file_path);
+  let real: string;
+  try {
+    real = fs.realpathSync(abs); // follows symlinks — closes ../ and link escapes
+  } catch {
+    throw new Error(`File not found: ${abs}`);
+  }
+  if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+    throw new Error(
+      `Attachments must live inside ${rootReal} on this instance (resolved: ${real}).`,
+    );
+  }
+  return { attachment: real, name: path.basename(real) };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -221,15 +302,26 @@ async function findThreadByName(name: string): Promise<ThreadChannel> {
 
 /**
  * Target resolution for send/read: explicit channel_id > thread_name lookup >
- * CLANKER_THREAD_ID default.
+ * CLANKER_THREAD_ID default. Locked instances (CLANKER_ROLE=project) are
+ * checked here — the single funnel — and explicit channel IDs are rejected
+ * before any Discord call is made.
  */
 async function resolveTargetChannel(
   channelId: string | undefined,
   threadName: string | undefined,
 ): Promise<ChatChannel> {
-  if (channelId) return getChatChannel(channelId);
-  if (threadName) return findThreadByName(threadName);
-  return getChatChannel(resolveChannelId(undefined, "CLANKER_THREAD_ID", "channel_id or thread_name"));
+  if (channelId) {
+    assertThreadAllowed(channelId); // fail fast, before any Discord fetch
+    return getChatChannel(channelId);
+  }
+  if (threadName) {
+    const thread = await findThreadByName(threadName);
+    assertThreadAllowed(thread.id);
+    return thread;
+  }
+  const id = resolveChannelId(undefined, "CLANKER_THREAD_ID", "channel_id or thread_name");
+  assertThreadAllowed(id);
+  return getChatChannel(id);
 }
 
 const SENDER_PREFIX = /^\*\*(.+?)\*\*: ?/;
@@ -320,11 +412,7 @@ function registerTools(server: McpServer): void {
         }
         let attachment: { attachment: string; name: string } | undefined;
         if (file_path) {
-          const abs = path.resolve(file_path);
-          if (!fs.existsSync(abs)) {
-            throw new Error(`File not found: ${abs}`);
-          }
-          attachment = { attachment: abs, name: path.basename(abs) };
+          attachment = resolveAttachment(file_path);
         }
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const id = channel.id;
@@ -435,6 +523,7 @@ function registerTools(server: McpServer): void {
     },
     ({ name, channel_id, message }) =>
       guard(async () => {
+        assertNotProjectMode("create_thread");
         const parentId = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         const parent = await getChatChannel(parentId);
         if (parent instanceof ThreadChannel) {
@@ -487,6 +576,7 @@ function registerTools(server: McpServer): void {
     },
     () =>
       guard(async () => {
+        assertNotProjectMode("list_channels");
         const me = await awaitReady();
         return {
           bot: { username: me.user.username, id: me.user.id },
@@ -524,6 +614,7 @@ function registerTools(server: McpServer): void {
     },
     ({ channel_id }) =>
       guard(async () => {
+        assertNotProjectMode("list_threads");
         const id = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         const channel = await getChatChannel(id);
         if (channel instanceof ThreadChannel) {
