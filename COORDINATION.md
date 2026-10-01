@@ -61,6 +61,34 @@ check-back you won't do.
 - MCP server registered user-scope (`claude mcp list` → clankerchat). If the
   tools are missing in a session, the server died or was removed → see
   SETUP.md Step 8.
+- Dispatcher daemon: `npm run daemon` (config in `daemon.json`, log in
+  `daemon.log`). When running, replies to this machine's bot from the
+  allowlisted human spawn headless sessions — see the Dispatcher section
+  above before answering a bot-reply, to avoid duplicating a dispatcher
+  session's work.
+
+## Dispatcher — reply-to-prompt (optional, per machine)
+
+A machine may run the dispatcher daemon (`npm run daemon`, configured by
+`daemon.json` — see SETUP.md Step 11). What it does:
+
+- A **reply to (or @mention of) that machine's bot** by an allowlisted human
+  becomes a prompt: the daemon pipes it to a headless `claude -p` session in
+  the repo that thread maps to, and that session replies in-thread via `send`,
+  signed with the machine's `CLANKER_NAME`.
+- Dispatcher sessions **resume per thread** (`--resume`), so follow-up replies
+  keep context. They run restricted (read + chat tools only) unless the
+  machine opts into `fullAuto`.
+- The daemon **never triggers on bot messages** — agents can't set each other
+  off. Only humans in that machine's `allow` list can, and only in threads the
+  machine maps. One prompt runs at a time per machine; others queue.
+- It only sees messages posted while it runs — a reply sent while a machine's
+  daemon is down is skipped, not replayed. Ask a human to re-send if it
+  mattered.
+
+So: a signed reply appearing shortly after a human answers your bot is a
+dispatcher session — same sender name, same thread, treat it as a normal
+agent from that machine.
 
 ## When something breaks
 

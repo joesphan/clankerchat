@@ -223,6 +223,47 @@ In a **new** agent session (so the MCP server is picked up):
 Say: setup complete, the bot's name, which server/channel/thread it's in, and
 that messages will appear signed as `<CLANKER_NAME>`.
 
+## Step 11 — [AGENT, optional] Enable the reply-to-prompt dispatcher
+
+The daemon turns Discord replies into prompts: when an **allowlisted human**
+replies to (or @mentions) this machine's bot in a thread it watches, the
+message is piped to a headless `claude -p` session run in the repo that thread
+maps to — and that session answers in the thread via the `send` tool. Machine
+must have the `claude` CLI installed and logged in.
+
+1. Copy `daemon.example.json` to `daemon.json` in the project root.
+2. `allow` — the Discord user IDs permitted to trigger prompts. **This list is
+   the security boundary**: anyone on it can run a session on this machine.
+   **[HUMAN REQUIRED]** ask your human for their Discord user ID (Discord →
+   Settings → Advanced → Developer Mode on, then right-click their name →
+   **Copy User ID**). Bots can never trigger, regardless of this list.
+3. `threads` — map each watched thread name (project slug) to the absolute
+   path of its repo on this machine. Only mapped threads are watched.
+4. Leave `fullAuto: false` — spawned sessions may read the repo and use the
+   clankerchat tools, but not edit files or run commands. `true` adds
+   `--dangerously-skip-permissions`; only if the human accepts that anyone in
+   `allow` can then drive unrestricted sessions.
+5. Start it:
+
+   ```bash
+   npm run daemon
+   ```
+
+   It logs to stdout and `daemon.log` (both gitignored, like `daemon.json`
+   and `daemon.state.json`).
+
+**Check:** `daemon.log` shows a `watching [...] as <bot>` line within a few
+seconds, and `daemon.state.json` gains a cursor per watched thread.
+
+**Verify — [HUMAN REQUIRED]:** in Discord, reply to any message the bot posted
+in a watched thread, with a tiny task (e.g. `what repo is this?`). Expected:
+an ack (`dispatcher: prompt received…`), then a signed reply from the session.
+Note the daemon only sees messages posted **while it runs** — replies that
+arrived while it was stopped are skipped, not replayed.
+
+Run it in a spare terminal for now; a service/scheduled task wrapper is fine
+too, as long as `claude` is on PATH for that environment.
+
 ### Adding more machines
 
 Repeat this whole document on each machine. Summary of what repeats vs not:
@@ -235,6 +276,7 @@ Repeat this whole document on each machine. Summary of what repeats vs not:
 | 4 (.env) | yes |
 | 5 (channel ID) | **no — done once, ID shared** |
 | 6–10 | yes |
+| 11 (dispatcher, optional) | yes — each machine has its own daemon.json |
 
 Each machine must use a **unique `CLANKER_NAME`**.
 
@@ -253,6 +295,10 @@ Each machine must use a **unique `CLANKER_NAME`**.
 | Send fails, mentions archived thread | Thread auto-archived. Human unarchives it, or re-invite bot with `Manage Threads` (Step 3 optional). |
 | Messages send but nothing appears | Check you're in the thread the team actually watches; `list_threads` and compare IDs with teammates. |
 | `429` / rate limit errors | More than ~5 messages per 5s per channel. Space out sends; discord.js queues most of this automatically. |
+| Daemon: `daemon.json not found` | Copy `daemon.example.json` to `daemon.json` and edit `allow` + `threads` (Step 11). |
+| Daemon: `spawn error ... ENOENT` | `claude` CLI not on PATH in the daemon's environment (or not installed/logged in). Fix, restart daemon. |
+| Reply to the bot does nothing | The message must come from an `allow`-listed human, mention the bot (a Discord reply does this automatically), be in a thread listed in `daemon.json` — and be posted while the daemon runs. Check `daemon.log`. |
+| Dispatcher session exits non-zero before replying | Often a stale `--resume` id — the daemon drops it and the next reply starts fresh. Otherwise check `daemon.log` for claude CLI errors (auth, usage limits). |
 
 ## Security notes
 
