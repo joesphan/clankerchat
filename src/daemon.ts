@@ -16,10 +16,12 @@
  *     Everything else is ignored; agents keep polling as usual.
  *   - A triggered message goes to a ROUTING stage: a small headless session
  *     with ListAgents/SendMessage that either wakes a matching live LOCAL
- *     session (which then answers in-thread) or picks the repo a worker
- *     should run in — the daemon.json `threads` map first, else inference
- *     over the folders under `reposRoot`. Successful inferences are written
- *     back to daemon.json (learned). Set "wake": false to always spawn.
+ *     session or picks the repo a worker should run in — the daemon.json
+ *     `threads` map first, else inference over the folders under `reposRoot`.
+ *     Successful inferences are written back to daemon.json (learned). A wake
+ *     is only trusted if an answer lands in the thread within `wakeGraceMs`;
+ *     otherwise the daemon spawns a worker fallback — an answer always lands.
+ *     Set "wake": false to always spawn.
  *   - A worker is `claude -p` with the message piped on stdin, run in the
  *     routed repo; it answers by calling the clankerchat MCP `send` tool
  *     itself — the daemon never parses or relays model output.
@@ -87,6 +89,9 @@ interface DaemonConfig {
   /** Try to wake a matching live local session before spawning a worker.
    *  The receiving session may ask its human to approve the wake message. */
   wake: boolean;
+  /** How long a woken session has to answer in-thread before the daemon
+   *  spawns a worker fallback, ms. */
+  wakeGraceMs: number;
   /** Folder holding this machine's repos — the inference search space. */
   reposRoot: string;
   /** Thread name (project slug) -> repo path. A HINT map: unmapped threads
@@ -164,6 +169,8 @@ function loadConfig(): DaemonConfig {
     fullAuto: parsed.fullAuto === true,
     ack: parsed.ack !== false,
     wake: parsed.wake !== false,
+    wakeGraceMs:
+      typeof parsed.wakeGraceMs === "number" ? Math.max(60_000, parsed.wakeGraceMs) : 4 * 60_000,
     reposRoot:
       typeof parsed.reposRoot === "string"
         ? path.resolve(parsed.reposRoot)
@@ -252,14 +259,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-async function sendToThread(threadId: string, message: string): Promise<void> {
+async function sendToThread(threadId: string, message: string): Promise<string | null> {
   try {
     const channel = await client.channels.fetch(threadId, { cache: false });
-    if (!(channel instanceof ThreadChannel)) return;
+    if (!(channel instanceof ThreadChannel)) return null;
     if (channel.archived) await channel.setArchived(false).catch(() => {});
-    await channel.send(withSender(process.env.CLANKER_NAME, message));
+    const sent = await channel.send(withSender(process.env.CLANKER_NAME, message));
+    return sent.id;
   } catch (err) {
     log(`ack send failed in ${threadId}: ${errText(err)}`);
+    return null;
   }
 }
 
@@ -361,6 +370,8 @@ interface Job {
   cwd: string | null; // repo path from daemon.json, if the thread is mapped
   prompt: string; // mention-stripped message text
   from: string; // Discord username of the triggering human
+  triggerId: string; // id of the Discord message that triggered this job
+  skipWake?: boolean; // fallback run: route cwd only, never wake
 }
 
 interface RouteDecision {
@@ -465,6 +476,46 @@ const queue: Job[] = [];
 let running = false;
 let currentChild: ReturnType<typeof spawn> | null = null;
 
+// ---------------------------------------------------------------------------
+// Wake watchdog — a routed wake only counts if an answer lands in the thread
+// ---------------------------------------------------------------------------
+
+interface FollowUp {
+  job: Job;
+  ackId: string; // ack (or trigger) id; any bot message newer than this = answered
+  deadline: number;
+  routedCwd: string | null; // repo the router picked, reused by the fallback
+}
+
+const pendingFollowups: FollowUp[] = [];
+
+async function checkFollowups(): Promise<void> {
+  for (let i = pendingFollowups.length - 1; i >= 0; i--) {
+    const f = pendingFollowups[i];
+    try {
+      const channel = await client.channels.fetch(f.job.threadId, { cache: false });
+      if (channel instanceof ThreadChannel) {
+        const fetched = await channel.messages.fetch({ limit: 25, after: f.ackId, cache: false });
+        const answered = [...fetched.values()].some(
+          (m) => m.author.id === client.user?.id && BigInt(m.id) > BigInt(f.ackId),
+        );
+        if (answered) {
+          pendingFollowups.splice(i, 1);
+          log(`wake follow-up: live session answered in "${f.job.threadName}"`);
+          continue;
+        }
+      }
+    } catch (err) {
+      log(`wake follow-up check failed in "${f.job.threadName}": ${errText(err)}`);
+    }
+    if (Date.now() >= f.deadline) {
+      pendingFollowups.splice(i, 1);
+      log(`wake follow-up: no answer in "${f.job.threadName}" after ${config.wakeGraceMs}ms — spawning worker fallback`);
+      enqueue({ ...f.job, cwd: f.routedCwd ?? f.job.cwd, skipWake: true });
+    }
+  }
+}
+
 function buildWorkerPrompt(job: Job, cwd: string): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   return [
@@ -482,17 +533,17 @@ async function dispatch(job: Job): Promise<void> {
   running = true;
   log(`dispatch: "${job.threadName}" (prompt from ${job.from})`);
   try {
-    if (config.ack) {
-      await sendToThread(
-        job.threadId,
-        "overseer: prompt received — routing it; the answer lands in this thread.",
-      );
-    }
+    const ackId = config.ack
+      ? await sendToThread(
+          job.threadId,
+          "overseer: prompt received — routing it; the answer lands in this thread.",
+        )
+      : null;
 
     // Route: wake a live local session if one fits, else decide the worker's repo.
     let cwd = job.cwd;
     let woke: string | null = null;
-    if (!cwd || config.wake) {
+    if (!job.skipWake && (!cwd || config.wake)) {
       const decision = await runRouter(job, cwd);
       if (decision) {
         woke = decision.woke;
@@ -502,8 +553,14 @@ async function dispatch(job: Job): Promise<void> {
     }
 
     if (woke) {
-      log(`done: "${job.threadName}" routed to live session "${woke}"`);
-      return; // the woken session answers in-thread
+      pendingFollowups.push({
+        job,
+        ackId: ackId ?? job.triggerId,
+        deadline: Date.now() + config.wakeGraceMs,
+        routedCwd: cwd,
+      });
+      log(`done: "${job.threadName}" routed to live session "${woke}" (watchdog ${config.wakeGraceMs / 1000}s)`);
+      return; // the watchdog spawns a worker if no answer lands in time
     }
     if (!cwd) {
       await sendToThread(
@@ -618,6 +675,7 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
         cwd: mapped,
         prompt,
         from: m.author.username,
+        triggerId: m.id,
       });
     }
     if (messages.length > 0) {
@@ -659,6 +717,11 @@ async function main(): Promise<void> {
       await pollOnce(parent, me.user);
     } catch (err) {
       log(`poll error: ${errText(err)}`);
+    }
+    try {
+      await checkFollowups();
+    } catch (err) {
+      log(`follow-up error: ${errText(err)}`);
     }
     try {
       await drain();
