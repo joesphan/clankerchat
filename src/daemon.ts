@@ -636,7 +636,7 @@ async function metaSession(job: Job, question: string): Promise<void> {
   ].join("\n");
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   const prompt = [
-    `You ARE the overseer itself on machine ${name} — the daemon behind clankerchat's reply-to-prompt system (repo: ${PROJECT_ROOT}). A human tagged you directly with a meta question about you/your machinery. This is NOT a project task — do not route it, do not work on any repo; answer about yourself.`,
+    `You ARE the overseer itself on machine ${name} — the daemon behind clankerchat's reply-to-prompt system (repo: ${PROJECT_ROOT}). A human tagged you directly with a meta question about you/your machinery. This is NOT a project task — do not route it, do not work on any repo; answer about yourself. Answer ONLY from the facts provided below — do not explore the filesystem, repos, or processes; if the facts don't cover it, say so plainly.`,
     ``,
     facts,
     ``,
@@ -646,8 +646,11 @@ async function metaSession(job: Job, question: string): Promise<void> {
     `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", under 2000 chars, starting with "overseer meta:". Never paste secrets.`,
   ].join("\n");
   const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS, "--permission-mode", "default"];
-  const run = await runClaude(args, PROJECT_ROOT, prompt, ROUTER_TIMEOUT_MS + 60_000);
-  log(`meta done: exit ${run.code}`);
+  const run = await runClaude(args, PROJECT_ROOT, prompt, config.timeoutMs);
+  const { result } = parseSessionResult(run.stdout);
+  log(
+    `meta done: exit ${run.code}${result ? ` — ${result.slice(0, 200)}` : run.stderr ? ` — stderr: ${run.stderr.slice(0, 200)}` : ""}`,
+  );
   if (run.code !== 0) {
     await sendToThread(job.threadId, `overseer meta: session exited ${run.code} before replying — see daemon.log.`);
   }
