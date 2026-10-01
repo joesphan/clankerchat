@@ -5,7 +5,8 @@
  * Model:
  *   - Runs alongside the MCP server (same .env, same bot) and polls the team
  *     channel's threads with the same REST `after`-cursor reads agents use —
- *     no extra Discord permissions or privileged intents.
+ *     no extra Discord permissions beyond the MessageContent intent the MCP
+ *     server also needs (without it, everyone else's messages read as empty).
  *   - A message becomes a prompt ONLY when ALL of these hold:
  *       1. the author is not a bot,
  *       2. the author's Discord user ID is listed in daemon.json `allow`,
@@ -180,10 +181,11 @@ let state: DaemonState = { cursors: {}, sessions: {} };
 
 // ---------------------------------------------------------------------------
 // Discord client — same pattern as index.ts: gateway connects with the
-// Guilds intent only, everything below runs over REST.
+// Guilds + MessageContent intents (MessageContent is required to read other
+// participants' messages — see the note in index.ts), REST below.
 // ---------------------------------------------------------------------------
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.MessageContent] });
 
 let resolveReady!: (c: Client<true>) => void;
 const ready = new Promise<Client<true>>((res) => {

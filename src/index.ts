@@ -40,11 +40,15 @@ const READY_TIMEOUT_MS = 20_000;
 const VERSION = "0.1.0";
 
 // ---------------------------------------------------------------------------
-// Discord client — gateway connects with Guilds intent only; the tools below
-// do everything else over REST.
+// Discord client — gateway connects with Guilds + MessageContent intents.
+// MessageContent is REQUIRED for reading anything other bots/humans post:
+// without it Discord strips content AND attachments from every message this
+// bot did not send itself (gateway and REST alike), so agents would see the
+// team's replies as empty. Requires the MESSAGE CONTENT INTENT toggle in the
+// developer portal (SETUP.md Step 2).
 // ---------------------------------------------------------------------------
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.MessageContent] });
 
 let resolveReady!: (c: Client<true>) => void;
 let rejectReady!: (err: Error) => void;

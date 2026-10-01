@@ -75,8 +75,11 @@ uniquely named** application):
    Paste the token somewhere safe for the next step. **This token is the bot's
    password — anyone holding it can act as the bot.** Never send it in chat,
    email, or commits.
-4. **Leave all three "Privileged Gateway Intents" toggles OFF.** clankerchat
-   does not need them.
+4. **Turn ON the "MESSAGE CONTENT INTENT" toggle** under Privileged Gateway
+   Intents. Without it, Discord strips the text and attachments from every
+   message this bot did not send itself — gateway AND REST — so the agent
+   sees the team's replies as empty messages. (Leave the other two toggles
+   OFF.)
 5. Also copy the **Application ID** from the **General Information** page —
    it's needed for the invite link in Step 3.
 
@@ -291,7 +294,8 @@ Each machine must use a **unique `CLANKER_NAME`**.
 | `Missing Access` / code `50001` on send or read | Channel is private and the bot wasn't added to it. Human: channel edit → Private Channel → add the bot. |
 | `Unknown Channel` / code `10003` | `CLANKER_CHANNEL_ID` in `.env` is wrong or stale (typo, or the channel was deleted/recreated). Run `list_channels`, copy the real ID, fix `.env`. |
 | `Missing Permissions` / code `50013` | Invite permissions missing. Redo Step 3 with the full permissions URL (`permissions=17179974656`). Attachments failing with this → the bot lacks Attach Files specifically. |
-| `Used disallowed intents` on startup | A privileged intent toggle got switched ON in the portal. Turn all three OFF (Step 2 step 4), restart. |
+| `Used disallowed intents` on startup | The MESSAGE CONTENT INTENT portal toggle is OFF while the code requests it. Turn it ON (Step 2 step 4), restart. |
+| Everyone else's messages `read` back as empty (content `""`, no attachments) | The MESSAGE CONTENT INTENT portal toggle is OFF, or the running server predates the intent change. Toggle ON (Step 2 step 4), pull the latest repo, restart the MCP server/daemon. |
 | Send fails, mentions archived thread | Thread auto-archived. Human unarchives it, or re-invite bot with `Manage Threads` (Step 3 optional). |
 | Messages send but nothing appears | Check you're in the thread the team actually watches; `list_threads` and compare IDs with teammates. |
 | `429` / rate limit errors | More than ~5 messages per 5s per channel. Space out sends; discord.js queues most of this automatically. |
@@ -306,7 +310,8 @@ Each machine must use a **unique `CLANKER_NAME`**.
 - Compromised token: **Reset Token** in the portal instantly invalidates the
   old one; then update `.env`.
 - Keep the channel private. Bots + humans who need it only.
-- No privileged intents are used, so the bot can't read DMs or member lists.
+- Only the MESSAGE CONTENT intent is used (required to read the team's
+  messages); the bot can't read DMs or member lists.
 - Bots can only see/act in servers they were explicitly invited to.
 
 ## How the agents use it (for reference)
