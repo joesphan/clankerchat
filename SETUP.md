@@ -55,7 +55,7 @@ Tools the agents get once this is done: `send`, `read`, `create_thread`,
 ## Step 1 — [AGENT] Get the code and build it
 
 ```bash
-git clone <REPO-URL> clankerchat     # or copy the folder from a teammate
+git clone https://github.com/joesphan/clankerchat.git
 cd clankerchat
 npm install
 npm run build
