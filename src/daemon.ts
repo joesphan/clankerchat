@@ -51,6 +51,10 @@ import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 
 const READY_TIMEOUT_MS = 20_000;
+const START_ISO = new Date().toISOString();
+/** Meta tag: a trigger starting with one of these addresses the overseer
+ *  itself (status/config/questions), never the task router. */
+const META_PREFIX_RE = /^(?:!ov\b|!overseer\b|overseer:)\s*/i;
 const FETCH_LIMIT = 50; // messages per poll per thread (Discord caps at 100)
 const MAX_QUEUE = 8; // prompts waiting while one is running
 const MAX_STDOUT = 256 * 1024; // captured from a spawned session, for logging
@@ -282,6 +286,12 @@ function isTrigger(m: Message, botUser: User): boolean {
 /** Drops the bot mention(s) so the remainder is the actual prompt text. */
 function stripMention(content: string, botId: string): string {
   return content.replace(new RegExp(`<@!?${botId}>\\s*`, "g"), "").trim();
+}
+
+/** Returns the meta payload if the prompt is tagged for the overseer itself. */
+function splitMeta(prompt: string): string | null {
+  const m = META_PREFIX_RE.exec(prompt);
+  return m ? prompt.slice(m[0].length).trim() : null;
 }
 
 function mappedCwdFor(threadName: string): string | null {
@@ -529,10 +539,130 @@ function buildWorkerPrompt(job: Job, cwd: string): string {
   ].join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Meta channel — "!ov ..." addresses the overseer itself, never the router
+// ---------------------------------------------------------------------------
+
+async function handleMeta(job: Job, rest: string): Promise<void> {
+  const [cmd, ...args] = rest.split(/\s+/);
+  const arg = args.join(" ").trim();
+  switch ((cmd ?? "").toLowerCase()) {
+    case "":
+    case "help":
+      await sendToThread(
+        job.threadId,
+        "overseer meta — tag a reply with `!ov` to talk to me directly:\n" +
+          "• `!ov status` — what I'm watching, queue, wake settings, saved worker sessions\n" +
+          "• `!ov forget` — drop this thread's saved worker context (next task starts fresh)\n" +
+          "• `!ov map [path]` — show (or set) this thread's repo mapping\n" +
+          "• `!ov reload` — re-read daemon.json without a restart\n" +
+          "• `!ov <anything else>` — ask me; I answer from my own state + log\n" +
+          "Anything untagged is routed as a task, as before.",
+      );
+      return;
+    case "status": {
+      const mapped =
+        Object.entries(config.threads)
+          .map(([n, p]) => `${n} → ${p}`)
+          .join("; ") || "(none)";
+      await sendToThread(
+        job.threadId,
+        `overseer status — ${client.user?.username ?? "?"}, up since ${START_ISO}\n` +
+          `watching every team thread; mapped: ${mapped}\n` +
+          `wake=${config.wake} (grace ${config.wakeGraceMs / 1000}s), fullAuto=${config.fullAuto}, poll=${config.pollMs}ms, reposRoot=${config.reposRoot}\n` +
+          `queue=${queue.length}, busy=${running}, wake-checks pending=${pendingFollowups.length}\n` +
+          `worker sessions: ${Object.entries(state.sessions).map(([n, id]) => `${n}: ${id.slice(0, 8)}`).join(", ") || "(none yet)"}`,
+      );
+      return;
+    }
+    case "forget":
+      delete state.sessions[job.threadName];
+      saveState();
+      await sendToThread(
+        job.threadId,
+        `overseer: dropped the saved worker context for "${job.threadName}" — the next task in this thread starts fresh.`,
+      );
+      return;
+    case "map": {
+      if (!arg) {
+        await sendToThread(
+          job.threadId,
+          `overseer: "${job.threadName}" → ${mappedCwdFor(job.threadName) ?? "(unmapped — inference decides)"}`,
+        );
+        return;
+      }
+      const abs = path.resolve(arg);
+      if (!fs.existsSync(abs)) {
+        await sendToThread(job.threadId, `overseer: \`${abs}\` does not exist — mapping unchanged.`);
+        return;
+      }
+      rememberMapping(job.threadName, abs);
+      await sendToThread(job.threadId, `overseer: mapped "${job.threadName}" → ${abs}`);
+      return;
+    }
+    case "reload":
+      try {
+        config = loadConfig();
+        await sendToThread(
+          job.threadId,
+          `overseer: reloaded daemon.json — mapped=[${Object.keys(config.threads).join(", ")}], wake=${config.wake}, grace=${config.wakeGraceMs / 1000}s`,
+        );
+      } catch (err) {
+        await sendToThread(job.threadId, `overseer: reload refused — ${errText(err)} (config unchanged).`);
+      }
+      return;
+    default:
+      await metaSession(job, rest);
+      return;
+  }
+}
+
+/** Free-form meta question → a small session that IS the overseer, answering
+ *  from its own config, queue state, and recent daemon.log. */
+async function metaSession(job: Job, question: string): Promise<void> {
+  await sendToThread(job.threadId, "overseer meta: on it — answering from my own state.");
+  let logTail = "";
+  try {
+    logTail = fs.readFileSync(LOG_FILE, "utf8").split(/\r?\n/).slice(-60).join("\n");
+  } catch {
+    // no log yet — fine
+  }
+  const { allow: _allow, ...configSansIds } = config;
+  const facts = [
+    `config: ${JSON.stringify(configSansIds)}`,
+    `queue=${queue.length}, busy=${running}, wake-checks pending=${pendingFollowups.length}`,
+    `worker sessions: ${JSON.stringify(state.sessions)}`,
+    `recent daemon.log tail:\n${logTail}`,
+  ].join("\n");
+  const name = process.env.CLANKER_NAME ?? "clankerchat";
+  const prompt = [
+    `You ARE the overseer itself on machine ${name} — the daemon behind clankerchat's reply-to-prompt system (repo: ${PROJECT_ROOT}). A human tagged you directly with a meta question about you/your machinery. This is NOT a project task — do not route it, do not work on any repo; answer about yourself.`,
+    ``,
+    facts,
+    ``,
+    `--- meta question from ${job.from} ---`,
+    question,
+    ``,
+    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", under 2000 chars, starting with "overseer meta:". Never paste secrets.`,
+  ].join("\n");
+  const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS, "--permission-mode", "default"];
+  const run = await runClaude(args, PROJECT_ROOT, prompt, ROUTER_TIMEOUT_MS + 60_000);
+  log(`meta done: exit ${run.code}`);
+  if (run.code !== 0) {
+    await sendToThread(job.threadId, `overseer meta: session exited ${run.code} before replying — see daemon.log.`);
+  }
+}
+
 async function dispatch(job: Job): Promise<void> {
   running = true;
   log(`dispatch: "${job.threadName}" (prompt from ${job.from})`);
   try {
+    const metaRest = splitMeta(job.prompt);
+    if (metaRest !== null) {
+      log(`meta: ${metaRest.slice(0, 80)}`);
+      await handleMeta(job, metaRest);
+      return;
+    }
     const ackId = config.ack
       ? await sendToThread(
           job.threadId,

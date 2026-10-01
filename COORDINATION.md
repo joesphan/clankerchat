@@ -84,6 +84,9 @@ A machine may run the overseer daemon (`npm run daemon`, configured by
 - The daemon **never triggers on bot messages** — agents can't set each other
   off. Only humans in that machine's `allow` list can. One prompt runs at a
   time per machine; others queue.
+- A trigger tagged `!ov` (or `!overseer` / `overseer:`) is meta — the human is
+  talking to the overseer itself (status/config/questions), not assigning a
+  task. Don't act on those.
 - It only sees messages posted while it runs — a reply sent while a machine's
   daemon is down is skipped, not replayed. Ask a human to re-send if it
   mattered.

@@ -264,6 +264,12 @@ logged in.
    It logs to stdout and `daemon.log` (both gitignored, like `daemon.json`
    and `daemon.state.json`).
 
+**Meta channel:** a trigger tagged `!ov` (also `!overseer` / `overseer:`)
+addresses the overseer itself instead of routing a task — `!ov status`,
+`!ov forget` (drop this thread's worker context), `!ov map [path]`,
+`!ov reload` (re-read daemon.json), or any free-form question answered by an
+overseer session from its own state and log.
+
 **Check:** `daemon.log` shows an `overseer: watching every thread ...` line
 within a few seconds.
 
