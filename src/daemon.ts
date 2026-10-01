@@ -129,6 +129,12 @@ function log(line: string): void {
   }
 }
 
+/** One log line per event — result excerpts must not splinter across lines
+ *  (splinters would false-positive error greps). */
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
 function loadConfig(): DaemonConfig {
   let raw: string;
   try {
@@ -649,7 +655,7 @@ async function metaSession(job: Job, question: string): Promise<void> {
   const run = await runClaude(args, PROJECT_ROOT, prompt, config.timeoutMs);
   const { result } = parseSessionResult(run.stdout);
   log(
-    `meta done: exit ${run.code}${result ? ` — ${result.slice(0, 200)}` : run.stderr ? ` — stderr: ${run.stderr.slice(0, 200)}` : ""}`,
+    `meta done: exit ${run.code}${result ? ` — ${oneLine(result).slice(0, 200)}` : run.stderr ? ` — stderr: ${oneLine(run.stderr).slice(0, 200)}` : ""}`,
   );
   if (run.code !== 0) {
     await sendToThread(job.threadId, `overseer meta: session exited ${run.code} before replying — see daemon.log.`);
@@ -728,7 +734,7 @@ async function dispatch(job: Job): Promise<void> {
       saveState();
     }
     log(
-      `done: "${job.threadName}" exit ${run.code}${result ? ` — ${result.slice(0, 200)}` : run.stderr ? ` — stderr: ${run.stderr.slice(0, 200)}` : ""}`,
+      `done: "${job.threadName}" exit ${run.code}${result ? ` — ${oneLine(result).slice(0, 200)}` : run.stderr ? ` — stderr: ${oneLine(run.stderr).slice(0, 200)}` : ""}`,
     );
 
     if (run.code !== 0) {
