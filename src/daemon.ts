@@ -288,6 +288,7 @@ function buildPrompt(job: Job): string {
     `You are the ${name} dispatcher session, spawned because a human replied to this machine's bot in the "${job.threadName}" Discord thread.`,
     `Work in this repo: ${job.cwd}`,
     `When done — or if you cannot or should not do the task — reply in that thread by calling the MCP tool mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}". Keep the reply under 2000 chars; never paste secrets.`,
+    `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
     ``,
     `--- task from Discord user ${job.from} ---`,
     job.prompt,
