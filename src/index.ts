@@ -17,12 +17,15 @@
  *
  * Hardening (tyler-hardening branch): an instance runs LOCKED when
  * CLANKER_ROLE=project. In that mode send/read accept only the thread IDs in
- * CLANKER_ALLOWED_THREADS, `file_path` attachments must resolve (realpath,
- * symlink-proof) inside CLANKER_FILE_ROOT ("none" disables attachments), and
- * list_channels / list_threads / create_thread are refused. Unset role =
+ * CLANKER_ALLOWED_THREADS (which must resolve to THREADS — a plain channel
+ * ID in the allowlist fails closed), `file_path` attachments must resolve
+ * (realpath, symlink-proof) inside CLANKER_FILE_ROOT ("none" disables
+ * attachments), and list_channels / list_threads / create_thread are
+ * refused. Unset role =
  * upstream behavior, used by the orchestrator/bootstrap instance. Locks are
  * read lazily from the real environment (per-instance `--env` flags), not
- * .env, so a shared checkout can serve locked and unlocked instances at once.
+ * .env (main() actively undoes any hardening values loadEnvFile injected),
+ * so a shared checkout can serve locked and unlocked instances at once.
  */
 
 import {
@@ -312,7 +315,7 @@ async function resolveTargetChannel(
 ): Promise<ChatChannel> {
   if (channelId) {
     assertThreadAllowed(channelId); // fail fast, before any Discord fetch
-    return getChatChannel(channelId);
+    return getFetchedThreadAllowed(channelId);
   }
   if (threadName) {
     const thread = await findThreadByName(threadName);
@@ -321,7 +324,25 @@ async function resolveTargetChannel(
   }
   const id = resolveChannelId(undefined, "CLANKER_THREAD_ID", "channel_id or thread_name");
   assertThreadAllowed(id);
-  return getChatChannel(id);
+  return getFetchedThreadAllowed(id);
+}
+
+/**
+ * Allowlist membership alone is not enough: the allowlist promises
+ * thread-only access, but getChatChannel() also accepts plain channels.
+ * If a non-thread channel ID lands in CLANKER_ALLOWED_THREADS, fail
+ * closed instead of enabling channel-level send/read.
+ */
+async function getFetchedThreadAllowed(channelId: string): Promise<ChatChannel> {
+  const channel = await getChatChannel(channelId);
+  if (projectMode() && !(channel instanceof ThreadChannel)) {
+    throw new Error(
+      `clankerchat project mode permits threads only, but ${channelId} resolved to a ` +
+        `non-thread channel (${ChannelType[channel.type] ?? String(channel.type)}) — refusing. ` +
+        "Remove it from CLANKER_ALLOWED_THREADS.",
+    );
+  }
+  return channel;
 }
 
 const SENDER_PREFIX = /^\*\*(.+?)\*\*: ?/;
@@ -646,7 +667,20 @@ function registerTools(server: McpServer): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Hardening keys must come from the LAUNCH environment (per-instance
+  // `--env`), never the shared .env: loadEnvFile() fills undefined/empty
+  // vars from .env, so a shared CLANKER_ROLE=project would silently lock
+  // every instance on the machine — including the orchestrator. Snapshot
+  // which keys the launch env actually defined, load .env, then undo any
+  // hardening values the loader injected.
+  const HARDENING_KEYS = ["CLANKER_ROLE", "CLANKER_ALLOWED_THREADS", "CLANKER_FILE_ROOT"];
+  const launchDefined = new Set(
+    HARDENING_KEYS.filter((k) => process.env[k] !== undefined && process.env[k] !== ""),
+  );
   loadEnvFile();
+  for (const k of HARDENING_KEYS) {
+    if (!launchDefined.has(k)) delete process.env[k];
+  }
   const token = process.env.DISCORD_TOKEN;
 
   const server = new McpServer({ name: "clankerchat", version: VERSION });

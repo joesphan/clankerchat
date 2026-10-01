@@ -25,6 +25,13 @@ function startServer(extraEnv) {
   const child = spawn(process.execPath, [SERVER], {
     env: {
       ...process.env,
+      // Sanitize hardening keys so they never leak from the test runner's
+      // environment — control cases must be genuinely unlocked unless
+      // extraEnv explicitly sets them (undefined values are omitted from
+      // the child env by node's spawn).
+      ...Object.fromEntries(
+        ["CLANKER_ROLE", "CLANKER_ALLOWED_THREADS", "CLANKER_FILE_ROOT"].map((k) => [k, undefined]),
+      ),
       DISCORD_TOKEN: "guards-test-dummy-token",
       ...extraEnv,
     },
@@ -141,10 +148,13 @@ test("attachment via .. escape is rejected", async () => {
   const r = await locked.call("send", {
     channel_id: ALLOWED,
     message: "x",
-    file_path: path.join(jail, "..", "escape.txt"),
+    // Points at a file that EXISTS outside the root — a containment-free
+    // implementation would find the file and send it, so only the jail
+    // error passes this test (not "File not found").
+    file_path: path.join(jail, "..", path.basename(outside), "secret.txt"),
   });
   assert.ok(r.isError);
-  assert.match(r.body.error, /must live inside|File not found/);
+  assert.match(r.body.error, /must live inside/);
 });
 
 test("attachment via symlink inside root pointing outside is rejected", async () => {
