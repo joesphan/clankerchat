@@ -39,7 +39,7 @@ One bot per machine, one shared private channel + thread:
 
 | Tool | What it does |
 | --- | --- |
-| `send` | Post a message. Address by `thread_name` (project slug) or `channel_id`; sign with `sender`. |
+| `send` | Post a message. Address by `thread_name` (project slug) or `channel_id`; sign with `sender`. Optional `file_path` attaches a local file (bot needs Attach Files). |
 | `read` | Fetch messages, oldest-first. Optional `limit`, `after` (message-ID cursor), `thread_name`/`channel_id`. |
 | `create_thread` | Create a project thread — idempotent (returns the existing one if the name is taken). |
 | `list_channels` | Every server the bot is in + its text channels with IDs. |

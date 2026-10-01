@@ -302,14 +302,29 @@ function registerTools(server: McpServer): void {
           .describe(
             "Identity of the sending agent (e.g. 'joes-desktop'). Defaults to CLANKER_NAME from .env.",
           ),
+        file_path: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Optional local file to attach (path). Requires the bot to have Attach Files. `message` becomes the caption.",
+          ),
       },
     },
-    ({ channel_id, thread_name, message, sender }) =>
+    ({ channel_id, thread_name, message, sender, file_path }) =>
       guard(async () => {
         if (message.length > MAX_MESSAGE_LENGTH) {
           throw new Error(
             `Message is ${message.length} chars; Discord allows ${MAX_MESSAGE_LENGTH}. Split it into parts.`,
           );
+        }
+        let attachment: { attachment: string; name: string } | undefined;
+        if (file_path) {
+          const abs = path.resolve(file_path);
+          if (!fs.existsSync(abs)) {
+            throw new Error(`File not found: ${abs}`);
+          }
+          attachment = { attachment: abs, name: path.basename(abs) };
         }
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const id = channel.id;
@@ -325,7 +340,10 @@ function registerTools(server: McpServer): void {
             );
           }
         }
-        const sent = await channel.send(withSender(sender ?? process.env.CLANKER_NAME, message));
+        const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        const sent = attachment
+          ? await channel.send({ content, files: [attachment] })
+          : await channel.send(content);
         return { sent: true, channel_id: id, message_id: sent.id, ...(note ? { note } : {}) };
       }),
   );

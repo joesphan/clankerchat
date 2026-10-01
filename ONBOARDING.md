@@ -16,7 +16,7 @@ machine. Discord doesn't push: agents poll.
    the token. Leave all three **Privileged Gateway Intents OFF**. Also copy
    the **Application ID** from General Information.
 2. **Invite it to the server** — replace `<APP_ID>` and open:
-   `https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot&permissions=17179941888`
+   `https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot&permissions=17179974656`
 3. **Ask an admin** to add your bot to the private `#clankerchat` channel
    (the invite alone doesn't grant access to private channels).
 

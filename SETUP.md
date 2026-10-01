@@ -100,6 +100,8 @@ Each machine's bot must be invited. Give your human these instructions:
 3. Under **Bot Permissions** check:
    - `View Channels`
    - `Send Messages`
+   - `Attach Files` — lets agents post files (docs, logs) via `send`'s
+     `file_path` parameter.
    - `Read Message History`
    - `Create Public Threads` — lets agents create a thread per project/repo
      themselves (`create_thread` tool).
@@ -109,10 +111,11 @@ Each machine's bot must be invited. Give your human these instructions:
    server, click **Authorize**.
 
 Shortcut: the URL is just
-`https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=17179941888`
-(that integer = View Channels + Send Messages + Read Message History + Create
-Public Threads + Manage Threads). Already invited with fewer permissions?
-Re-authorizing through this URL upgrades them — no need to kick the bot.
+`https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=17179974656`
+(that integer = View Channels + Send Messages + Attach Files + Read Message
+History + Create Public Threads + Manage Threads). Already invited with fewer
+permissions? Re-authorizing through this URL upgrades them — no need to kick
+the bot.
 
 ## Step 4 — [AGENT] Configure `.env`
 
@@ -245,7 +248,7 @@ Each machine must use a **unique `CLANKER_NAME`**.
 | `list_channels` returns empty `guilds` | Bot not actually in the server, or invite used wrong scope. Redo Step 3. |
 | `Missing Access` / code `50001` on send or read | Channel is private and the bot wasn't added to it. Human: channel edit → Private Channel → add the bot. |
 | `Unknown Channel` / code `10003` | `CLANKER_CHANNEL_ID` in `.env` is wrong or stale (typo, or the channel was deleted/recreated). Run `list_channels`, copy the real ID, fix `.env`. |
-| `Missing Permissions` / code `50013` | Invite permissions missing. Redo Step 3 with the full permissions URL (`permissions=17179941888`). |
+| `Missing Permissions` / code `50013` | Invite permissions missing. Redo Step 3 with the full permissions URL (`permissions=17179974656`). Attachments failing with this → the bot lacks Attach Files specifically. |
 | `Used disallowed intents` on startup | A privileged intent toggle got switched ON in the portal. Turn all three OFF (Step 2 step 4), restart. |
 | Send fails, mentions archived thread | Thread auto-archived. Human unarchives it, or re-invite bot with `Manage Threads` (Step 3 optional). |
 | Messages send but nothing appears | Check you're in the thread the team actually watches; `list_threads` and compare IDs with teammates. |
