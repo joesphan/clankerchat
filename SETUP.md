@@ -226,13 +226,18 @@ In a **new** agent session (so the MCP server is picked up):
 Say: setup complete, the bot's name, which server/channel/thread it's in, and
 that messages will appear signed as `<CLANKER_NAME>`.
 
-## Step 11 — [AGENT, optional] Enable the reply-to-prompt dispatcher
+## Step 11 — [AGENT, optional] Enable the reply-to-prompt overseer
 
 The daemon turns Discord replies into prompts: when an **allowlisted human**
-replies to (or @mentions) this machine's bot in a thread it watches, the
-message is piped to a headless `claude -p` session run in the repo that thread
-maps to — and that session answers in the thread via the `send` tool. Machine
-must have the `claude` CLI installed and logged in.
+replies to (or @mentions) this machine's bot in **any** team thread, a small
+routing session first checks the machine's live local sessions — if one
+clearly works on that project and is idle, it is woken with the question
+(it answers in the thread). Otherwise the message goes to a headless
+`claude -p` worker spawned in the repo for that thread — the mapped repo if
+`daemon.json` knows it, else inferred from the thread name/question against
+the folders under `reposRoot`. Successful inferences are written back to
+`daemon.json` (learned). Machine must have the `claude` CLI installed and
+logged in.
 
 1. Copy `daemon.example.json` to `daemon.json` in the project root.
 2. `allow` — the Discord user IDs permitted to trigger prompts. **This list is
@@ -240,13 +245,17 @@ must have the `claude` CLI installed and logged in.
    **[HUMAN REQUIRED]** ask your human for their Discord user ID (Discord →
    Settings → Advanced → Developer Mode on, then right-click their name →
    **Copy User ID**). Bots can never trigger, regardless of this list.
-3. `threads` — map each watched thread name (project slug) to the absolute
-   path of its repo on this machine. Only mapped threads are watched.
-4. Leave `fullAuto: false` — spawned sessions may read the repo and use the
-   clankerchat tools, but not edit files or run commands. `true` adds
+3. `reposRoot` — the folder holding this machine's repos; the inference search
+   space. `threads` — optional thread name → repo path hints (learned entries
+   land here too). Every thread is watched either way.
+4. `wake` — try to wake a matching live local session instead of spawning.
+   The receiving session may ask its human to approve the wake message; set
+   `false` to always spawn a worker instead.
+5. Leave `fullAuto: false` — workers may read the repo and use the clankerchat
+   tools, but not edit files or run commands. `true` adds
    `--dangerously-skip-permissions`; only if the human accepts that anyone in
    `allow` can then drive unrestricted sessions.
-5. Start it:
+6. Start it:
 
    ```bash
    npm run daemon
@@ -255,14 +264,15 @@ must have the `claude` CLI installed and logged in.
    It logs to stdout and `daemon.log` (both gitignored, like `daemon.json`
    and `daemon.state.json`).
 
-**Check:** `daemon.log` shows a `watching [...] as <bot>` line within a few
-seconds, and `daemon.state.json` gains a cursor per watched thread.
+**Check:** `daemon.log` shows an `overseer: watching every thread ...` line
+within a few seconds.
 
 **Verify — [HUMAN REQUIRED]:** in Discord, reply to any message the bot posted
-in a watched thread, with a tiny task (e.g. `what repo is this?`). Expected:
-an ack (`dispatcher: prompt received…`), then a signed reply from the session.
-Note the daemon only sees messages posted **while it runs** — replies that
-arrived while it was stopped are skipped, not replayed.
+in a team thread, with a tiny task (e.g. `what repo is this?`). Expected: an
+ack (`overseer: prompt received…`), a `router:` line in `daemon.log`, then a
+signed reply in the thread. Note the daemon only sees messages posted
+**while it runs** — replies that arrived while it was stopped are skipped,
+not replayed.
 
 Run it in a spare terminal for now; a service/scheduled task wrapper is fine
 too, as long as `claude` is on PATH for that environment.
@@ -303,6 +313,8 @@ Each machine must use a **unique `CLANKER_NAME`**.
 | Daemon: `spawn error ... ENOENT` | `claude` CLI not on PATH in the daemon's environment (or not installed/logged in). Fix, restart daemon. |
 | Reply to the bot does nothing | The message must come from an `allow`-listed human, mention the bot (a Discord reply does this automatically), be in a thread listed in `daemon.json` — and be posted while the daemon runs. Check `daemon.log`. |
 | Dispatcher session exits non-zero before replying | Often a stale `--resume` id — the daemon drops it and the next reply starts fresh. Otherwise check `daemon.log` for claude CLI errors (auth, usage limits). |
+| Overseer routes to the wrong repo | Check the `router:` line in `daemon.log`, fix/add the mapping in `daemon.json` `threads` (hints beat inference), reply again. |
+| Overseer says it "could not tell which repo this thread is about" | Thread unmapped and inference found no plausible match — add it to `daemon.json` `threads`. |
 
 ## Security notes
 

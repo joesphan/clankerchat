@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * clankerchat daemon — reply-to-prompt dispatcher.
+ * clankerchat daemon — reply-to-prompt overseer.
  *
  * Model:
- *   - Runs alongside the MCP server (same .env, same bot) and polls the team
- *     channel's threads with the same REST `after`-cursor reads agents use —
- *     no extra Discord permissions beyond the MessageContent intent the MCP
- *     server also needs (without it, everyone else's messages read as empty).
+ *   - Runs alongside the MCP server (same .env, same bot) and polls EVERY
+ *     thread in the team channel with the same REST `after`-cursor reads
+ *     agents use — no extra Discord permissions beyond the MessageContent
+ *     intent the MCP server also needs.
  *   - A message becomes a prompt ONLY when ALL of these hold:
  *       1. the author is not a bot,
  *       2. the author's Discord user ID is listed in daemon.json `allow`,
@@ -14,16 +14,21 @@
  *          of the bot's messages mentions it automatically; an explicit
  *          @mention works too.
  *     Everything else is ignored; agents keep polling as usual.
- *   - A triggered message is stripped of the mention and piped on stdin to
- *     `claude -p`, run in the local repo the thread maps to (daemon.json
- *     `threads`). The headless session answers by calling the clankerchat MCP
- *     `send` tool itself — the daemon never parses or relays model output.
- *   - Spawned sessions are restricted by default: default permission mode
- *     plus an explicit allowlist of the clankerchat tools (so they can read
- *     the repo and chat, but not edit or execute) unless daemon.json sets
- *     `fullAuto`. One prompt runs at a time per machine; further triggers
- *     queue. Sessions resume per thread (`--resume`), so follow-up replies
- *     keep their context; a failed resume falls back to a fresh session.
+ *   - A triggered message goes to a ROUTING stage: a small headless session
+ *     with ListAgents/SendMessage that either wakes a matching live LOCAL
+ *     session (which then answers in-thread) or picks the repo a worker
+ *     should run in — the daemon.json `threads` map first, else inference
+ *     over the folders under `reposRoot`. Successful inferences are written
+ *     back to daemon.json (learned). Set "wake": false to always spawn.
+ *   - A worker is `claude -p` with the message piped on stdin, run in the
+ *     routed repo; it answers by calling the clankerchat MCP `send` tool
+ *     itself — the daemon never parses or relays model output.
+ *   - Workers are restricted by default: default permission mode plus an
+ *     explicit allowlist of the clankerchat tools (read the repo + chat,
+ *     nothing else) unless daemon.json sets `fullAuto`. One prompt at a time
+ *     per machine; further triggers queue. Workers resume per thread
+ *     (`--resume`), so follow-up replies keep context; a failed resume falls
+ *     back to a fresh session.
  *
  * Run with `npm run daemon`. Diagnostics go to stdout and daemon.log.
  */
@@ -48,13 +53,14 @@ const FETCH_LIMIT = 50; // messages per poll per thread (Discord caps at 100)
 const MAX_QUEUE = 8; // prompts waiting while one is running
 const MAX_STDOUT = 256 * 1024; // captured from a spawned session, for logging
 const MAX_STDERR = 64 * 1024;
+const ROUTER_TIMEOUT_MS = 120_000; // routing must be quick; it is not the work
 
 const CONFIG_FILE = path.join(PROJECT_ROOT, "daemon.json");
 const STATE_FILE = path.join(PROJECT_ROOT, "daemon.state.json");
 const LOG_FILE = path.join(PROJECT_ROOT, "daemon.log");
 
-/** Headless sessions may chat (all clankerchat tools) and read the repo —
- *  nothing else, unless daemon.json sets fullAuto. */
+/** Workers may chat (all clankerchat tools) and read the repo — nothing else,
+ *  unless daemon.json sets fullAuto. */
 const ALLOWED_TOOLS = [
   "mcp__clankerchat__send",
   "mcp__clankerchat__read",
@@ -72,13 +78,19 @@ interface DaemonConfig {
   allow: string[];
   /** Poll interval for the thread sweep, ms. */
   pollMs: number;
-  /** Kill a spawned session after this long, ms. */
+  /** Kill a worker after this long, ms. */
   timeoutMs: number;
   /** Spawn with --dangerously-skip-permissions instead of restricted mode. */
   fullAuto: boolean;
   /** Post a short ack into the thread when a prompt is dispatched. */
   ack: boolean;
-  /** Thread name (project slug) -> absolute path of the repo to work in. */
+  /** Try to wake a matching live local session before spawning a worker.
+   *  The receiving session may ask its human to approve the wake message. */
+  wake: boolean;
+  /** Folder holding this machine's repos — the inference search space. */
+  reposRoot: string;
+  /** Thread name (project slug) -> repo path. A HINT map: unmapped threads
+   *  are routed by inference, and successful inferences land here. */
   threads: Record<string, string>;
 }
 
@@ -114,7 +126,7 @@ function loadConfig(): DaemonConfig {
     raw = fs.readFileSync(CONFIG_FILE, "utf8");
   } catch {
     fatal(
-      `daemon.json not found at ${CONFIG_FILE} — copy daemon.example.json to daemon.json and edit it (SETUP.md Step 11).`,
+      `daemon.json not found at ${CONFIG_FILE} — copy daemon.example.json to daemon.json and edit it (see SETUP.md Step 11).`,
     );
   }
   let parsed: Record<string, unknown>;
@@ -133,16 +145,15 @@ function loadConfig(): DaemonConfig {
       'daemon.json needs an "allow" array with at least one Discord user ID (digits only) — this is who may trigger prompts.',
     );
   }
-  const threads = parsed.threads;
+  const threads = (parsed.threads ?? {}) as Record<string, unknown>;
   if (
     typeof threads !== "object" ||
     threads === null ||
     Array.isArray(threads) ||
-    Object.keys(threads).length === 0 ||
     !Object.values(threads).every((p) => typeof p === "string" && p.length > 0)
   ) {
     fatal(
-      'daemon.json needs a "threads" object mapping thread name -> repo path, e.g. {"clankerchat": "C:\\\\repo\\\\clankerchat"}.',
+      'daemon.json "threads" must map thread name -> repo path, e.g. {"clankerchat": "C:\\\\repo\\\\clankerchat"} (may be empty {}).',
     );
   }
   return {
@@ -152,6 +163,11 @@ function loadConfig(): DaemonConfig {
       typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : 15 * 60_000,
     fullAuto: parsed.fullAuto === true,
     ack: parsed.ack !== false,
+    wake: parsed.wake !== false,
+    reposRoot:
+      typeof parsed.reposRoot === "string"
+        ? path.resolve(parsed.reposRoot)
+        : path.dirname(PROJECT_ROOT), // repo sits in the repos folder by default
     threads: threads as Record<string, string>,
   };
 }
@@ -259,6 +275,13 @@ function stripMention(content: string, botId: string): string {
   return content.replace(new RegExp(`<@!?${botId}>\\s*`, "g"), "").trim();
 }
 
+function mappedCwdFor(threadName: string): string | null {
+  const hit = Object.entries(config.threads).find(
+    ([n]) => n.toLowerCase() === threadName.toLowerCase(),
+  );
+  return hit ? hit[1] : null;
+}
+
 function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => void }): void {
   if (process.platform === "win32" && child.pid) {
     // shell:true spawns cmd.exe, so the real claude process is a child — kill the tree.
@@ -269,57 +292,24 @@ function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => void }): 
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch — pipe the prompt into `claude -p`, let it answer via MCP send
+// Headless claude plumbing — one spawn helper for router and workers
 // ---------------------------------------------------------------------------
 
-interface Job {
-  threadName: string; // canonical name from Discord
-  threadId: string;
-  cwd: string; // repo path from daemon.json
-  prompt: string; // mention-stripped message text
-  from: string; // Discord username of the triggering human
+interface ClaudeRun {
+  code: number | null;
+  stdout: string;
+  stderr: string;
 }
 
-const queue: Job[] = [];
-let running = false;
-let currentChild: ReturnType<typeof spawn> | null = null;
-
-function buildPrompt(job: Job): string {
-  const name = process.env.CLANKER_NAME ?? "clankerchat";
-  return [
-    `You are the ${name} dispatcher session, spawned because a human replied to this machine's bot in the "${job.threadName}" Discord thread.`,
-    `Work in this repo: ${job.cwd}`,
-    `When done — or if you cannot or should not do the task — reply in that thread by calling the MCP tool mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}". Keep the reply under 2000 chars; never paste secrets.`,
-    `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
-    ``,
-    `--- task from Discord user ${job.from} ---`,
-    job.prompt,
-  ].join("\n");
-}
-
-async function dispatch(job: Job): Promise<void> {
-  running = true;
-  log(`spawn: claude -p for "${job.threadName}" (prompt from ${job.from})`);
-  try {
-    if (config.ack) {
-      await sendToThread(
-        job.threadId,
-        "dispatcher: prompt received — spawning a session; its reply lands in this thread.",
-      );
-    }
-
-    const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS];
-    if (config.fullAuto) {
-      args.push("--dangerously-skip-permissions");
-    } else {
-      args.push("--permission-mode", "default");
-    }
-    const sessionId = state.sessions[job.threadName];
-    if (sessionId) args.push("--resume", sessionId);
-
-    const child = spawn("claude", args, { cwd: job.cwd, shell: true });
+async function runClaude(
+  args: string[],
+  cwd: string,
+  stdinText: string,
+  timeoutMs: number,
+): Promise<ClaudeRun> {
+  return new Promise((resolve) => {
+    const child = spawn("claude", args, { cwd, shell: true });
     currentChild = child;
-
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (d: Buffer) => {
@@ -331,51 +321,233 @@ async function dispatch(job: Job): Promise<void> {
     child.on("error", (err) => {
       log(`spawn error: ${errText(err)} — is claude on PATH for this daemon?`);
     });
-
     const timedOut = setTimeout(() => {
-      log(`session for "${job.threadName}" exceeded ${config.timeoutMs}ms — killing it`);
+      log(`claude run in ${cwd} exceeded ${timeoutMs}ms — killing it`);
       killTree(child);
-    }, config.timeoutMs);
-
+    }, timeoutMs);
     try {
-      child.stdin?.write(buildPrompt(job) + "\n");
+      child.stdin?.write(stdinText + "\n");
       child.stdin?.end();
     } catch {
       // claude died before accepting stdin — the close handler reports it
     }
+    child.on("close", (code) => {
+      clearTimeout(timedOut);
+      if (currentChild === child) currentChild = null;
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
 
-    const code = await new Promise<number | null>((res) => child.on("close", res));
-    clearTimeout(timedOut);
-    currentChild = null;
+/** Parses `claude -p --output-format json` output. */
+function parseSessionResult(stdout: string): { sessionId?: string; result: string } {
+  const trimmed = stdout.trim();
+  try {
+    const parsed = JSON.parse(trimmed) as { session_id?: string; result?: string };
+    return { sessionId: parsed.session_id, result: parsed.result ?? "" };
+  } catch {
+    const m = /"session_id"\s*:\s*"([0-9a-f-]+)"/.exec(trimmed);
+    return { sessionId: m?.[1], result: "" };
+  }
+}
 
-    // -p --output-format json prints one result object; keep the session id
-    // so the next prompt in this thread resumes with context.
-    const trimmed = stdout.trim();
-    let sessionIdOut: string | undefined;
-    let resultText = "";
-    try {
-      const parsed = JSON.parse(trimmed) as { session_id?: string; result?: string };
-      sessionIdOut = parsed.session_id;
-      resultText = parsed.result ?? "";
-    } catch {
-      const m = /"session_id"\s*:\s*"([0-9a-f-]+)"/.exec(trimmed);
-      if (m) sessionIdOut = m[1];
+// ---------------------------------------------------------------------------
+// Routing stage — wake a live local session, or infer the repo for a worker
+// ---------------------------------------------------------------------------
+
+interface Job {
+  threadName: string; // canonical name from Discord
+  threadId: string;
+  cwd: string | null; // repo path from daemon.json, if the thread is mapped
+  prompt: string; // mention-stripped message text
+  from: string; // Discord username of the triggering human
+}
+
+interface RouteDecision {
+  woke: string | null; // name of the live session that was messaged
+  cwd: string | null; // inferred repo for a worker
+  reason: string;
+}
+
+function repoFolderNames(reposRoot: string): string[] {
+  try {
+    return fs
+      .readdirSync(reposRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
+  const name = process.env.CLANKER_NAME ?? "clankerchat";
+  const repoNames = repoFolderNames(config.reposRoot);
+  return [
+    `You are the routing stage of the ${name} overseer on this machine. Route ONE incoming question; be decisive and fast — do NOT do the task yourself.`,
+    ``,
+    `Question (Discord user ${job.from}) in thread "${job.threadName}":`,
+    `"""`,
+    job.prompt,
+    `"""`,
+    ``,
+    `Known thread→repo map: ${JSON.stringify(config.threads)}`,
+    mappedCwd ? `This thread is mapped to: ${mappedCwd}` : `This thread is NOT mapped.`,
+    `Repo folders under ${config.reposRoot}: ${repoNames.join(", ") || "(none found)"}`,
+    ``,
+    `Steps:`,
+    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
+    `2. Otherwise pick "cwd" for a worker: the mapped path if given; else the single best-matching repo folder above, resolved to an absolute path; null only if nothing plausibly matches.`,
+    ``,
+    `Reply with ONLY one line of JSON, no prose:`,
+    `{"woke": <session name or null>, "cwd": <absolute path or null>, "reason": "<=10 words"}`,
+  ].join("\n");
+}
+
+async function runRouter(job: Job, mappedCwd: string | null): Promise<RouteDecision | null> {
+  const args = [
+    "-p",
+    "--output-format",
+    "json",
+    "--allowed-tools",
+    "ListAgents",
+    "SendMessage",
+    "--permission-mode",
+    "default",
+  ];
+  const run = await runClaude(args, config.reposRoot, buildRouterPrompt(job, mappedCwd), ROUTER_TIMEOUT_MS);
+  if (run.code !== 0) {
+    log(`router failed (exit ${run.code}): ${run.stderr.slice(0, 200)}`);
+    return null;
+  }
+  const { result } = parseSessionResult(run.stdout);
+  const m = /\{[\s\S]*\}/.exec(result); // the decision is one JSON line; tolerate prose around it
+  if (!m) {
+    log(`router returned no decision: ${result.slice(0, 200)}`);
+    return null;
+  }
+  try {
+    const d = JSON.parse(m[0]) as Partial<RouteDecision>;
+    return {
+      woke: typeof d.woke === "string" && d.woke ? d.woke : null,
+      cwd:
+        typeof d.cwd === "string" && d.cwd && fs.existsSync(d.cwd)
+          ? path.resolve(d.cwd)
+          : null,
+      reason: typeof d.reason === "string" ? d.reason : "",
+    };
+  } catch {
+    log(`router decision unparseable: ${result.slice(0, 200)}`);
+    return null;
+  }
+}
+
+/** Persist an inferred thread→repo mapping so the next trigger is instant. */
+function rememberMapping(threadName: string, cwd: string): void {
+  if (config.threads[threadName] === cwd) return;
+  config.threads[threadName] = cwd;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) as Record<string, unknown>;
+    parsed.threads = config.threads;
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2) + "\n");
+    log(`learned mapping: "${threadName}" -> ${cwd}`);
+  } catch (err) {
+    log(`could not persist learned mapping: ${errText(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch — route, then spawn the worker; the worker answers via MCP send
+// ---------------------------------------------------------------------------
+
+const queue: Job[] = [];
+let running = false;
+let currentChild: ReturnType<typeof spawn> | null = null;
+
+function buildWorkerPrompt(job: Job, cwd: string): string {
+  const name = process.env.CLANKER_NAME ?? "clankerchat";
+  return [
+    `You are the ${name} overseer worker, spawned because a human replied to this machine's bot in the "${job.threadName}" Discord thread.`,
+    `Work in this repo: ${cwd}`,
+    `When done — or if you cannot or should not do the task — reply in that thread by calling the MCP tool mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}". Keep the reply under 2000 chars; never paste secrets.`,
+    `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
+    ``,
+    `--- task from Discord user ${job.from} ---`,
+    job.prompt,
+  ].join("\n");
+}
+
+async function dispatch(job: Job): Promise<void> {
+  running = true;
+  log(`dispatch: "${job.threadName}" (prompt from ${job.from})`);
+  try {
+    if (config.ack) {
+      await sendToThread(
+        job.threadId,
+        "overseer: prompt received — routing it; the answer lands in this thread.",
+      );
     }
+
+    // Route: wake a live local session if one fits, else decide the worker's repo.
+    let cwd = job.cwd;
+    let woke: string | null = null;
+    if (!cwd || config.wake) {
+      const decision = await runRouter(job, cwd);
+      if (decision) {
+        woke = decision.woke;
+        if (!cwd && decision.cwd) cwd = decision.cwd;
+        log(`router: woke=${woke ?? "-"} cwd=${cwd ?? "-"} (${decision.reason})`);
+      }
+    }
+
+    if (woke) {
+      log(`done: "${job.threadName}" routed to live session "${woke}"`);
+      return; // the woken session answers in-thread
+    }
+    if (!cwd) {
+      await sendToThread(
+        job.threadId,
+        "overseer: could not tell which repo this thread is about — add it to daemon.json (SETUP.md Step 11) and reply again.",
+      );
+      return;
+    }
+    if (!fs.existsSync(cwd)) {
+      log(`routed path does not exist: ${cwd} (thread "${job.threadName}")`);
+      await sendToThread(
+        job.threadId,
+        `overseer: this thread routes to \`${cwd}\`, which does not exist on this machine — fix daemon.json (SETUP.md Step 11).`,
+      );
+      return;
+    }
+    if (!job.cwd) rememberMapping(job.threadName, cwd);
+
+    const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS];
+    if (config.fullAuto) {
+      args.push("--dangerously-skip-permissions");
+    } else {
+      args.push("--permission-mode", "default");
+    }
+    const sessionId = state.sessions[job.threadName];
+    if (sessionId) args.push("--resume", sessionId);
+
+    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd), config.timeoutMs);
+    const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
     if (sessionIdOut) {
       state.sessions[job.threadName] = sessionIdOut;
       saveState();
     }
     log(
-      `done: "${job.threadName}" exit ${code}${resultText ? ` — ${resultText.slice(0, 200)}` : stderr ? ` — stderr: ${stderr.slice(0, 200)}` : ""}`,
+      `done: "${job.threadName}" exit ${run.code}${result ? ` — ${result.slice(0, 200)}` : run.stderr ? ` — stderr: ${run.stderr.slice(0, 200)}` : ""}`,
     );
 
-    if (code !== 0) {
+    if (run.code !== 0) {
       // Most often a stale --resume id; drop it so the next trigger starts fresh.
       delete state.sessions[job.threadName];
       saveState();
       await sendToThread(
         job.threadId,
-        `dispatcher: the spawned session exited with code ${code} before replying — see daemon.log on this machine. (Session context dropped; next reply starts fresh.)`,
+        `overseer: the worker session exited with code ${run.code} before replying — see daemon.log on this machine. (Session context dropped; next reply starts fresh.)`,
       );
     }
   } finally {
@@ -396,23 +568,13 @@ async function drain(): Promise<void> {
   if (running) return;
   while (queue.length > 0) {
     const job = queue.shift()!;
-    if (!fs.existsSync(job.cwd)) {
-      log(`mapped path does not exist: ${job.cwd} (thread "${job.threadName}")`);
-      await sendToThread(
-        job.threadId,
-        `dispatcher: daemon.json maps this thread to \`${job.cwd}\`, which does not exist on this machine — fix the mapping (SETUP.md Step 11).`,
-      );
-      continue;
-    }
     await dispatch(job);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Poll loop — same REST reads the agents use
+// Poll loop — same REST reads the agents use, over EVERY thread
 // ---------------------------------------------------------------------------
-
-const warnedMissingThreads = new Set<string>();
 
 async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promise<void> {
   const [active, archived] = await Promise.all([
@@ -421,16 +583,8 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
   ]);
   const threads = [...active.threads.values(), ...archived.threads.values()];
 
-  for (const [name, cwd] of Object.entries(config.threads)) {
-    const thread = threads.find((t) => t.name.toLowerCase() === name.toLowerCase());
-    if (!thread) {
-      if (!warnedMissingThreads.has(name)) {
-        warnedMissingThreads.add(name);
-        log(`thread "${name}" not found in the team channel — waiting for it to exist`);
-      }
-      continue;
-    }
-    warnedMissingThreads.delete(name);
+  for (const thread of threads) {
+    const mapped = mappedCwdFor(thread.name);
 
     const latest = thread.lastMessageId;
     let cursor = state.cursors[thread.id];
@@ -455,10 +609,16 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
       if (!isTrigger(m, botUser)) continue;
       const prompt = stripMention(m.content, botUser.id);
       if (!prompt) {
-        log(`skip: trigger from ${m.author.username} in "${name}" had no text`);
+        log(`skip: trigger from ${m.author.username} in "${thread.name}" had no text`);
         continue;
       }
-      enqueue({ threadName: thread.name, threadId: thread.id, cwd, prompt, from: m.author.username });
+      enqueue({
+        threadName: thread.name,
+        threadId: thread.id,
+        cwd: mapped,
+        prompt,
+        from: m.author.username,
+      });
     }
     if (messages.length > 0) {
       state.cursors[thread.id] = cursor;
@@ -489,8 +649,9 @@ async function main(): Promise<void> {
   }
 
   log(
-    `watching [${Object.keys(config.threads).join(", ")}] as ${me.user.username}; ` +
-      `allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; poll=${config.pollMs}ms`,
+    `overseer: watching every thread in the team channel as ${me.user.username}; ` +
+      `mapped=[${Object.keys(config.threads).join(", ")}]; reposRoot=${config.reposRoot}; ` +
+      `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; poll=${config.pollMs}ms`,
   );
 
   for (;;) {

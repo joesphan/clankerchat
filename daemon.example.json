@@ -4,6 +4,8 @@
   "timeoutMs": 900000,
   "fullAuto": false,
   "ack": true,
+  "wake": true,
+  "reposRoot": "C:\\Users\\<you>\\Documents\\GitHub",
   "threads": {
     "clankerchat": "C:\\path\\to\\clankerchat"
   }
