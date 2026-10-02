@@ -87,22 +87,36 @@ export function parseKey(material: string): ParsedKey {
 // the audit trail delete-after-queueing would have destroyed.
 // ---------------------------------------------------------------------------
 
+// Serializes appendInjectEvent's read-prev/append inside this process.
+let appendQueue: Promise<void> = Promise.resolve();
+
 export function appendInjectEvent(
   spoolDir: string,
   evt: { event: "received" | "consumed"; id: string; source: string; target: string; detail?: string },
-): void {
-  const logPath = path.join(spoolDir, "inject.log");
-  let prev = ""; // genesis entry chains from the empty string
-  try {
-    const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
-    if (lines.length > 0) prev = String(JSON.parse(lines[lines.length - 1]).hash ?? "");
-  } catch {
-    /* no log yet — genesis */
-  }
-  const body = { ...evt, ts: new Date().toISOString(), prev };
-  const hash = crypto.createHash("sha256").update(prev + JSON.stringify(body)).digest("hex");
-  fs.mkdirSync(spoolDir, { recursive: true });
-  fs.appendFileSync(logPath, `${JSON.stringify({ ...body, hash })}\n`);
+): Promise<void> {
+  // Serialize read-prev/append inside this process: two connections landing
+  // injects simultaneously could otherwise interleave and break the chain.
+  // (A cross-PROCESS race — daemon vs. trigger layer — still exists but is
+  // detectable: verifyInjectLog throws, fail-visible not fail-silent.)
+  appendQueue = appendQueue.then(() => {
+    const logPath = path.join(spoolDir, "inject.log");
+    let prev = ""; // genesis entry chains from the empty string
+    try {
+      const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+      if (lines.length > 0) prev = String(JSON.parse(lines[lines.length - 1]).hash ?? "");
+    } catch {
+      /* no log yet — genesis */
+    }
+    const body = { ...evt, ts: new Date().toISOString(), prev };
+    const hash = crypto.createHash("sha256").update(prev + JSON.stringify(body)).digest("hex");
+    fs.mkdirSync(spoolDir, { recursive: true });
+    fs.appendFileSync(logPath, `${JSON.stringify({ ...body, hash })}\n`);
+  });
+  // Callers on the daemon path are fire-and-forget; a rejected link must
+  // not poison subsequent appends. Callers who need the flush (the daemon
+  // ACKs only after the audit entry landed) await the returned promise.
+  appendQueue.catch(() => {});
+  return appendQueue;
 }
 
 /** Replay inject.log and verify the hash chain. Returns entries, or throws. */
@@ -250,7 +264,7 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
             }
             let data = "";
             stream.stdin.on("data", (c: Buffer) => (data += c.toString("utf8")));
-            stream.stdin.on("end", () => {
+            stream.stdin.on("end", async () => {
               if (++injects > maxInjects) {
                 stream.stderr.end("inject limit for this connection\n");
                 stream.exit(1);
@@ -287,7 +301,9 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               );
               injectsTotal++;
               try {
-                appendInjectEvent(opts.spoolDir, {
+                // Await the audit entry BEFORE acking: the ACK must mean the
+                // inject is both spooled and logged.
+                await appendInjectEvent(opts.spoolDir, {
                   event: "received",
                   id,
                   source: payload.source,

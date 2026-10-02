@@ -214,6 +214,28 @@ test("inject audit log is tamper-evident: edits and deletions are caught", async
   assert.throws(() => verifyInjectLog(spool), /chain/, "removed entry detected");
 });
 
+test("concurrent injects serialize into an intact chain (interleaved-writer race)", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  const N = 8;
+  await Promise.all(
+    Array.from({ length: N }, (_, i) =>
+      botlinkRequest(peer, "inject", { source: `s${i}`, target: `t${i}`, text: `burst ${i}` }).catch((e) => {
+        throw new Error(`inject ${i} failed: ${e.message}`);
+      }),
+    ),
+  );
+  const entries = verifyInjectLog(spool); // throws if the chain interleaved/broke
+  assert.equal(entries.length, N, `all ${N} received entries present, chain verifies`);
+  const ids = new Set(entries.map((e) => e.id));
+  assert.equal(ids.size, N, "no duplicate ids");
+});
+
 test("fingerprintOfPublicKey accepts blobs and lines; rejects junk", () => {
   const key = generateBotKey("fp");
   assert.equal(fingerprintOfPublicKey(key.publicLine), key.fingerprint);
