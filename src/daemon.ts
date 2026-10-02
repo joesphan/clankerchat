@@ -346,8 +346,11 @@ const daemonMessageIds = new Set<string>();
 async function sendToThread(threadId: string, message: string): Promise<string | null> {
   try {
     const channel = await client.channels.fetch(threadId, { cache: false });
-    if (!(channel instanceof ThreadChannel)) return null;
-    if (channel.archived) await channel.setArchived(false).catch(() => {});
+    if (channel instanceof ThreadChannel) {
+      if (channel.archived) await channel.setArchived(false).catch(() => {});
+    } else if (!(channel instanceof TextChannel)) {
+      return null;
+    }
     const sent = await channel.send(withSender(process.env.CLANKER_NAME, message));
     daemonMessageIds.add(sent.id);
     return sent.id;
@@ -484,8 +487,9 @@ function parseSessionResult(stdout: string): { sessionId?: string; result: strin
 // ---------------------------------------------------------------------------
 
 interface Job {
-  threadName: string; // canonical name from Discord
+  threadName: string; // canonical name from Discord ("(channel root)" for root posts)
   threadId: string;
+  rootChannel?: boolean; // trigger landed in the channel root, not a thread
   cwd: string | null; // repo path from daemon.json, if the thread is mapped
   prompt: string; // mention-stripped message text
   from: string; // Discord username of the triggering human
@@ -530,7 +534,7 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
     `Repo folders under ${config.reposRoot}: ${repoNames.join(", ") || "(none found)"}`,
     ``,
     `Steps:`,
-    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , max 30 words of prose (code blocks exempt), commands/paths in fenced code, then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
+    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , max 30 words of prose (code blocks exempt), commands/paths in fenced code, then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.${job.rootChannel ? " (This job is a CHANNEL-ROOT post — do NOT wake; go straight to step 2 and reply woke=null.)" : ""}`,
     `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
     ``,
     `Reply with ONLY one line of JSON, no prose:`,
@@ -647,16 +651,19 @@ async function checkFollowups(): Promise<void> {
 
 function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
+  const replyTarget = job.rootChannel
+    ? `channel_id "${job.threadId}" (the channel ROOT — not a thread)`
+    : `thread_name "${job.threadName}"`;
   return [
-    `You are the ${name} overseer worker, spawned because ${job.fromBot ? `another machine's agent (${job.from}) mentioned` : "a human replied to"} this machine's bot in the "${job.threadName}" Discord thread.`,
+    `You are the ${name} overseer worker, spawned because ${job.fromBot ? `another machine's agent (${job.from}) mentioned` : "a human replied to"} this machine's bot in the "${job.threadName}" Discord ${job.rootChannel ? "channel root" : "thread"}.`,
     `Start your reply by tagging the asker — the first characters of the message must be <@${job.fromId}> followed by a space.`,
     job.fromBot
-      ? `Post your reply as a NEW message in the thread, not a Discord reply to their message (new-message tags reach the peer's humans; reply-chains can trip peer daemons that wake on mentions).`
+      ? `Post your reply as a NEW message, not a Discord reply to their message (new-message tags reach the peer's humans; reply-chains can trip peer daemons that wake on mentions).`
       : ``,
     sandboxed
       ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
       : `Work in this repo: ${cwd}`,
-    `When done — or if you cannot or should not do the task — reply in that thread by calling the MCP tool mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}". Keep the reply under 2000 chars; never paste secrets.`,
+    `When done — or if you cannot or should not do the task — reply by calling the MCP tool mcp__clankerchat__send with sender "${name}" and ${replyTarget}. Keep the reply under 2000 chars; never paste secrets.`,
     `Format for Discord: every command, path, snippet, or log excerpt goes in a fenced code block (triple backticks, language tag when known) or \`inline code\` — bare code gets mangled into goofy formatting by Discord markdown. HARD LIMIT: the reply is at most 30 words of prose, code blocks exempt — cut everything else, link or point at local files instead.`,
     `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
     ``,
@@ -809,7 +816,7 @@ async function dispatch(job: Job): Promise<void> {
     let cwd = job.cwd;
     let woke: string | null = null;
     let routeConfidence: "high" | "low" = "high"; // explicit mapping is always trusted
-    if (!job.skipWake && (!cwd || config.wake)) {
+    if (!job.skipWake && !job.rootChannel && (!cwd || config.wake)) {
       const decision = await runRouter(job, cwd);
       if (decision) {
         woke = decision.woke;
@@ -961,6 +968,45 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
     }
     if (messages.length > 0) {
       state.cursors[thread.id] = cursor;
+      saveState();
+    }
+  }
+
+  // Channel ROOT sweep — the parent channel is watched like a thread of its
+  // own, so tags landing outside any thread still trigger (replies land in
+  // the root). Same cursor, first-sight-skip, and trigger rules as threads.
+  let rootCursor = state.cursors[parent.id];
+  const rootLatest = parent.lastMessageId;
+  if (rootCursor === undefined) {
+    if (rootLatest) {
+      state.cursors[parent.id] = rootLatest;
+      saveState();
+    }
+  } else if (rootLatest && BigInt(rootCursor) < BigInt(rootLatest)) {
+    const fetched = await parent.messages.fetch({ limit: FETCH_LIMIT, after: rootCursor, cache: false });
+    const rootMessages = [...fetched.values()].sort(byIdAscending);
+    for (const m of rootMessages) {
+      rootCursor = m.id;
+      if (!isTrigger(m, botUser)) continue;
+      const prompt = stripMention(m.content, botUser.id);
+      if (!prompt) {
+        log(`skip: root trigger from ${m.author.username} had no text`);
+        continue;
+      }
+      enqueue({
+        threadName: "(channel root)",
+        threadId: parent.id,
+        rootChannel: true,
+        cwd: null,
+        prompt,
+        from: m.author.username,
+        fromId: m.author.id,
+        fromBot: m.author.bot,
+        triggerId: m.id,
+      });
+    }
+    if (rootMessages.length > 0) {
+      state.cursors[parent.id] = rootCursor;
       saveState();
     }
   }
