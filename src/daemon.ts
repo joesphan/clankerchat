@@ -280,12 +280,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
 
+/** Message ids the daemon itself posted (acks, notices). A wake counts as
+ *  answered only when a SESSION replies — never the daemon's own messages. */
+const daemonMessageIds = new Set<string>();
+
 async function sendToThread(threadId: string, message: string): Promise<string | null> {
   try {
     const channel = await client.channels.fetch(threadId, { cache: false });
     if (!(channel instanceof ThreadChannel)) return null;
     if (channel.archived) await channel.setArchived(false).catch(() => {});
     const sent = await channel.send(withSender(process.env.CLANKER_NAME, message));
+    daemonMessageIds.add(sent.id);
     return sent.id;
   } catch (err) {
     log(`ack send failed in ${threadId}: ${errText(err)}`);
@@ -530,7 +535,10 @@ async function checkFollowups(): Promise<void> {
       if (channel instanceof ThreadChannel) {
         const fetched = await channel.messages.fetch({ limit: 25, after: f.ackId, cache: false });
         const answered = [...fetched.values()].some(
-          (m) => m.author.id === client.user?.id && BigInt(m.id) > BigInt(f.ackId),
+          (m) =>
+            m.author.id === client.user?.id &&
+            !daemonMessageIds.has(m.id) &&
+            BigInt(m.id) > BigInt(f.ackId),
         );
         if (answered) {
           pendingFollowups.splice(i, 1);
