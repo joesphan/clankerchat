@@ -742,9 +742,11 @@ function registerTools(server: McpServer): void {
         task_diff_ref: z.string().max(400).optional().describe("Structured task: PR/commit ref (TEXT hint — nothing fetches it)."),
         task_acceptance: z.array(z.string().min(1).max(400)).max(10).optional().describe("Structured task: pass criteria."),
         task_reply_to: z.string().max(64).optional().describe("Structured task: inject/message id to thread replies to."),
+        task_correlation: z.string().max(64).optional().describe("Structured task: grouping id shared by related injects of one task round."),
+        supersedes: z.string().max(64).optional().describe("Lineage: inject id this one replaces (same logical prompt, refined)."),
       },
     },
-    ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to }) =>
+    ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to, task_correlation, supersedes }) =>
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
@@ -759,6 +761,7 @@ function registerTools(server: McpServer): void {
               ...(task_diff_ref ? { diff_ref: task_diff_ref } : {}),
               ...(task_acceptance ? { acceptance: task_acceptance } : {}),
               ...(task_reply_to ? { reply_to: task_reply_to } : {}),
+              ...(task_correlation ? { correlation: task_correlation } : {}),
             }
           : undefined;
         const out = await botlinkRequest(botlinkPeer!, "inject", {
@@ -766,6 +769,7 @@ function registerTools(server: McpServer): void {
           target,
           text,
           ...(thread ? { thread } : {}),
+          ...(supersedes ? { supersedes } : {}),
           ...(task ? { task } : {}),
         });
         try {

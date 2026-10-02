@@ -235,6 +235,7 @@ export const InjectTask = z.object({
   diff_ref: z.string().max(400).optional(), // PR/commit ref or URL (TEXT ONLY — nothing fetches it)
   acceptance: z.array(z.string().min(1).max(400)).max(10).optional(), // pass criteria
   reply_to: z.string().max(64).optional(), // inject/message id to thread replies to
+  correlation: z.string().max(64).optional(), // task-round grouping id shared by related injects
   deadline_soft: z.string().max(40).optional(), // duration or timestamp HINT
 });
 export type InjectTask = z.infer<typeof InjectTask>;
@@ -244,6 +245,7 @@ export const InjectPayload = z.object({
   target: z.string().min(1).max(64), // routing hint, e.g. "orchestrator" | "shim"
   text: z.string().min(1).max(BOTLINK_MAX_TEXT), // the prompt itself (human framing)
   thread: z.string().max(64).optional(), // reply venue hint (thread name/id)
+  supersedes: z.string().max(64).optional(), // lineage: inject id this one replaces (same logical prompt, refined)
   task: InjectTask.optional(), // structured task — hints, same untrusted-input rules
 });
 export type InjectPayload = z.infer<typeof InjectPayload>;
@@ -407,8 +409,10 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                   target: payload.target,
                   detail: [
                     `key ${authedKeyFp} from ${peerIp}, ${payload.text.length} chars`,
+                    payload.supersedes ? `supersedes=${payload.supersedes}` : "",
                     payload.task?.kind ? `kind=${payload.task.kind}` : "",
                     payload.task?.reply_to ? `reply_to=${payload.task.reply_to}` : "",
+                    payload.task?.correlation ? `correlation=${payload.task.correlation}` : "",
                   ]
                     .filter(Boolean)
                     .join(" "),

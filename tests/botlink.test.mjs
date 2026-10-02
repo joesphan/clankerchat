@@ -283,7 +283,9 @@ test("structured task payloads roundtrip; junk task fields are refused", async (
         commit: "58833e6",
         acceptance: ["drift gate clean", "host_tests 570/570"],
         reply_to: "1790904000000-abc123",
+        correlation: "round-7",
       },
+      supersedes: "1790903000000-old456",
     }),
   );
   assert.ok(ack.ok);
@@ -293,10 +295,16 @@ test("structured task payloads roundtrip; junk task fields are refused", async (
   assert.equal(saved.task.commit, "58833e6");
   assert.deepEqual(saved.task.acceptance, ["drift gate clean", "host_tests 570/570"]);
   assert.equal(saved.task.reply_to, "1790904000000-abc123");
-  // audit detail carries kind + reply_to for metrics derivation
+  // lineage fields survive zod — reserved so peers can adopt them without a
+  // breaking schema change (unknown keys would otherwise be silently stripped)
+  assert.equal(saved.task.correlation, "round-7");
+  assert.equal(saved.supersedes, "1790903000000-old456");
+  // audit detail carries kind + reply_to + lineage for metrics derivation
   const log = verifyInjectLog(spool);
   assert.match(log[0].detail ?? "", /kind=review/);
   assert.match(log[0].detail ?? "", /reply_to=1790904000000-abc123/);
+  assert.match(log[0].detail ?? "", /supersedes=1790903000000-old456/);
+  assert.match(log[0].detail ?? "", /correlation=round-7/);
 
   // junk kind / oversize acceptance / unknown field → refused, nothing spooled
   await assert.rejects(

@@ -105,10 +105,18 @@ independent of what the sender claims.
 **Structured tasks.** An inject may carry a `task` object: `kind`
 (implement | review | question | status) plus optional hints — `repo`,
 `branch`, `base`, `commit`, `diff_ref` (TEXT hint — nothing fetches it),
-`acceptance[]`, `reply_to`, `deadline_soft`. Schema-validated, capped; all
+`acceptance[]`, `reply_to`, `correlation` (grouping id for related injects
+of one task round), `deadline_soft`. Schema-validated, capped; all
 fields are sender hints under the same untrusted-input rules. Prose `text`
 stays mandatory (the human-readable framing); the task is the machine-parsed
 shape. The MCP tool exposes them as `task_kind`, `task_repo`, … inputs.
+
+**Lineage.** The envelope carries an optional `supersedes` (inject id this
+prompt replaces — same logical task, refined before the receiver acted).
+Reserved in the schema now so peers can adopt merge/supersede behavior
+without a breaking change; the receiving trigger layer should treat a
+superseded prompt as withdrawn *if the sender's claim checks out* (it is,
+like everything else in the payload, untrusted).
 
 Consume it exactly like a bot-authored tag: mark the prompt as bot-sourced
 untrusted input, keep human triggers higher priority. `target`/`thread` are
