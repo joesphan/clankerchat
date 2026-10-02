@@ -660,7 +660,9 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                   size: f.size,
                   sha256: f.sha256,
                   ...(f.note ? { note: f.note } : {}),
-                  path: path.relative(opts.spoolDir, dest),
+                  // POSIX separators in the manifest regardless of host OS —
+                  // manifests are audit artifacts read on both platforms.
+                  path: path.relative(opts.spoolDir, dest).split(path.sep).join("/"),
                 };
               }
               const file = path.join(opts.spoolDir, `${id}.inject.json`);
