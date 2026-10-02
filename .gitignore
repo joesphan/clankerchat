@@ -7,3 +7,4 @@ daemon.log
 botlink-keys/
 botlink-spool/
 .botlink.env
+.claude/settings.local.json
