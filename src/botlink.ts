@@ -123,7 +123,9 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   fs.mkdirSync(opts.spoolDir, { recursive: true });
 
   const allowedKeys = opts.authorizedPublicKeys.map((line) => parseKey(line));
-  if (allowedKeys.length === 0) throw new Error("botlink server requires at least one authorized public key");
+  // Zero authorized keys = the lane is UP but trusts nobody (every auth is
+  // refused). That's better ops than refusing to boot: the daemon comes up
+  // before the peer's key has been exchanged, and self-tests still work.
   // Validate parseability, but hand ssh2 the ORIGINAL OpenSSH PEM —
   // getPrivatePEM() re-serializes to PKCS8, which ssh2's server rejects.
   parseKey(opts.hostKeyPem);

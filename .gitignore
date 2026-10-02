@@ -3,3 +3,4 @@ dist/
 .env
 botlink-keys/
 botlink-spool/
+.botlink.env
