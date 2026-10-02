@@ -100,6 +100,8 @@ interface DaemonConfig {
   pollMs: number;
   /** Kill a worker after this long, ms. */
   timeoutMs: number;
+  /** Max workers running at once. Same thread never runs concurrently. */
+  maxConcurrent: number;
   /** Spawn with --dangerously-skip-permissions instead of restricted mode. */
   fullAuto: boolean;
   /** Post a short ack into the thread when a prompt is dispatched. */
@@ -206,6 +208,10 @@ function loadConfig(): DaemonConfig {
     pollMs: Math.max(1000, typeof parsed.pollMs === "number" ? parsed.pollMs : 5000),
     timeoutMs:
       typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : 15 * 60_000,
+    maxConcurrent: Math.min(
+      8,
+      Math.max(1, typeof parsed.maxConcurrent === "number" ? parsed.maxConcurrent : 3),
+    ),
     fullAuto: parsed.fullAuto === true,
     ack: parsed.ack !== false,
     wake: parsed.wake !== false,
@@ -430,6 +436,7 @@ async function runClaude(
   return new Promise((resolve) => {
     const child = spawn("claude", args, { cwd, shell: true });
     currentChild = child;
+    children.add(child);
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -448,6 +455,7 @@ async function runClaude(
       clearTimeout(timedOut);
       clearTimeout(hardFail);
       if (currentChild === child) currentChild = null;
+      children.delete(child);
       resolve({ code, stdout, stderr });
     };
     const timedOut = setTimeout(() => {
@@ -600,8 +608,12 @@ function rememberMapping(threadName: string, cwd: string): void {
 // ---------------------------------------------------------------------------
 
 const queue: Job[] = [];
-let running = false;
-let currentChild: ReturnType<typeof spawn> | null = null;
+let running = false; // true while any dispatch is in flight (status output only)
+const isRunning = () => activeJobs.length > 0;
+/** Jobs currently dispatched (concurrent). One per thread max; diverse cwds preferred. */
+const activeJobs: Job[] = [];
+let currentChild: ReturnType<typeof spawn> | null = null; // last spawned (signals kill all via children set)
+const children = new Set<ReturnType<typeof spawn>>();
 
 // ---------------------------------------------------------------------------
 // Wake watchdog — a routed wake only counts if an answer lands in the thread
@@ -703,7 +715,7 @@ async function handleMeta(job: Job, rest: string): Promise<void> {
         `overseer status — ${client.user?.username ?? "?"}, up since ${START_ISO}\n` +
           `watching every team thread; mapped: ${mapped}\n` +
           `wake=${config.wake} (grace ${config.wakeGraceMs / 1000}s), fullAuto=${config.fullAuto}, poll=${config.pollMs}ms, reposRoot=${config.reposRoot}\n` +
-          `queue=${queue.length}, busy=${running}, wake-checks pending=${pendingFollowups.length}\n` +
+          `queue=${queue.length}, busy=${activeJobs.length}/${config.maxConcurrent}, wake-checks pending=${pendingFollowups.length}\n` +
           `worker sessions: ${Object.entries(state.sessions).map(([n, id]) => `${n}: ${id.slice(0, 8)}`).join(", ") || "(none yet)"}`,
       );
       return;
@@ -763,7 +775,7 @@ async function metaSession(job: Job, question: string): Promise<void> {
   const { allow: _allow, ...configSansIds } = config;
   const facts = [
     `config: ${JSON.stringify(configSansIds)}`,
-    `queue=${queue.length}, busy=${running}, wake-checks pending=${pendingFollowups.length}`,
+    `queue=${queue.length}, busy=${activeJobs.length}/${config.maxConcurrent}, wake-checks pending=${pendingFollowups.length}`,
     `worker sessions: ${JSON.stringify(state.sessions)}`,
     `recent daemon.log tail:\n${logTail}`,
   ].join("\n");
@@ -792,8 +804,8 @@ async function metaSession(job: Job, question: string): Promise<void> {
 }
 
 async function dispatch(job: Job): Promise<void> {
-  running = true;
-  log(`dispatch: "${job.threadName}" (prompt from ${job.from})`);
+  running = isRunning();
+  log(`dispatch: "${job.threadName}" (prompt from ${job.from}) [${activeJobs.length}/${config.maxConcurrent}]`);
   let stopTyping: (() => void) | null = null;
   try {
     const metaRest = splitMeta(job.prompt);
@@ -894,7 +906,7 @@ async function dispatch(job: Job): Promise<void> {
     }
   } finally {
     stopTyping?.();
-    running = false;
+    running = isRunning();
   }
 }
 
@@ -907,11 +919,24 @@ function enqueue(job: Job): void {
   log(`queued: "${job.threadName}" from ${job.from} (queue=${queue.length})`);
 }
 
-async function drain(): Promise<void> {
-  if (running) return;
-  while (queue.length > 0) {
-    const job = queue.shift()!;
-    await dispatch(job);
+function drain(): void {
+  while (queue.length > 0 && activeJobs.length < config.maxConcurrent) {
+    // Prefer a job that conflicts with nothing active (same thread never
+    // concurrent — resume-state races; different cwd preferred — repo races).
+    const conflicts = (j: Job) =>
+      activeJobs.some(
+        (a) => a.threadName === j.threadName || (a.cwd != null && a.cwd === j.cwd),
+      );
+    let idx = queue.findIndex((j) => !conflicts(j));
+    if (idx < 0 && activeJobs.length === 0) idx = 0; // idle: head of queue always runs
+    if (idx < 0) break; // only conflicting jobs left and concurrency budget spent
+    const job = queue.splice(idx, 1)[0];
+    activeJobs.push(job);
+    void dispatch(job).finally(() => {
+      const i = activeJobs.indexOf(job);
+      if (i >= 0) activeJobs.splice(i, 1);
+      drain();
+    });
   }
 }
 
@@ -1060,6 +1085,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     log("shutting down");
     if (currentChild) killTree(currentChild);
+    for (const c of children) killTree(c);
     void client.destroy();
     process.exit(0);
   });
