@@ -78,7 +78,7 @@ child.stdin.write(
 
 const tools = await rpc("tools/list", {});
 const names = (tools.result?.tools ?? []).map((t) => t.name).sort();
-const expected = ["create_thread", "list_channels", "list_threads", "read", "send"].sort();
+const expected = ["bot_inject", "bot_status", "create_thread", "list_channels", "list_threads", "read", "send"].sort();
 if (names.join(",") !== expected.join(",")) {
   fail(`unexpected tools: ${names.join(", ")} (expected ${expected.join(", ")})`);
 }

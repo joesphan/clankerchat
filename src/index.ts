@@ -14,6 +14,18 @@
  *     intent toggles are needed in the developer portal.
  *
  * stdout is reserved for MCP JSON-RPC. All diagnostics go to stderr.
+ *
+ * Hardening (tyler-hardening branch): an instance runs LOCKED when
+ * CLANKER_ROLE=project. In that mode send/read accept only the thread IDs in
+ * CLANKER_ALLOWED_THREADS (which must resolve to THREADS — a plain channel
+ * ID in the allowlist fails closed), `file_path` attachments must resolve
+ * (realpath, symlink-proof) inside CLANKER_FILE_ROOT ("none" disables
+ * attachments), and list_channels / list_threads / create_thread are
+ * refused. Unset role =
+ * upstream behavior, used by the orchestrator/bootstrap instance. Locks are
+ * read lazily from the real environment (per-instance `--env` flags), not
+ * .env (main() actively undoes any hardening values loadEnvFile injected),
+ * so a shared checkout can serve locked and unlocked instances at once.
  */
 
 import {
@@ -34,6 +46,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { loadEnvFile } from "./env.js";
+import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
 const READY_TIMEOUT_MS = 20_000;
@@ -93,6 +106,78 @@ async function awaitReady(): Promise<Client<true>> {
     ).unref();
   });
   return Promise.race([ready, timeout]);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening locks — see header comment. Env is read lazily so per-instance
+// `--env` overrides apply regardless of when .env loading happens.
+// ---------------------------------------------------------------------------
+
+function projectMode(): boolean {
+  return process.env.CLANKER_ROLE?.trim().toLowerCase() === "project";
+}
+
+function allowedThreadIds(): string[] {
+  return (process.env.CLANKER_ALLOWED_THREADS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Project mode: only the pinned thread(s) may be sent to / read from. */
+function assertThreadAllowed(channelId: string): void {
+  if (!projectMode()) return;
+  const allowed = allowedThreadIds();
+  if (allowed.length === 0) {
+    throw new Error(
+      "clankerchat is locked (CLANKER_ROLE=project) but CLANKER_ALLOWED_THREADS is empty — refusing every target.",
+    );
+  }
+  if (!allowed.includes(channelId)) {
+    throw new Error(
+      `clankerchat is locked to thread(s) ${allowed.join(", ")} — channel ${channelId} is not permitted on this instance.`,
+    );
+  }
+}
+
+/** Project mode: refuse the discovery/creation tools outright. */
+function assertNotProjectMode(tool: string): void {
+  if (projectMode()) {
+    throw new Error(`${tool} is disabled on this clankerchat instance (CLANKER_ROLE=project).`);
+  }
+}
+
+/**
+ * Project mode: attachments must realpath inside CLANKER_FILE_ROOT ("none" =
+ * attachments disabled). Returns the realpath to attach. Unlocked instances
+ * keep the upstream behavior (any readable file).
+ */
+function resolveAttachment(file_path: string): { attachment: string; name: string } {
+  if (!projectMode()) {
+    const abs = path.resolve(file_path);
+    if (!fs.existsSync(abs)) {
+      throw new Error(`File not found: ${abs}`);
+    }
+    return { attachment: abs, name: path.basename(abs) };
+  }
+  const root = (process.env.CLANKER_FILE_ROOT ?? "").trim();
+  if (!root || root.toLowerCase() === "none") {
+    throw new Error("Attachments are disabled on this clankerchat instance.");
+  }
+  const rootReal = fs.realpathSync(root); // throws if the root itself is bogus
+  const abs = path.resolve(file_path);
+  let real: string;
+  try {
+    real = fs.realpathSync(abs); // follows symlinks — closes ../ and link escapes
+  } catch {
+    throw new Error(`File not found: ${abs}`);
+  }
+  if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+    throw new Error(
+      `Attachments must live inside ${rootReal} on this instance (resolved: ${real}).`,
+    );
+  }
+  return { attachment: real, name: path.basename(real) };
 }
 
 // ---------------------------------------------------------------------------
@@ -194,15 +279,44 @@ async function findThreadByName(name: string): Promise<ThreadChannel> {
 
 /**
  * Target resolution for send/read: explicit channel_id > thread_name lookup >
- * CLANKER_THREAD_ID default.
+ * CLANKER_THREAD_ID default. Locked instances (CLANKER_ROLE=project) are
+ * checked here — the single funnel — and explicit channel IDs are rejected
+ * before any Discord call is made.
  */
 async function resolveTargetChannel(
   channelId: string | undefined,
   threadName: string | undefined,
 ): Promise<ChatChannel> {
-  if (channelId) return getChatChannel(channelId);
-  if (threadName) return findThreadByName(threadName);
-  return getChatChannel(resolveChannelId(undefined, "CLANKER_THREAD_ID", "channel_id or thread_name"));
+  if (channelId) {
+    assertThreadAllowed(channelId); // fail fast, before any Discord fetch
+    return getFetchedThreadAllowed(channelId);
+  }
+  if (threadName) {
+    const thread = await findThreadByName(threadName);
+    assertThreadAllowed(thread.id);
+    return thread;
+  }
+  const id = resolveChannelId(undefined, "CLANKER_THREAD_ID", "channel_id or thread_name");
+  assertThreadAllowed(id);
+  return getFetchedThreadAllowed(id);
+}
+
+/**
+ * Allowlist membership alone is not enough: the allowlist promises
+ * thread-only access, but getChatChannel() also accepts plain channels.
+ * If a non-thread channel ID lands in CLANKER_ALLOWED_THREADS, fail
+ * closed instead of enabling channel-level send/read.
+ */
+async function getFetchedThreadAllowed(channelId: string): Promise<ChatChannel> {
+  const channel = await getChatChannel(channelId);
+  if (projectMode() && !(channel instanceof ThreadChannel)) {
+    throw new Error(
+      `clankerchat project mode permits threads only, but ${channelId} resolved to a ` +
+        `non-thread channel (${ChannelType[channel.type] ?? String(channel.type)}) — refusing. ` +
+        "Remove it from CLANKER_ALLOWED_THREADS.",
+    );
+  }
+  return channel;
 }
 
 const SENDER_PREFIX = /^\*\*(.+?)\*\*: ?/;
@@ -282,9 +396,16 @@ function registerTools(server: McpServer): void {
           .describe(
             "Optional local file to attach (path). Requires the bot to have Attach Files. `message` becomes the caption.",
           ),
+        reply_to: z
+          .string()
+          .regex(/^\d{16,20}$/, "Discord message ID (snowflake)")
+          .optional()
+          .describe(
+            "Optional message ID in the SAME channel/thread to reply to — posts as a native Discord reply, keeping the answer visually attached to the question. Get the ID from `read` output.",
+          ),
       },
     },
-    ({ channel_id, thread_name, message, sender, file_path }) =>
+    ({ channel_id, thread_name, message, sender, file_path, reply_to }) =>
       guard(async () => {
         if (message.length > MAX_MESSAGE_LENGTH) {
           throw new Error(
@@ -293,11 +414,7 @@ function registerTools(server: McpServer): void {
         }
         let attachment: { attachment: string; name: string } | undefined;
         if (file_path) {
-          const abs = path.resolve(file_path);
-          if (!fs.existsSync(abs)) {
-            throw new Error(`File not found: ${abs}`);
-          }
-          attachment = { attachment: abs, name: path.basename(abs) };
+          attachment = resolveAttachment(file_path);
         }
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const id = channel.id;
@@ -314,9 +431,17 @@ function registerTools(server: McpServer): void {
           }
         }
         const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        // Native reply (same channel only): keeps an answer attached to the
+        // message it answers — the watcher also treats replies-to-our-messages
+        // as explicit addressing, so threaded answers route cleanly.
+        // failIfNotExists:false — a deleted/unknown target degrades to a
+        // normal send instead of erroring the whole tool call.
+        const reply = reply_to ? { messageReference: reply_to, failIfNotExists: false } : undefined;
         const sent = attachment
-          ? await channel.send({ content, files: [attachment] })
-          : await channel.send(content);
+          ? await channel.send({ content, files: [attachment], ...(reply ? { reply } : {}) })
+          : reply
+            ? await channel.send({ content, reply })
+            : await channel.send(content);
         return { sent: true, channel_id: id, message_id: sent.id, ...(note ? { note } : {}) };
       }),
   );
@@ -408,6 +533,7 @@ function registerTools(server: McpServer): void {
     },
     ({ name, channel_id, message }) =>
       guard(async () => {
+        assertNotProjectMode("create_thread");
         const parentId = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         const parent = await getChatChannel(parentId);
         if (parent instanceof ThreadChannel) {
@@ -460,6 +586,7 @@ function registerTools(server: McpServer): void {
     },
     () =>
       guard(async () => {
+        assertNotProjectMode("list_channels");
         const me = await awaitReady();
         return {
           bot: { username: me.user.username, id: me.user.id },
@@ -497,6 +624,7 @@ function registerTools(server: McpServer): void {
     },
     ({ channel_id }) =>
       guard(async () => {
+        assertNotProjectMode("list_threads");
         const id = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         const channel = await getChatChannel(id);
         if (channel instanceof ThreadChannel) {
@@ -521,6 +649,126 @@ function registerTools(server: McpServer): void {
         return { channel_id: id, count: threads.length, threads };
       }),
   );
+
+  // -------------------------------------------------------------------------
+  // botlink — the SSH machine lane (peer bot's daemon, NOT Discord).
+  // Configured only when CLANKER_BOTLINK_PEER is set; unconfigured instances
+  // get a clear error instead of a silent capability. Works in project mode
+  // too: an inject is a PROMPT (same trust level as a Discord tag), and the
+  // receiving machine applies its own untrusted-input scrutiny.
+  // -------------------------------------------------------------------------
+
+  const botlinkPeer = (() => {
+    const peer = process.env.CLANKER_BOTLINK_PEER; // host[:port]
+    const keyPath = process.env.CLANKER_BOTLINK_KEY; // this bot's private key
+    const hostKey = process.env.CLANKER_BOTLINK_PEER_HOSTKEY; // pinned fingerprint/line
+    if (!peer || !keyPath || !hostKey) return null;
+    const [host, portStr] = peer.split(":");
+    return {
+      host,
+      port: portStr ? Number(portStr) : undefined,
+      username: process.env.CLANKER_BOTLINK_USER,
+      privateKeyPem: fs.readFileSync(path.resolve(keyPath), "utf8"),
+      expectedHostKey: hostKey,
+    } satisfies BotlinkPeer;
+  })();
+  const botlinkDisabled = (): string | null => {
+    if (!botlinkPeer) {
+      return (
+        "botlink is not configured on this instance. Set CLANKER_BOTLINK_PEER, " +
+        "CLANKER_BOTLINK_KEY and CLANKER_BOTLINK_PEER_HOSTKEY (see BOTLINK.md)."
+      );
+    }
+    return null;
+  };
+
+  server.registerTool(
+    "bot_status",
+    {
+      title: "Check peer machine's bot status over botlink",
+      description: [
+        "Ask the peer machine's botlink daemon for a health snapshot (uptime,",
+        "inject count, spool depth). Private SSH lane — nothing goes to Discord.",
+        "Use this before injecting, and for keepalive/cross-machine health checks.",
+      ].join(" "),
+      inputSchema: {},
+    },
+    () =>
+      guard(async () => {
+        const disabled = botlinkDisabled();
+        if (disabled) throw new Error(disabled);
+        const out = await botlinkRequest(botlinkPeer!, "status");
+        try {
+          return JSON.parse(out);
+        } catch {
+          return { raw: out };
+        }
+      }),
+  );
+
+  server.registerTool(
+    "bot_inject",
+    {
+      title: "Inject a prompt into the peer machine over botlink",
+      description: [
+        "Deliver a prompt to the peer machine's trigger layer over the private",
+        "SSH lane (NOT Discord — Discord stays the human-readable log). The peer",
+        "treats your text as UNTRUSTED INPUT with elevated scrutiny, exactly like",
+        "a bot-authored Discord tag. `target` routes it (e.g. 'orchestrator', or a",
+        "session/thread name the peer recognizes); `thread` optionally names the",
+        "Discord thread the peer should answer in for human visibility.",
+      ].join(" "),
+      inputSchema: {
+        target: z.string().min(1).max(64).describe("Routing hint on the peer, e.g. 'orchestrator' or 'shim'."),
+        text: z.string().min(1).max(4000).describe("The prompt text (untrusted input on the peer — keep it self-contained)."),
+        thread: z.string().max(64).optional().describe("Discord thread name/id the peer should answer in (human visibility)."),
+        task_kind: z.enum(["implement", "review", "question", "status"]).optional().describe("Structured task: what the receiver should do."),
+        task_repo: z.string().max(200).optional().describe("Structured task: repo name on the receiving side (hint)."),
+        task_branch: z.string().max(200).optional().describe("Structured task: branch to build/review."),
+        task_base: z.string().max(200).optional().describe("Structured task: base ref for diffs."),
+        task_commit: z.string().max(40).optional().describe("Structured task: specific commit under review."),
+        task_diff_ref: z.string().max(400).optional().describe("Structured task: PR/commit ref (TEXT hint — nothing fetches it)."),
+        task_acceptance: z.array(z.string().min(1).max(400)).max(10).optional().describe("Structured task: pass criteria."),
+        task_reply_to: z.string().max(64).optional().describe("Structured task: inject/message id to thread replies to."),
+        task_correlation: z.string().max(64).optional().describe("Structured task: grouping id shared by related injects of one task round."),
+        task_deadline_soft: z.string().max(40).optional().describe("Structured task: soft deadline (duration or timestamp hint)."),
+        supersedes: z.string().max(64).optional().describe("Lineage: inject id this one replaces (same logical prompt, refined)."),
+      },
+    },
+    ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to, task_correlation, task_deadline_soft, supersedes }) =>
+      guard(async () => {
+        const disabled = botlinkDisabled();
+        if (disabled) throw new Error(disabled);
+        const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
+        const task = task_kind
+          ? {
+              kind: task_kind,
+              ...(task_repo ? { repo: task_repo } : {}),
+              ...(task_branch ? { branch: task_branch } : {}),
+              ...(task_base ? { base: task_base } : {}),
+              ...(task_commit ? { commit: task_commit } : {}),
+              ...(task_diff_ref ? { diff_ref: task_diff_ref } : {}),
+              ...(task_acceptance ? { acceptance: task_acceptance } : {}),
+              ...(task_reply_to ? { reply_to: task_reply_to } : {}),
+              ...(task_correlation ? { correlation: task_correlation } : {}),
+              ...(task_deadline_soft ? { deadline_soft: task_deadline_soft } : {}),
+            }
+          : undefined;
+        const out = await botlinkRequest(botlinkPeer!, "inject", {
+          source,
+          target,
+          text,
+          ...(thread ? { thread } : {}),
+          ...(supersedes ? { supersedes } : {}),
+          ...(task ? { task } : {}),
+        });
+        try {
+          return JSON.parse(out);
+        } catch {
+          return { raw: out };
+        }
+      }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +776,20 @@ function registerTools(server: McpServer): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Hardening keys must come from the LAUNCH environment (per-instance
+  // `--env`), never the shared .env: loadEnvFile() fills undefined/empty
+  // vars from .env, so a shared CLANKER_ROLE=project would silently lock
+  // every instance on the machine — including the orchestrator. Snapshot
+  // which keys the launch env actually defined, load .env, then undo any
+  // hardening values the loader injected.
+  const HARDENING_KEYS = ["CLANKER_ROLE", "CLANKER_ALLOWED_THREADS", "CLANKER_FILE_ROOT"];
+  const launchDefined = new Set(
+    HARDENING_KEYS.filter((k) => process.env[k] !== undefined && process.env[k] !== ""),
+  );
   loadEnvFile();
+  for (const k of HARDENING_KEYS) {
+    if (!launchDefined.has(k)) delete process.env[k];
+  }
   const token = process.env.DISCORD_TOKEN;
 
   const server = new McpServer({ name: "clankerchat", version: VERSION });

@@ -4,3 +4,6 @@ dist/
 daemon.json
 daemon.state.json
 daemon.log
+botlink-keys/
+botlink-spool/
+.botlink.env
