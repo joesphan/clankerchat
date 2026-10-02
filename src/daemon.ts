@@ -932,11 +932,10 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
     const latest = thread.lastMessageId;
     let cursor = state.cursors[thread.id];
     if (cursor === undefined) {
-      // First sight of the thread: skip the backlog, prompt on new replies only.
-      if (latest) {
-        state.cursors[thread.id] = latest;
-        saveState();
-      }
+      // First sight: skip backlog for threads with history, but seed "0" for
+      // EMPTY threads so the first message ever posted is not swallowed.
+      state.cursors[thread.id] = latest ?? "0";
+      saveState();
       continue;
     }
     if (!latest || BigInt(cursor) >= BigInt(latest)) continue;
@@ -978,10 +977,8 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
   let rootCursor = state.cursors[parent.id];
   const rootLatest = parent.lastMessageId;
   if (rootCursor === undefined) {
-    if (rootLatest) {
-      state.cursors[parent.id] = rootLatest;
-      saveState();
-    }
+    state.cursors[parent.id] = rootLatest ?? "0";
+    saveState();
   } else if (rootLatest && BigInt(rootCursor) < BigInt(rootLatest)) {
     const fetched = await parent.messages.fetch({ limit: FETCH_LIMIT, after: rootCursor, cache: false });
     const rootMessages = [...fetched.values()].sort(byIdAscending);
