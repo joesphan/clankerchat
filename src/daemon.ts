@@ -429,6 +429,7 @@ async function runClaude(
     currentChild = child;
     let stdout = "";
     let stderr = "";
+    let settled = false;
     child.stdout?.on("data", (d: Buffer) => {
       if (stdout.length < MAX_STDOUT) stdout += d.toString();
     });
@@ -438,21 +439,31 @@ async function runClaude(
     child.on("error", (err) => {
       log(`spawn error: ${errText(err)} — is claude on PATH for this daemon?`);
     });
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timedOut);
+      clearTimeout(hardFail);
+      if (currentChild === child) currentChild = null;
+      resolve({ code, stdout, stderr });
+    };
     const timedOut = setTimeout(() => {
       log(`claude run in ${cwd} exceeded ${timeoutMs}ms — killing it`);
       killTree(child);
     }, timeoutMs);
+    // Safety net: if close never fires (observed once — shell:true trees can
+    // outlive taskkill), resolve anyway so the serial queue can never jam.
+    const hardFail = setTimeout(() => {
+      log(`claude run in ${cwd} never closed after kill — abandoning it (queue unblocked)`);
+      finish(null);
+    }, timeoutMs + 30_000);
     try {
       child.stdin?.write(stdinText + "\n");
       child.stdin?.end();
     } catch {
       // claude died before accepting stdin — the close handler reports it
     }
-    child.on("close", (code) => {
-      clearTimeout(timedOut);
-      if (currentChild === child) currentChild = null;
-      resolve({ code, stdout, stderr });
-    });
+    child.on("close", (code) => finish(code));
   });
 }
 
