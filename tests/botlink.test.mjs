@@ -17,7 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ssh2 from "ssh2";
 const { Client, utils } = ssh2;
-import { generateBotKey, fingerprintOfPublicKey, startBotlinkServer, botlinkRequest, verifyInjectLog } from "../dist/botlink.js";
+import { generateBotKey, fingerprintOfPublicKey, startBotlinkServer, botlinkRequest, verifyInjectLog, appendInjectEvent, renderInjectReport } from "../dist/botlink.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -260,6 +260,84 @@ test("concurrent injects serialize into an intact chain (interleaved-writer race
   assert.equal(entries.length, N, `all ${N} received entries present, chain verifies`);
   const ids = new Set(entries.map((e) => e.id));
   assert.equal(ids.size, N, "no duplicate ids");
+});
+
+test("structured task payloads roundtrip; junk task fields are refused", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  const ack = JSON.parse(
+    await botlinkRequest(peer, "inject", {
+      source: "client-bot",
+      target: "shim",
+      text: "review the re-vendor branch",
+      thread: "shim",
+      task: {
+        kind: "review",
+        repo: "shim",
+        branch: "main",
+        commit: "58833e6",
+        acceptance: ["drift gate clean", "host_tests 570/570"],
+        reply_to: "1790904000000-abc123",
+      },
+    }),
+  );
+  assert.ok(ack.ok);
+  const files = fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json"));
+  const saved = JSON.parse(fs.readFileSync(path.join(spool, files[0]), "utf8"));
+  assert.equal(saved.task.kind, "review");
+  assert.equal(saved.task.commit, "58833e6");
+  assert.deepEqual(saved.task.acceptance, ["drift gate clean", "host_tests 570/570"]);
+  assert.equal(saved.task.reply_to, "1790904000000-abc123");
+  // audit detail carries kind + reply_to for metrics derivation
+  const log = verifyInjectLog(spool);
+  assert.match(log[0].detail ?? "", /kind=review/);
+  assert.match(log[0].detail ?? "", /reply_to=1790904000000-abc123/);
+
+  // junk kind / oversize acceptance / unknown field → refused, nothing spooled
+  await assert.rejects(
+    botlinkRequest(peer, "inject", { source: "c", target: "x", text: "hi", task: { kind: "destroy" } }),
+    /invalid payload/i,
+  );
+  await assert.rejects(
+    botlinkRequest(peer, "inject", {
+      source: "c", target: "x", text: "hi",
+      task: { kind: "review", acceptance: ["x".repeat(401)] },
+    }),
+    /invalid payload/i,
+  );
+  assert.equal(fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length, 1, "only the valid inject spooled");
+});
+
+test("report: metrics derive from the audit log (latency, completed, rework)", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  const first = JSON.parse(
+    await botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "one", task: { kind: "implement", reply_to: "R1" } }),
+  );
+  await new Promise((r) => setTimeout(r, 50));
+  const second = JSON.parse(
+    await botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "two", task: { kind: "review", reply_to: "R1" } }),
+  );
+  // receiver-side lifecycle event on the first
+  await appendInjectEvent(spool, { event: "completed", id: first.id, source: "a", target: "shim", detail: "merged @ aaa5592" });
+  await appendInjectEvent(spool, { event: "consumed", id: first.id, source: "a", target: "shim" });
+  const report = renderInjectReport(spool);
+  assert.match(report, /2 inject\(s\), chain verified/);
+  assert.match(report, /completed lifecycle events: 1/);
+  assert.match(report, /merged @ aaa5592/);
+  assert.match(report, /rework rounds \(shared reply_to\): 1/);
+  assert.match(report, /received→consumed latency: \d+ms median \(1 paired\)/);
+  assert.ok(second.ok);
 });
 
 test("fingerprintOfPublicKey accepts blobs and lines; rejects junk", () => {

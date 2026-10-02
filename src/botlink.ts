@@ -92,7 +92,13 @@ let appendQueue: Promise<void> = Promise.resolve();
 
 export function appendInjectEvent(
   spoolDir: string,
-  evt: { event: "received" | "consumed"; id: string; source: string; target: string; detail?: string },
+  evt: {
+    event: string; // "received" | "consumed" are the lane's own; receivers may append lifecycle events ("completed", …)
+    id: string;
+    source: string;
+    target: string;
+    detail?: string;
+  },
 ): Promise<void> {
   // Serialize read-prev/append inside this process: two connections landing
   // injects simultaneously could otherwise interleave and break the chain.
@@ -120,10 +126,12 @@ export function appendInjectEvent(
 }
 
 /** Replay inject.log and verify the hash chain. Returns entries, or throws. */
-export function verifyInjectLog(spoolDir: string): Array<{ event: string; id: string; hash: string }> {
+export function verifyInjectLog(
+  spoolDir: string,
+): Array<{ event: string; id: string; hash: string; ts?: string; source?: string; target?: string; detail?: string }> {
   const lines = fs.readFileSync(path.join(spoolDir, "inject.log"), "utf8").split("\n").filter(Boolean);
   let prev = "";
-  const out: Array<{ event: string; id: string; hash: string }> = [];
+  const out: Array<{ event: string; id: string; hash: string; ts?: string; source?: string; target?: string; detail?: string }> = [];
   for (const line of lines) {
     const entry = JSON.parse(line);
     const { hash, ...body } = entry;
@@ -138,16 +146,105 @@ export function verifyInjectLog(spoolDir: string): Array<{ event: string; id: st
 }
 
 // ---------------------------------------------------------------------------
+// Lane metrics — derived purely from the audit log (no extra bookkeeping).
+// What the log can't see (merge outcomes in git) lands via lifecycle events
+// the receiving side appends; derive what exists, never invent the rest.
+// ---------------------------------------------------------------------------
+
+export interface InjectMetrics {
+  injects: number;
+  bySource: Record<string, number>;
+  byTarget: Record<string, number>;
+  receivedToConsumedMs: number[]; // per inject that has both events, in order
+  medianReceivedToConsumedMs: number | null;
+  completed: Array<{ id: string; detail?: string }>;
+  reworkRounds: number; // injects sharing a reply_to beyond the first
+}
+
+export function deriveInjectMetrics(
+  entries: Array<{ event: string; id: string; ts?: string; source?: string; target?: string; detail?: string }>,
+): InjectMetrics {
+  const bySource: Record<string, number> = {};
+  const byTarget: Record<string, number> = {};
+  const receivedAt = new Map<string, number>();
+  const consumedAt = new Map<string, number>();
+  const completed: Array<{ id: string; detail?: string }> = [];
+  const replyTo = new Map<string, number>();
+  let injects = 0;
+  for (const e of entries) {
+    const ts = e.ts ? Date.parse(e.ts) : NaN;
+    if (e.event === "received") {
+      injects++;
+      const s = e.source ?? "?";
+      const t = e.target ?? "?";
+      bySource[s] = (bySource[s] ?? 0) + 1;
+      byTarget[t] = (byTarget[t] ?? 0) + 1;
+      if (!Number.isNaN(ts)) receivedAt.set(e.id, ts);
+    } else if (e.event === "consumed" && !Number.isNaN(ts)) {
+      consumedAt.set(e.id, ts);
+    } else if (e.event === "completed") {
+      completed.push({ id: e.id, detail: e.detail });
+    }
+    if (e.event === "received" && e.detail) {
+      const m = e.detail.match(/reply_to[=:]([A-Za-z0-9-]+)/);
+      if (m) replyTo.set(m[1], (replyTo.get(m[1]) ?? 0) + 1);
+    }
+  }
+  const receivedToConsumedMs: number[] = [];
+  for (const [id, got] of consumedAt) {
+    const sent = receivedAt.get(id);
+    if (sent !== undefined && got >= sent) receivedToConsumedMs.push(got - sent);
+  }
+  const sorted = [...receivedToConsumedMs].sort((a, b) => a - b);
+  const median = sorted.length
+    ? sorted[Math.floor((sorted.length - 1) / 2)]
+    : null;
+  let reworkRounds = 0;
+  for (const n of replyTo.values()) if (n > 1) reworkRounds += n - 1;
+  return { injects, bySource, byTarget, receivedToConsumedMs, medianReceivedToConsumedMs: median, completed, reworkRounds };
+}
+
+/** Human-readable report from a spool dir's audit log (chain-verified first). */
+export function renderInjectReport(spoolDir: string): string {
+  const entries = verifyInjectLog(spoolDir);
+  const m = deriveInjectMetrics(entries);
+  const lines = [
+    `inject.log report — ${m.injects} inject(s), chain verified`,
+    `by source: ${Object.entries(m.bySource).map(([k, v]) => `${k}=${v}`).join(" ") || "(none)"}`,
+    `by target: ${Object.entries(m.byTarget).map(([k, v]) => `${k}=${v}`).join(" ") || "(none)"}`,
+    `received→consumed latency: ${m.medianReceivedToConsumedMs !== null ? `${m.medianReceivedToConsumedMs}ms median (${m.receivedToConsumedMs.length} paired)` : "no paired events yet"}`,
+    `completed lifecycle events: ${m.completed.length}`,
+    `rework rounds (shared reply_to): ${m.reworkRounds}`,
+  ];
+  for (const c of m.completed) lines.push(`  completed ${c.id}${c.detail ? ` — ${c.detail}` : ""}`);
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Payload — what an `inject` may carry. Deliberately tiny: a prompt is text
 // plus routing hints, nothing else. The receiving machine treats it as
 // untrusted input (same rule as Discord messages).
 // ---------------------------------------------------------------------------
 
+export const InjectTask = z.object({
+  kind: z.enum(["implement", "review", "question", "status"]), // what the receiver should do
+  repo: z.string().max(200).optional(), // repo name on the receiving side (hint)
+  branch: z.string().max(200).optional(), // branch to build/review
+  base: z.string().max(200).optional(), // base ref for diffs
+  commit: z.string().max(40).optional(), // specific commit under review
+  diff_ref: z.string().max(400).optional(), // PR/commit ref or URL (TEXT ONLY — nothing fetches it)
+  acceptance: z.array(z.string().min(1).max(400)).max(10).optional(), // pass criteria
+  reply_to: z.string().max(64).optional(), // inject/message id to thread replies to
+  deadline_soft: z.string().max(40).optional(), // duration or timestamp HINT
+});
+export type InjectTask = z.infer<typeof InjectTask>;
+
 export const InjectPayload = z.object({
   source: z.string().min(1).max(64), // who is asking (peer bot/agent name)
   target: z.string().min(1).max(64), // routing hint, e.g. "orchestrator" | "shim"
-  text: z.string().min(1).max(BOTLINK_MAX_TEXT), // the prompt itself
+  text: z.string().min(1).max(BOTLINK_MAX_TEXT), // the prompt itself (human framing)
   thread: z.string().max(64).optional(), // reply venue hint (thread name/id)
+  task: InjectTask.optional(), // structured task — hints, same untrusted-input rules
 });
 export type InjectPayload = z.infer<typeof InjectPayload>;
 
@@ -308,7 +405,13 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                   id,
                   source: payload.source,
                   target: payload.target,
-                  detail: `key ${authedKeyFp} from ${peerIp}, ${payload.text.length} chars`,
+                  detail: [
+                    `key ${authedKeyFp} from ${peerIp}, ${payload.text.length} chars`,
+                    payload.task?.kind ? `kind=${payload.task.kind}` : "",
+                    payload.task?.reply_to ? `reply_to=${payload.task.reply_to}` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" "),
                 });
               } catch {
                 /* audit failure must not drop the inject itself */

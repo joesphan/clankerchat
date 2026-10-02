@@ -734,14 +734,40 @@ function registerTools(server: McpServer): void {
         target: z.string().min(1).max(64).describe("Routing hint on the peer, e.g. 'orchestrator' or 'shim'."),
         text: z.string().min(1).max(4000).describe("The prompt text (untrusted input on the peer — keep it self-contained)."),
         thread: z.string().max(64).optional().describe("Discord thread name/id the peer should answer in (human visibility)."),
+        task_kind: z.enum(["implement", "review", "question", "status"]).optional().describe("Structured task: what the receiver should do."),
+        task_repo: z.string().max(200).optional().describe("Structured task: repo name on the receiving side (hint)."),
+        task_branch: z.string().max(200).optional().describe("Structured task: branch to build/review."),
+        task_base: z.string().max(200).optional().describe("Structured task: base ref for diffs."),
+        task_commit: z.string().max(40).optional().describe("Structured task: specific commit under review."),
+        task_diff_ref: z.string().max(400).optional().describe("Structured task: PR/commit ref (TEXT hint — nothing fetches it)."),
+        task_acceptance: z.array(z.string().min(1).max(400)).max(10).optional().describe("Structured task: pass criteria."),
+        task_reply_to: z.string().max(64).optional().describe("Structured task: inject/message id to thread replies to."),
       },
     },
-    ({ target, text, thread }) =>
+    ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to }) =>
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
         const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
-        const out = await botlinkRequest(botlinkPeer!, "inject", { source, target, text, ...(thread ? { thread } : {}) });
+        const task = task_kind
+          ? {
+              kind: task_kind,
+              ...(task_repo ? { repo: task_repo } : {}),
+              ...(task_branch ? { branch: task_branch } : {}),
+              ...(task_base ? { base: task_base } : {}),
+              ...(task_commit ? { commit: task_commit } : {}),
+              ...(task_diff_ref ? { diff_ref: task_diff_ref } : {}),
+              ...(task_acceptance ? { acceptance: task_acceptance } : {}),
+              ...(task_reply_to ? { reply_to: task_reply_to } : {}),
+            }
+          : undefined;
+        const out = await botlinkRequest(botlinkPeer!, "inject", {
+          source,
+          target,
+          text,
+          ...(thread ? { thread } : {}),
+          ...(task ? { task } : {}),
+        });
         try {
           return JSON.parse(out);
         } catch {

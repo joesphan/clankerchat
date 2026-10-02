@@ -14,6 +14,10 @@
  *   node dist/botlink-server.js fingerprint <keyfile>
  *       Print the SHA256 fingerprint of a public or private key file.
  *
+ *   node dist/botlink-server.js report [spoolDir]
+ *       Chain-verify inject.log and print lane metrics (counts by source/
+ *       target, received→consumed latency, completed events, rework rounds).
+ *
  *   node dist/botlink-server.js serve
  *       Listen and serve the two verbs (status / inject). Config from env:
  *         CLANKER_BOTLINK_LISTEN          host:port   (default 127.0.0.1:47421)
@@ -30,7 +34,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { fingerprintOfPublicKey, generateBotKey, parseKey, startBotlinkServer } from "./botlink.js";
+import { fingerprintOfPublicKey, generateBotKey, parseKey, renderInjectReport, startBotlinkServer } from "./botlink.js";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT_DEFAULT = 47421;
@@ -110,9 +114,20 @@ function requiredEnv(name: string): string {
   return v;
 }
 
+function cmdReport(dirArg?: string): void {
+  const spoolDir = dirArg ?? process.env.CLANKER_BOTLINK_SPOOL ?? path.join(PROJECT_ROOT, "botlink-spool");
+  try {
+    console.log(renderInjectReport(spoolDir));
+  } catch (err) {
+    console.error(`report: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "keygen") cmdKeygen(rest);
 else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
+else if (cmd === "report") cmdReport(rest[0]);
 else if (cmd === "serve" || cmd === undefined) cmdServe();
 else {
   console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | serve)`);

@@ -93,12 +93,22 @@ Each inject writes `<id>.inject.json`:
 ```json
 { "id": "…", "received": "ISO-8601", "source": "peer-bot",
   "target": "orchestrator", "text": "the prompt", "thread": "shim",
-  "authenticated_key_fp": "SHA256:…", "peer_ip": "127.0.0.1" }
+  "authenticated_key_fp": "SHA256:…", "peer_ip": "127.0.0.1",
+  "task": { "kind": "review", "repo": "shim", "commit": "58833e6",
+            "acceptance": ["drift gate clean"], "reply_to": "…" } }
 ```
 
 `source` is the sender's SELF-REPORT; `authenticated_key_fp` and `peer_ip`
 are recorded by the receiving daemon at auth time — provenance you can trust
 independent of what the sender claims.
+
+**Structured tasks.** An inject may carry a `task` object: `kind`
+(implement | review | question | status) plus optional hints — `repo`,
+`branch`, `base`, `commit`, `diff_ref` (TEXT hint — nothing fetches it),
+`acceptance[]`, `reply_to`, `deadline_soft`. Schema-validated, capped; all
+fields are sender hints under the same untrusted-input rules. Prose `text`
+stays mandatory (the human-readable framing); the task is the machine-parsed
+shape. The MCP tool exposes them as `task_kind`, `task_repo`, … inputs.
 
 Consume it exactly like a bot-authored tag: mark the prompt as bot-sourced
 untrusted input, keep human triggers higher priority. `target`/`thread` are
@@ -120,6 +130,20 @@ hash covers its predecessor). `verifyInjectLog(spoolDir)` replays it and
 throws on any edit, reorder, or deletion. This is the audit trail for every
 prompt that ever entered the machine through the lane — don't rotate or
 prune it casually; ship it with any security review.
+
+## Lane metrics
+
+```
+npm run botlink -- report          # or: node dist/botlink-server.js report <spoolDir>
+```
+
+Chain-verifies the log, then derives: inject counts by source/target,
+median received→consumed latency, `completed` lifecycle events, and rework
+rounds (injects sharing a `reply_to` beyond the first). Receivers may
+append lifecycle events (`completed` with a detail line like
+`merged @ <sha>`) — `appendInjectEvent()` accepts any event name; the
+chain treats them identically. Metrics derive from what exists in the log;
+nothing is invented.
 
 ## systemd user unit (Linux)
 
