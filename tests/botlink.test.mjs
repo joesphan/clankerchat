@@ -177,6 +177,32 @@ test("unknown verb and malformed payloads are refused; nothing spools", async (t
   assert.notEqual(forbidden, "ran-exit-0", "arbitrary commands must not run");
   assert.equal(fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length, 0, "nothing spooled by refusal");
 
+  // Port forwarding must be refused — the lane is verbs-only, not a tunnel.
+  const fwd = await new Promise((resolve) => {
+    const conn = new Client();
+    conn
+      .on("ready", () => {
+        conn.forwardOut("127.0.0.1", 0, "127.0.0.1", 22, (err, stream) => {
+          conn.end();
+          if (err) return resolve("refused");
+          stream.close();
+          return resolve("forwarded");
+        });
+      })
+      .on("error", () => {
+        conn.end();
+        resolve("refused");
+      })
+      .connect({
+        host: "127.0.0.1",
+        port: srv.port,
+        username: "clanker",
+        privateKey: clientBot.privatePem,
+        hostVerifier: (key) => key.toString("base64") === host.publicLine.split(" ")[1],
+      });
+  });
+  assert.equal(fwd, "refused", "direct-tcpip forwarding must not be honored");
+
   // Oversized text.
   await assert.rejects(
     botlinkRequest(peer, "inject", { source: "c", target: "x", text: "x".repeat(4001) }),
