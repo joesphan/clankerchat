@@ -280,6 +280,42 @@ function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
 
+// ---------------------------------------------------------------------------
+// Typing indicator — Discord's lasts ~10s, so re-trigger every 8s while work
+// runs. Refcounted per thread (router + worker on the same thread stack).
+// ---------------------------------------------------------------------------
+
+const typing = new Map<string, { timer: NodeJS.Timeout; refs: number }>();
+
+async function typingTick(threadId: string): Promise<void> {
+  try {
+    const channel = await client.channels.fetch(threadId, { cache: false });
+    if (channel instanceof ThreadChannel) await channel.sendTyping();
+  } catch {
+    // thread gone/unreachable — stop() clears us; nothing to log per tick
+  }
+}
+
+function startTyping(threadId: string): () => void {
+  const existing = typing.get(threadId);
+  if (existing) {
+    existing.refs++;
+    return () => stopTypingRef(threadId);
+  }
+  void typingTick(threadId);
+  const timer = setInterval(() => void typingTick(threadId), 8_000);
+  typing.set(threadId, { timer, refs: 1 });
+  return () => stopTypingRef(threadId);
+}
+
+function stopTypingRef(threadId: string): void {
+  const t = typing.get(threadId);
+  if (!t) return;
+  if (--t.refs > 0) return;
+  clearInterval(t.timer);
+  typing.delete(threadId);
+}
+
 /** Message ids the daemon itself posted (acks, notices). A wake counts as
  *  answered only when a SESSION replies — never the daemon's own messages. */
 const daemonMessageIds = new Set<string>();
@@ -405,6 +441,7 @@ interface Job {
   cwd: string | null; // repo path from daemon.json, if the thread is mapped
   prompt: string; // mention-stripped message text
   from: string; // Discord username of the triggering human
+  fromId: string; // Discord user/bot id of the asker — replies tag this
   fromBot: boolean; // triggered by a peer bot rather than an allowlisted human
   triggerId: string; // id of the Discord message that triggered this job
   skipWake?: boolean; // fallback run: route cwd only, never wake
@@ -445,7 +482,7 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
     `Repo folders under ${config.reposRoot}: ${repoNames.join(", ") || "(none found)"}`,
     ``,
     `Steps:`,
-    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
+    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
     `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
     ``,
     `Reply with ONLY one line of JSON, no prose:`,
@@ -523,6 +560,7 @@ interface FollowUp {
   ackId: string; // ack (or trigger) id; any bot message newer than this = answered
   deadline: number;
   routedCwd: string | null; // repo the router picked, reused by the fallback
+  stopTyping: () => void; // keep the indicator lit until the answer or deadline
 }
 
 const pendingFollowups: FollowUp[] = [];
@@ -542,6 +580,7 @@ async function checkFollowups(): Promise<void> {
         );
         if (answered) {
           pendingFollowups.splice(i, 1);
+          f.stopTyping();
           log(`wake follow-up: live session answered in "${f.job.threadName}"`);
           continue;
         }
@@ -551,6 +590,7 @@ async function checkFollowups(): Promise<void> {
     }
     if (Date.now() >= f.deadline) {
       pendingFollowups.splice(i, 1);
+      f.stopTyping();
       log(`wake follow-up: no answer in "${f.job.threadName}" after ${config.wakeGraceMs}ms — spawning worker fallback`);
       enqueue({ ...f.job, cwd: f.routedCwd ?? f.job.cwd, skipWake: true });
     }
@@ -561,8 +601,9 @@ function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   return [
     `You are the ${name} overseer worker, spawned because ${job.fromBot ? `another machine's agent (${job.from}) mentioned` : "a human replied to"} this machine's bot in the "${job.threadName}" Discord thread.`,
+    `Start your reply by tagging the asker — the first characters of the message must be <@${job.fromId}> followed by a space.`,
     job.fromBot
-      ? `Reply as a NEW message in that thread — do NOT use a Discord reply to their message (replying auto-mentions their bot and can re-trigger their daemon into a loop). Address them by name in plain text instead.`
+      ? `Post your reply as a NEW message in the thread, not a Discord reply to their message (new-message tags reach the peer's humans; reply-chains can trip peer daemons that wake on mentions).`
       : ``,
     sandboxed
       ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
@@ -679,10 +720,12 @@ async function metaSession(job: Job, question: string): Promise<void> {
     `--- meta question from ${job.from} ---`,
     question,
     ``,
-    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", under 2000 chars, starting with "overseer meta:". Never paste secrets.`,
+    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", under 2000 chars, starting with the tag <@${job.fromId}> then "overseer meta:". Never paste secrets.`,
   ].join("\n");
   const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS, "--permission-mode", "default"];
+  const stopTyping = startTyping(job.threadId);
   const run = await runClaude(args, PROJECT_ROOT, prompt, config.timeoutMs);
+  stopTyping();
   const { result } = parseSessionResult(run.stdout);
   log(
     `meta done: exit ${run.code}${result ? ` — ${oneLine(result).slice(0, 200)}` : run.stderr ? ` — stderr: ${oneLine(run.stderr).slice(0, 200)}` : ""}`,
@@ -695,6 +738,7 @@ async function metaSession(job: Job, question: string): Promise<void> {
 async function dispatch(job: Job): Promise<void> {
   running = true;
   log(`dispatch: "${job.threadName}" (prompt from ${job.from})`);
+  let stopTyping: (() => void) | null = null;
   try {
     const metaRest = splitMeta(job.prompt);
     if (metaRest !== null) {
@@ -702,6 +746,9 @@ async function dispatch(job: Job): Promise<void> {
       await handleMeta(job, metaRest);
       return;
     }
+
+    // "Thinking…" in the thread from routing until the answer lands.
+    stopTyping = startTyping(job.threadId);
     const ackId = config.ack
       ? await sendToThread(
           job.threadId,
@@ -729,7 +776,9 @@ async function dispatch(job: Job): Promise<void> {
         ackId: ackId ?? job.triggerId,
         deadline: Date.now() + config.wakeGraceMs,
         routedCwd: cwd,
+        stopTyping: stopTyping ?? (() => {}),
       });
+      stopTyping = null; // ownership moves to the follow-up (lit until answer/deadline)
       log(`done: "${job.threadName}" routed to live session "${woke}" (watchdog ${config.wakeGraceMs / 1000}s)`);
       return; // the watchdog spawns a worker if no answer lands in time
     }
@@ -788,6 +837,7 @@ async function dispatch(job: Job): Promise<void> {
       );
     }
   } finally {
+    stopTyping?.();
     running = false;
   }
 }
@@ -855,6 +905,7 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
         cwd: mapped,
         prompt,
         from: m.author.username,
+        fromId: m.author.id,
         fromBot: m.author.bot,
         triggerId: m.id,
       });
