@@ -1048,7 +1048,7 @@ async function main(): Promise<void> {
       log(`follow-up error: ${errText(err)}`);
     }
     try {
-      await drain();
+      void drain(); // non-blocking: polling must never starve behind a long worker
     } catch (err) {
       log(`dispatch error: ${errText(err)}`);
     }
