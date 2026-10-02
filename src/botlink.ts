@@ -341,7 +341,10 @@ export const InjectPayload = z.object({
       name: z.string().min(1).max(160), // display/hint name — receiver sanitizes to a basename, sender NEVER picks a path
       size: z.number().int().min(1), // decoded byte length (receiver verifies)
       sha256: z.string().regex(/^[0-9a-f]{64}$/), // of the DECODED bytes (receiver verifies)
-      content_b64: z.string().min(1), // base64 of the raw bytes
+      // Schema-level blob bound: base64 of the 2 MB cap is ~2.8 MB — anything
+      // larger is a hostile/buggy peer, rejected at PARSE before the raw
+      // accumulator or decoder ever sees it.
+      content_b64: z.string().min(1).max(Math.ceil(BOTLINK_MAX_FILE_BYTES / 3) * 4),
       note: z.string().max(400).optional(), // one line: what it is / why
     })
     .optional(), // file transfer — same trust level as the text (untrusted on arrival)
@@ -422,6 +425,7 @@ export interface BotlinkServerOptions {
   maxConnections?: number; // concurrent SSH connection cap — slowloris guard (default 10)
   execTimeoutMs?: number; // per-exec watchdog: no payload-end by this → drop (default 30s)
   maxFileBytes?: number; // per-file cap for file-carrying injects (default 2 MB decoded)
+  maxRawPayloadBytes?: number; // raw stdin accumulator cap BEFORE parsing (default 12 MB — headroom over one max file + envelope)
   log?: (line: string) => void;
 }
 
@@ -453,6 +457,11 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   const maxConnections = opts.maxConnections ?? 10; // legit inject bursts clear; parked-idle channels are the thing being bounded
   const execTimeoutMs = opts.execTimeoutMs ?? 30_000;
   const maxFileBytes = opts.maxFileBytes ?? BOTLINK_MAX_FILE_BYTES;
+  // Raw-accumulator cap: zod bounds the PARSED payload, but the stdin
+  // collector buffers whatever bytes arrive BEFORE parse — a hostile authed
+  // peer could stream gigabytes of junk-JSON into memory. Refuse the channel
+  // the moment the accumulator crosses the line.
+  const maxRawPayloadBytes = opts.maxRawPayloadBytes ?? 12 * 1024 * 1024;
 
   // Unconsumed-spool depth, shared by the status snapshot and the inject cap.
   const countPending = () => {
@@ -559,10 +568,25 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               return;
             }
             let data = "";
-            stream.stdin.on("data", (c: Buffer) => (data += c.toString("utf8")));
+            let rawRefused = false; // oversize accumulator: stop buffering, refuse at end
+            stream.stdin.on("data", (c: Buffer) => {
+              if (rawRefused) return; // already over the line — keep draining, keep nothing
+              data += c.toString("utf8");
+              if (data.length > maxRawPayloadBytes) {
+                rawRefused = true;
+                data = ""; // drop the buffer, not just the flag — the bytes are garbage to us
+              }
+            });
             stream.stdin.on("end", async () => {
               if (reaped) return; // watchdog already dropped this channel
               clearTimeout(watchdog); // payload arrived — normal processing from here
+              if (rawRefused) {
+                log(`botlink: payload refused from ${peerIp} — raw body over ${maxRawPayloadBytes} bytes (pre-parse accumulator cap)`);
+                stream.stderr.end(`payload too large: raw body exceeds ${maxRawPayloadBytes} bytes\n`);
+                stream.exit(1);
+                stream.close();
+                return;
+              }
               if (++injects > maxInjects) {
                 stream.stderr.end("inject limit for this connection\n");
                 stream.exit(1);
@@ -769,7 +793,11 @@ export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", pay
       conn.end();
       finish(() => reject(new Error(msg)));
     };
-    timer = setTimeout(() => fail(`botlink verb "${verb}" timed out after 30s without completing`), 30_000);
+    // File-carrying injects move ~2.8 MB of base64; give them double the
+    // absolute deadline so a slow link fails on the SERVER's watchdog, not
+    // on our own impatience (both fire well under a healthy tailnet's time).
+    const deadlineMs = verb === "inject" && payload?.file ? 60_000 : 30_000;
+    timer = setTimeout(() => fail(`botlink verb "${verb}" timed out after ${deadlineMs / 1000}s without completing`), deadlineMs);
     conn
       .on("ready", () => {
         conn.exec(verb, (err, stream) => {

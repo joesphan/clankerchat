@@ -723,3 +723,89 @@ test("file inject: hostile sender-supplied name is collapsed server-side (no tra
   assert.ok(fs.readFileSync(path.join(destDir, "evil.sh")).equals(bytes));
   assert.equal(fs.existsSync(path.join(spool, "..", "evil.sh")), false, "nothing escaped the spool");
 });
+
+test("file inject hardening: schema bounds the blob, raw accumulator cap refuses pre-parse", async (t) => {
+  // Schema-level: content_b64 beyond base64-of-2MB is rejected at PARSE —
+  // a hostile peer's oversized blob never reaches the decoder.
+  const bytes = Buffer.from("x");
+  const bloated = {
+    source: "client-bot",
+    target: "orchestrator",
+    text: "schema-bound probe",
+    file: {
+      name: "blob.bin",
+      size: 1,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      content_b64: "A".repeat(Math.ceil(BOTLINK_MAX_FILE_BYTES / 3) * 4 + 1),
+    },
+  };
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = { host: "127.0.0.1", port: srv.port, privateKeyPem: clientBot.privatePem, expectedHostKey: host.fingerprint };
+  await assert.rejects(botlinkRequest(peer, "inject", bloated), /invalid payload/i);
+
+  // Accumulator cap: raw stdin beyond maxRawPayloadBytes is refused BEFORE
+  // parsing — junk that isn't even JSON gets the same wall. Tiny cap here so
+  // the test moves bytes, not tens of megabytes.
+  const { srv: srv2, host: host2, clientBot: clientBot2, spool: spool2 } = await makeServer(t, { maxRawPayloadBytes: 1024 });
+  const peer2 = { host: "127.0.0.1", port: srv2.port, privateKeyPem: clientBot2.privatePem, expectedHostKey: host2.fingerprint };
+  await assert.rejects(
+    botlinkRequestRaw(peer2, "x".repeat(4096)),
+    /payload too large/i,
+  );
+  assert.equal(
+    fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length +
+      fs.readdirSync(spool2).filter((f) => f.endsWith(".inject.json")).length,
+    0,
+    "nothing spooled by either refusal",
+  );
+});
+
+/** Raw-stdin inject: ship arbitrary bytes as the "payload" (no builder, no
+ *  valid JSON) — what a hostile authed peer actually controls. */
+function botlinkRequestRaw(peer, raw) {
+  // Reuse the public client but intercept the payload write: botlinkRequest
+  // only injects JSON for `inject` when given a payload object; without one
+  // it sends nothing. So drive ssh2 directly here.
+  return new Promise((resolve, reject) => {
+    const { Client } = ssh2;
+    const conn = new Client();
+    const done = (fn) => {
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(() => {
+      conn.end();
+      reject(new Error("raw probe timed out"));
+    }, 15_000);
+    conn
+      .on("ready", () => {
+        conn.exec("inject", (err, stream) => {
+          if (err) return done(() => reject(err));
+          let errOut = "";
+          let exitCode = null;
+          stream.on("data", () => {}); // drain: without a reader the channel window stalls and 'close' never fires
+          stream.stderr.on("data", (c) => (errOut += c.toString()));
+          stream.on("exit", (code) => (exitCode = code));
+          stream.on("close", () => {
+            conn.end();
+            done(() =>
+              exitCode === 0
+                ? resolve("unexpected ok")
+                : reject(new Error(errOut.trim() || `exit ${exitCode}`)),
+            );
+          });
+          stream.end(raw);
+        });
+      })
+      .on("error", (err) => done(() => reject(err)))
+      .on("close", () => done(() => reject(new Error("closed early"))))
+      .connect({
+        host: peer.host,
+        port: peer.port,
+        username: "clanker",
+        privateKey: peer.privateKeyPem,
+        hostVerifier: (key) => fingerprintOfPublicKey(key.toString("base64")) === peer.expectedHostKey,
+        readyTimeout: 10_000,
+      });
+  });
+}

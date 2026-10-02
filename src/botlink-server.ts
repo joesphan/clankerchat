@@ -29,6 +29,7 @@
  *         CLANKER_BOTLINK_MAX_PENDING     refuse injects at this spool depth (default 100)
  *         CLANKER_BOTLINK_MAX_CONNECTIONS concurrent-connection cap (default 10)
  *         CLANKER_BOTLINK_MAX_FILE_BYTES  per-file cap for file-carrying injects (default 2 MB)
+ *         CLANKER_BOTLINK_MAX_PAYLOAD_BYTES raw stdin cap before parsing (default 12 MB)
  *
  * stdout is reserved for keygen/fingerprint output; serve logs to stderr.
  */
@@ -92,6 +93,7 @@ function cmdServe(): void {
     maxSpoolPending: numEnv("CLANKER_BOTLINK_MAX_PENDING"),
     maxConnections: numEnv("CLANKER_BOTLINK_MAX_CONNECTIONS"),
     maxFileBytes: numEnv("CLANKER_BOTLINK_MAX_FILE_BYTES"),
+    maxRawPayloadBytes: numEnv("CLANKER_BOTLINK_MAX_PAYLOAD_BYTES"),
     log: (line) => console.error(line),
   });
   console.error(`botlink-server: serving as "${botName}" (spool: ${spoolDir})`);
