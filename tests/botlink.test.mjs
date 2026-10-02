@@ -462,3 +462,125 @@ test("fingerprintOfPublicKey accepts blobs and lines; rejects junk", () => {
   assert.equal(fingerprintOfPublicKey(key.publicLine.split(" ")[1]), key.fingerprint);
   assert.throws(() => fingerprintOfPublicKey("not a key"), /not a public key/);
 });
+
+test("spool-depth cap: inject past maxSpoolPending is refused, nothing spooled (disk-fill guard)", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t, { maxSpoolPending: 1 });
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  const first = JSON.parse(await botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "one" }));
+  assert.ok(first.ok, "first inject spools (cap not yet reached)");
+  // Nothing consumes the spool in this test — the second inject must hit the cap.
+  await assert.rejects(
+    botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "two" }),
+    /spool full/i,
+    "inject past the pending cap is refused with a clear reason",
+  );
+  assert.equal(fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length, 1, "refused inject wrote no file");
+  // Status still answers and reports the honest depth.
+  const status = JSON.parse(await botlinkRequest(peer, "status"));
+  assert.equal(status.spool_pending, 1);
+  assert.equal(status.injects_total, 1, "refused inject is not counted");
+});
+
+test("connection cap: beyond maxConnections the SSH handshake is dropped (slowloris guard)", async (t) => {
+  const { srv, host, clientBot } = await makeServer(t, { maxConnections: 1 });
+  const connect = () => {
+    const conn = new Client();
+    const ready = new Promise((resolve, reject) => {
+      conn.on("ready", () => resolve(conn));
+      conn.on("error", reject);
+      // A server that drops the connection mid-handshake (the cap path) can
+      // emit ONLY 'close' — without this listener the promise never settles
+      // (the exact hang the library client fix covers; raw clients need it too).
+      conn.on("close", () => reject(new Error("connection closed before ready")));
+      conn.connect({
+        host: "127.0.0.1",
+        port: srv.port,
+        username: "clanker",
+        privateKey: clientBot.privatePem,
+        hostVerifier: (key) => key.toString("base64") === host.publicLine.split(" ")[1],
+      });
+    });
+    return { conn, ready };
+  };
+  const held = connect();
+  t.after(() => held.conn.end());
+  await held.ready; // connection #1 authenticated and parked (no exec, no data)
+  // Connection #2 must be refused at the door — the server has no free slot.
+  const second = connect();
+  const outcome = await Promise.race([
+    second.ready.then(
+      () => "admitted",
+      () => "refused", // error OR close-only — both are refusals (see connect())
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("timeout"), 3000)),
+  ]);
+  second.conn.end();
+  assert.notEqual(outcome, "admitted", "a parked connection must block new ones past the cap");
+  assert.notEqual(outcome, "timeout", "the refusal must be immediate-ish, not silence");
+  // After the held connection goes away, a fresh one gets in again.
+  held.conn.end();
+  await new Promise((r) => setTimeout(r, 150));
+  const third = connect();
+  await third.ready;
+  third.conn.end();
+});
+
+test("client never hangs: a peer that closes mid-handshake rejects, close-only (no error event)", async () => {
+  // Regression for the connection-cap discovery: refused/dying connections can
+  // surface as a bare socket 'close' — the request must settle, not pend.
+  const net = await import("node:net");
+  const dropper = net.createServer((socket) => socket.destroy()); // accept, then RST-ish close
+  await new Promise((resolve) => dropper.listen(0, "127.0.0.1", resolve));
+  const port = dropper.address().port;
+  const anyKey = generateBotKey("hang-probe");
+  await assert.rejects(
+    botlinkRequest(
+      { host: "127.0.0.1", port, privateKeyPem: anyKey.privatePem, expectedHostKey: anyKey.fingerprint },
+      "status",
+    ),
+    /unreachable|closed|timed out|reset/i,
+    "connection dropped before handshake must reject within the deadline, never hang",
+  );
+  dropper.close();
+});
+
+test("exec watchdog: an exec channel that never ends is dropped (idle-channel guard)", async (t) => {
+  const { srv, host, clientBot } = await makeServer(t, { execTimeoutMs: 150 });
+  const verdict = await new Promise((resolve) => {
+    const conn = new Client();
+    let settled = false;
+    const done = (how) => {
+      if (!settled) {
+        settled = true;
+        conn.end();
+        resolve(how);
+      }
+    };
+    conn
+      .on("ready", () => {
+        conn.exec("inject", (err, stream) => {
+          if (err) return done("exec-rejected");
+          // Hostile shape: open the channel, send a partial payload, never EOF.
+          stream.stdin.write('{"source":"a"');
+          stream.on("close", () => done("dropped"));
+          conn.on("close", () => done("dropped"));
+        });
+      })
+      .on("error", () => done("dropped"))
+      .connect({
+        host: "127.0.0.1",
+        port: srv.port,
+        username: "clanker",
+        privateKey: clientBot.privatePem,
+        hostVerifier: (key) => key.toString("base64") === host.publicLine.split(" ")[1],
+      });
+    // If the watchdog is broken the channel lives forever — fail, don't hang.
+    setTimeout(() => done("still-open"), 3000).unref();
+  });
+  assert.equal(verdict, "dropped", "stalled exec channel must be closed by the server");
+});

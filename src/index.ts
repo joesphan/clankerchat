@@ -423,9 +423,16 @@ function registerTools(server: McpServer): void {
           .describe(
             "Optional local file to attach (path). Requires the bot to have Attach Files. `message` becomes the caption.",
           ),
+        reply_to: z
+          .string()
+          .regex(/^\d{16,20}$/, "Discord message ID (snowflake)")
+          .optional()
+          .describe(
+            "Optional message ID in the SAME channel/thread to reply to — posts as a native Discord reply, keeping the answer visually attached to the question. Get the ID from `read` output.",
+          ),
       },
     },
-    ({ channel_id, thread_name, message, sender, file_path }) =>
+    ({ channel_id, thread_name, message, sender, file_path, reply_to }) =>
       guard(async () => {
         if (message.length > MAX_MESSAGE_LENGTH) {
           throw new Error(
@@ -451,9 +458,17 @@ function registerTools(server: McpServer): void {
           }
         }
         const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        // Native reply (same channel only): keeps an answer attached to the
+        // message it answers — the watcher also treats replies-to-our-messages
+        // as explicit addressing, so threaded answers route cleanly.
+        // failIfNotExists:false — a deleted/unknown target degrades to a
+        // normal send instead of erroring the whole tool call.
+        const reply = reply_to ? { messageReference: reply_to, failIfNotExists: false } : undefined;
         const sent = attachment
-          ? await channel.send({ content, files: [attachment] })
-          : await channel.send(content);
+          ? await channel.send({ content, files: [attachment], ...(reply ? { reply } : {}) })
+          : reply
+            ? await channel.send({ content, reply })
+            : await channel.send(content);
         return { sent: true, channel_id: id, message_id: sent.id, ...(note ? { note } : {}) };
       }),
   );

@@ -26,6 +26,8 @@
  *         CLANKER_BOTLINK_USER            required SSH username (default "clanker")
  *         CLANKER_BOTLINK_SPOOL           inject spool dir (default ./botlink-spool)
  *         CLANKER_BOTLINK_NAME            this bot's link name (default CLANKER_NAME/hostname)
+ *         CLANKER_BOTLINK_MAX_PENDING     refuse injects at this spool depth (default 100)
+ *         CLANKER_BOTLINK_MAX_CONNECTIONS concurrent-connection cap (default 10)
  *
  * stdout is reserved for keygen/fingerprint output; serve logs to stderr.
  */
@@ -86,6 +88,8 @@ function cmdServe(): void {
     username: process.env.CLANKER_BOTLINK_USER,
     spoolDir,
     botName,
+    maxSpoolPending: numEnv("CLANKER_BOTLINK_MAX_PENDING"),
+    maxConnections: numEnv("CLANKER_BOTLINK_MAX_CONNECTIONS"),
     log: (line) => console.error(line),
   });
   console.error(`botlink-server: serving as "${botName}" (spool: ${spoolDir})`);
@@ -112,6 +116,18 @@ function requiredEnv(name: string): string {
     process.exit(1);
   }
   return v;
+}
+
+/** Positive-integer env value, or undefined to take the library default. */
+function numEnv(name: string): number | undefined {
+  const v = process.env[name];
+  if (v === undefined || v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1) {
+    console.error(`botlink-server: ${name} must be a positive integer (got "${v}")`);
+    process.exit(1);
+  }
+  return n;
 }
 
 function cmdReport(dirArg?: string): void {

@@ -343,6 +343,9 @@ export interface BotlinkServerOptions {
   spoolDir: string; // where inject payloads land for the local trigger layer
   botName: string;
   maxInjectsPerConnection?: number;
+  maxSpoolPending?: number; // refuse injects at/above this many unconsumed files (default 100)
+  maxConnections?: number; // concurrent SSH connection cap — slowloris guard (default 10)
+  execTimeoutMs?: number; // per-exec watchdog: no payload-end by this → drop (default 30s)
   log?: (line: string) => void;
 }
 
@@ -358,6 +361,7 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   const log = opts.log ?? (() => {});
   const startedAt = Date.now();
   let injectsTotal = 0;
+  let liveConnections = 0;
   fs.mkdirSync(opts.spoolDir, { recursive: true });
 
   const allowedKeys = opts.authorizedPublicKeys.map((line) => parseKey(line));
@@ -369,6 +373,18 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   parseKey(opts.hostKeyPem);
   const username = opts.username ?? BOTLINK_USER_DEFAULT;
   const maxInjects = opts.maxInjectsPerConnection ?? 30;
+  const maxPending = opts.maxSpoolPending ?? 100;
+  const maxConnections = opts.maxConnections ?? 10; // legit inject bursts clear; parked-idle channels are the thing being bounded
+  const execTimeoutMs = opts.execTimeoutMs ?? 30_000;
+
+  // Unconsumed-spool depth, shared by the status snapshot and the inject cap.
+  const countPending = () => {
+    try {
+      return fs.readdirSync(opts.spoolDir).filter((f) => f.endsWith(".inject.json")).length;
+    } catch {
+      return 0; // unreadable spool reads as 0 pending — same as status today
+    }
+  };
 
   const server = new SshServer(
     { hostKeys: [opts.hostKeyPem], ident: "clankerchat-botlink" },
@@ -382,6 +398,16 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
           : Array.isArray(rawIp)
             ? String(rawIp.find((x) => typeof x === "string") ?? "?")
             : "?";
+      // Concurrent-connection cap: a peer (or a compromised mesh station)
+      // holding idle channels open must not be able to wedge the lane with
+      // less traffic than a handshake. Refused connections never authenticate.
+      if (liveConnections >= maxConnections) {
+        log(`botlink: connection refused from ${peerIp} — ${liveConnections} live (cap ${maxConnections})`);
+        conn.end();
+        return;
+      }
+      liveConnections++;
+      conn.once("close", () => liveConnections--);
       let authed = false;
       let authedKeyFp = ""; // provenance: WHICH authorized key let this peer in
       conn.on("authentication", (ctx) => {
@@ -419,13 +445,26 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               return void reject();
             }
             const stream = accept();
-            if (verb === "status") {
-              let pending = 0;
+            // Exec watchdog: a hostile/buggy peer can open `inject` and never
+            // send EOF, parking the channel forever. Any legit exchange
+            // (≤4000-char payload) closes within milliseconds; drop the whole
+            // connection if this channel is still open when the timer fires.
+            let reaped = false; // set when the watchdog fires: late stdin 'end'
+            // events (ssh2 flushes partial data as the channel closes) must
+            // not try to write an ACK to a dead stream.
+            const watchdog = setTimeout(() => {
+              reaped = true;
+              log(`botlink: exec stalled from ${peerIp} (${verb}, no payload end in ${execTimeoutMs}ms) — dropping connection`);
               try {
-                pending = fs.readdirSync(opts.spoolDir).filter((f) => f.endsWith(".inject.json")).length;
+                stream.close();
               } catch {
-                /* unreadable spool reads as 0 pending */
+                /* already gone — conn.end() below is the backstop */
               }
+              conn.end();
+            }, execTimeoutMs);
+            stream.once("close", () => clearTimeout(watchdog));
+            if (verb === "status") {
+              const pending = countPending();
               // Canonical ssh2 server pattern: write on the channel itself,
               // then exit-status, then close — ending a substream can close
               // the channel before the exit-status request is flushed.
@@ -445,6 +484,8 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
             let data = "";
             stream.stdin.on("data", (c: Buffer) => (data += c.toString("utf8")));
             stream.stdin.on("end", async () => {
+              if (reaped) return; // watchdog already dropped this channel
+              clearTimeout(watchdog); // payload arrived — normal processing from here
               if (++injects > maxInjects) {
                 stream.stderr.end("inject limit for this connection\n");
                 stream.exit(1);
@@ -456,6 +497,20 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                 payload = InjectPayload.parse(JSON.parse(data));
               } catch (err) {
                 stream.stderr.end(`invalid payload: ${(err as Error).message}\n`);
+                stream.exit(1);
+                stream.close();
+                return;
+              }
+              // Spool-depth cap: injects are cheap for the sender and priced
+              // in disk for the receiver, and the archive keeps everything —
+              // a peer stuck in an ack-loop must not be able to fill this
+              // machine. Refuse past the cap, loudly, nothing spooled.
+              const pending = countPending();
+              if (pending >= maxPending) {
+                log(`botlink: inject REFUSED from ${peerIp} — spool at ${pending} pending (cap ${maxPending}); receiver is not consuming`);
+                stream.stderr.end(
+                  `spool full: ${pending} inject(s) pending, cap ${maxPending} — the receiver is not consuming; inject refused (nothing was spooled)\n`,
+                );
                 stream.exit(1);
                 stream.close();
                 return;
@@ -567,10 +622,23 @@ export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", pay
     const want = peer.expectedHostKey.trim();
     const wantFp = want.startsWith("SHA256:") ? want : fingerprintOfPublicKey(want);
     const conn = new SshClient();
+    // Every exit path must settle the promise exactly once: a peer that drops
+    // the socket mid-handshake (restart, connection cap, crash) can emit ONLY
+    // a 'close' — no 'error' — and without the close handler the request hung
+    // forever (found by the connection-cap test: refused connections died
+    // exactly this way). The absolute deadline backstops any other silent
+    // stall; late settles are no-ops by Promise semantics.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (fn: () => void) => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      fn();
+    };
     const fail = (msg: string) => {
       conn.end();
-      reject(new Error(msg));
+      finish(() => reject(new Error(msg)));
     };
+    timer = setTimeout(() => fail(`botlink verb "${verb}" timed out after 30s without completing`), 30_000);
     conn
       .on("ready", () => {
         conn.exec(verb, (err, stream) => {
@@ -585,14 +653,18 @@ export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", pay
           stream.on("exit", (code: number | null) => (exitCode = code));
           stream.on("close", () => {
             conn.end();
-            if (exitCode === 0) return resolve(out.trim());
-            reject(new Error(errOut.trim() || `botlink verb failed (exit ${exitCode})`));
+            finish(() =>
+              exitCode === 0
+                ? resolve(out.trim())
+                : reject(new Error(errOut.trim() || `botlink verb failed (exit ${exitCode})`)),
+            );
           });
           if (verb === "inject" && payload) stream.end(JSON.stringify(payload) + "\n");
           else stream.end();
         });
       })
       .on("error", (err) => fail(`botlink peer unreachable: ${err.message}`))
+      .on("close", () => fail("botlink peer closed the connection before the verb completed"))
       .connect({
         host: peer.host,
         port: peer.port ?? BOTLINK_PORT_DEFAULT,
