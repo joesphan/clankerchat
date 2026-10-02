@@ -49,15 +49,41 @@ export function generateBotKey(comment: string): BotKeyPair {
   // ssh2's own generator emits containers its parser/signer handle by
   // construction — and OpenSSH itself accepts them (verified against
   // ssh-keygen). No hand-rolled wire format to drift out of spec.
-  const pair = utils.generateKeyPairSync("ed25519", { comment }) as unknown as {
-    public: string;
-    private: string;
-  };
-  return {
-    privatePem: pair.private,
-    publicLine: pair.public.trim(),
-    fingerprint: fingerprintOfPublicKey(pair.public),
-  };
+  //
+  // EXCEPT, intermittently, it doesn't: ~0.4% of ed25519 pairs (8/2000
+  // observed) come out with a dropped length prefix in the private section —
+  // ssh2's parser AND `ssh-keygen -y` both reject the file ("invalid
+  // format"). Self-verify every pair (parse both halves, cross-check the
+  // derived public blob against the public line) and regenerate on failure:
+  // keygen runs once per bot, so the retry costs nothing and a malformed
+  // key never ships to a place where the daemon boots on it.
+  for (let attempt = 0; ; attempt++) {
+    const pair = utils.generateKeyPairSync("ed25519", { comment }) as unknown as {
+      public: string;
+      private: string;
+    };
+    const want = pair.public.trim().split(" ")[1];
+    try {
+      const privOk =
+        Buffer.from(parseKey(pair.private).getPublicSSH()).toString("base64") === want;
+      const pubOk =
+        Buffer.from(parseKey(pair.public).getPublicSSH()).toString("base64") === want;
+      if (privOk && pubOk) {
+        return {
+          privatePem: pair.private,
+          publicLine: pair.public.trim(),
+          fingerprint: fingerprintOfPublicKey(pair.public),
+        };
+      }
+    } catch {
+      /* unparseable pair — retry with a fresh one */
+    }
+    if (attempt >= 8) {
+      throw new Error(
+        `bot keygen self-verify failed after ${attempt + 1} attempts — ssh2's generator keeps emitting unparseable OpenSSH containers`,
+      );
+    }
+  }
 }
 
 /** SHA256 fingerprint of a public key (blob base64, public line, or raw). */
@@ -90,6 +116,14 @@ export function parseKey(material: string): ParsedKey {
 // Serializes appendInjectEvent's read-prev/append inside this process.
 let appendQueue: Promise<void> = Promise.resolve();
 
+/** Structured lineage on a log entry — covered by the entry's hash, unlike
+ *  free-form `detail` (which metrics must not depend on for the same reason). */
+export interface InjectEventMeta {
+  reply_to?: string;
+  correlation?: string;
+  supersedes?: string;
+}
+
 export function appendInjectEvent(
   spoolDir: string,
   evt: {
@@ -98,6 +132,7 @@ export function appendInjectEvent(
     source: string;
     target: string;
     detail?: string;
+    meta?: InjectEventMeta;
   },
 ): Promise<void> {
   // Serialize read-prev/append inside this process: two connections landing
@@ -117,6 +152,10 @@ export function appendInjectEvent(
     const hash = crypto.createHash("sha256").update(prev + JSON.stringify(body)).digest("hex");
     fs.mkdirSync(spoolDir, { recursive: true });
     fs.appendFileSync(logPath, `${JSON.stringify({ ...body, hash })}\n`);
+    // Head-hash artifact (their reviewer's tail-truncation catch): deleting
+    // the NEWEST line(s) leaves a valid shorter chain the replay alone can't
+    // see. The .head file records the last appended hash; verify compares.
+    fs.writeFileSync(path.join(spoolDir, "inject.log.head"), hash + "\n");
   });
   // The queue HEAD must survive a failed append: .then() on a rejected
   // promise skips its work, so one EBUSY/ENOSPC would freeze the audit
@@ -130,10 +169,10 @@ export function appendInjectEvent(
 /** Replay inject.log and verify the hash chain. Returns entries, or throws. */
 export function verifyInjectLog(
   spoolDir: string,
-): Array<{ event: string; id: string; hash: string; ts?: string; source?: string; target?: string; detail?: string }> {
+): Array<{ event: string; id: string; hash: string; ts?: string; source?: string; target?: string; detail?: string; meta?: InjectEventMeta }> {
   const lines = fs.readFileSync(path.join(spoolDir, "inject.log"), "utf8").split("\n").filter(Boolean);
   let prev = "";
-  const out: Array<{ event: string; id: string; hash: string; ts?: string; source?: string; target?: string; detail?: string }> = [];
+  const out: Array<{ event: string; id: string; hash: string; ts?: string; source?: string; target?: string; detail?: string; meta?: InjectEventMeta }> = [];
   for (const line of lines) {
     const entry = JSON.parse(line);
     const { hash, ...body } = entry;
@@ -143,6 +182,21 @@ export function verifyInjectLog(
     if (body.prev !== prev) throw new Error(`inject.log chain order broken at ${entry.id ?? "?"}`);
     prev = hash;
     out.push(entry);
+  }
+  // Tail-truncation guard: the chain replays valid without its newest line(s),
+  // so the last appended hash is persisted beside the log. Mismatch = entries
+  // were removed from the end. (No .head file = pre-artifact log; can't
+  // distinguish "never written" from "deleted" — replay alone governs.)
+  if (lines.length > 0) {
+    try {
+      const head = fs.readFileSync(path.join(spoolDir, "inject.log.head"), "utf8").trim();
+      if (head && head !== prev) {
+        throw new Error(`inject.log tail truncated: head artifact ${head.slice(0, 12)}… ≠ last entry ${prev.slice(0, 12)}… (${lines.length} entries replay)`);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("inject.log tail")) throw err;
+      /* unreadable/absent head file — legacy log, replay verdict stands */
+    }
   }
   return out;
 }
@@ -164,7 +218,7 @@ export interface InjectMetrics {
 }
 
 export function deriveInjectMetrics(
-  entries: Array<{ event: string; id: string; ts?: string; source?: string; target?: string; detail?: string }>,
+  entries: Array<{ event: string; id: string; ts?: string; source?: string; target?: string; detail?: string; meta?: InjectEventMeta }>,
 ): InjectMetrics {
   const bySource: Record<string, number> = {};
   const byTarget: Record<string, number> = {};
@@ -187,9 +241,12 @@ export function deriveInjectMetrics(
     } else if (e.event === "completed") {
       completed.push({ id: e.id, detail: e.detail });
     }
-    if (e.event === "received" && e.detail) {
-      const m = e.detail.match(/reply_to[=:]([A-Za-z0-9-]+)/);
-      if (m) replyTo.set(m[1], (replyTo.get(m[1]) ?? 0) + 1);
+    if (e.event === "received") {
+      // Structured field first (hash-covered); regex on free-form detail only
+      // as a legacy fallback — format drift there silently zeroes, which is
+      // exactly why the field exists now.
+      const rt = e.meta?.reply_to ?? e.detail?.match(/reply_to[=:]([A-Za-z0-9-]+)/)?.[1];
+      if (rt) replyTo.set(rt, (replyTo.get(rt) ?? 0) + 1);
     }
   }
   const receivedToConsumedMs: number[] = [];
@@ -440,6 +497,13 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                   ]
                     .filter(Boolean)
                     .join(" "),
+                  // Structured lineage (hash-covered) — metrics read these;
+                  // the detail line above stays for human eyes only.
+                  meta: {
+                    ...(payload.task?.reply_to ? { reply_to: payload.task.reply_to } : {}),
+                    ...(payload.task?.correlation ? { correlation: payload.task.correlation } : {}),
+                    ...(payload.supersedes ? { supersedes: payload.supersedes } : {}),
+                  },
                 });
               } catch (auditErr) {
                 // Audit failure must not drop the inject itself — but never

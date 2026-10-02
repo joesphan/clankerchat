@@ -139,6 +139,30 @@ throws on any edit, reorder, or deletion. This is the audit trail for every
 prompt that ever entered the machine through the lane — don't rotate or
 prune it casually; ship it with any security review.
 
+**Entry meta fields.** `received` entries carry a structured `meta` object
+(`reply_to`, `correlation`, `supersedes` — mirrored from the payload) that
+is *inside* the hash coverage. Metrics read `meta` first and only fall back
+to regex over the human-facing `detail` line for pre-meta logs: free-form
+text drifts, and a metric that silently zeroes on a wording change is worse
+than no metric.
+
+**Two durability guards beyond replay:**
+
+- `inject.log.head` — a sidecar file holding the hash of the last appended
+  entry. A hash chain can't see its own tail: deleting the newest line(s)
+  leaves a valid shorter chain. The `.head` file is the memory of the last
+  write; a mismatch means entries were removed from the end. (Logs from
+  before this artifact existed have no `.head` — replay alone governs
+  those, since "absent" can't be distinguished from "deleted".)
+- **Append-loss reconciliation** — the report cross-checks every inject
+  file (spool + `archive/`) against `received` entries. A file with no
+  entry means an audit append failed *after* the spool write (the log
+  stays chain-valid through such a loss, so this cross-check is the only
+  durable detector). The daemon also journals such failures loudly and
+  never lets one poison the append queue: a failed append rejects its own
+  caller but the queue head survives, so later appends still land.
+
+
 ## Lane metrics
 
 ```
@@ -179,12 +203,16 @@ with `.botlink.env` holding the `CLANKER_BOTLINK_*` vars above (gitignored).
 
 ```
 npm run build
-npm run test:botlink     # keygen, roundtrips, and every refusal path
+npm test                 # botlink + guards suites
+npm run test:botlink     # botlink suite alone
+npm run test:guards      # project-mode lock tests alone
 ```
 
-The suite generates its own keys, runs a server on an ephemeral localhost
-port, and proves: key parseability (ssh2 roundtrip; the generator's output is also
-accepted by OpenSSH's ssh-keygen, verified during development),
-status/inject roundtrips, wrong-key / wrong-user / host-pin-mismatch
-refusal, forbidden-verb refusal, and payload validation. Nothing leaves the
-machine.
+The botlink suite generates its own keys, runs a server on an ephemeral
+localhost port, and proves: key parseability (ssh2 roundtrip; the
+generator's output is also accepted by OpenSSH's ssh-keygen, verified
+during development), status/inject roundtrips, wrong-key / wrong-user /
+host-pin-mismatch refusal, forbidden-verb refusal, payload validation,
+audit-log tamper detection (edits, head deletion, tail truncation via the
+`.head` artifact), append-queue failure recovery, and archive
+reconciliation. Nothing leaves the machine.

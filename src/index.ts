@@ -743,10 +743,11 @@ function registerTools(server: McpServer): void {
         task_acceptance: z.array(z.string().min(1).max(400)).max(10).optional().describe("Structured task: pass criteria."),
         task_reply_to: z.string().max(64).optional().describe("Structured task: inject/message id to thread replies to."),
         task_correlation: z.string().max(64).optional().describe("Structured task: grouping id shared by related injects of one task round."),
+        task_deadline_soft: z.string().max(40).optional().describe("Structured task: soft deadline (duration or timestamp hint)."),
         supersedes: z.string().max(64).optional().describe("Lineage: inject id this one replaces (same logical prompt, refined)."),
       },
     },
-    ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to, task_correlation, supersedes }) =>
+    ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to, task_correlation, task_deadline_soft, supersedes }) =>
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
@@ -762,6 +763,7 @@ function registerTools(server: McpServer): void {
               ...(task_acceptance ? { acceptance: task_acceptance } : {}),
               ...(task_reply_to ? { reply_to: task_reply_to } : {}),
               ...(task_correlation ? { correlation: task_correlation } : {}),
+              ...(task_deadline_soft ? { deadline_soft: task_deadline_soft } : {}),
             }
           : undefined;
         const out = await botlinkRequest(botlinkPeer!, "inject", {

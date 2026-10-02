@@ -65,6 +65,24 @@ test("keygen: ssh2 parses our keys, private matches its own public line", () => 
   );
 });
 
+test("keygen self-verify: EVERY emitted pair is parseable (ssh2 intermittently emits malformed containers)", () => {
+  // Upstream bug, measured at ~0.4% (8/2000): generateKeyPairSync("ed25519")
+  // occasionally drops a length prefix in the private section — ssh2's parser
+  // and ssh-keygen both reject the file. generateBotKey self-verifies and
+  // regenerates, so this loop must NEVER see an unparseable key; a failure
+  // here means the retry guard itself broke.
+  for (let i = 0; i < 300; i++) {
+    const key = generateBotKey(`loop-${i}`);
+    const priv = utils.parseKey(key.privatePem);
+    assert.ok(priv, `iteration ${i}: private PEM must parse`);
+    assert.equal(
+      Buffer.from(priv.getPublicSSH()).toString("base64"),
+      key.publicLine.split(" ")[1],
+      `iteration ${i}: private must match its own public line`,
+    );
+  }
+});
+
 test("status/inject roundtrip over localhost", async (t) => {
   const { srv, host, clientBot, spool } = await makeServer(t, { botName: "roundtrip-machine" });
   const peer = {
@@ -399,6 +417,43 @@ test("report reconciles archive files against the log — a lost append is visib
   assert.match(report, /9999000000-dead00/);
   // and the clean case shows no false positive for the logged one
   assert.doesNotMatch(report, new RegExp(`unlogged[^\n]*${ack.id}`));
+});
+
+test("tail truncation is caught by the head artifact; legacy headless logs still verify", async (t) => {
+  const { spool } = await makeServer(t);
+  const logPath = path.join(spool, "inject.log");
+  await appendInjectEvent(spool, { event: "received", id: "t1", source: "s", target: "t" });
+  await appendInjectEvent(spool, { event: "consumed", id: "t1", source: "s", target: "t" });
+  assert.equal(verifyInjectLog(spool).length, 2, "both entries chain-verify");
+
+  // Delete the NEWEST line: replay alone sees a valid shorter chain — the
+  // persisted head hash is what catches it (their reviewer's part-2 catch).
+  const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+  fs.writeFileSync(logPath, lines.slice(0, -1).join("\n") + "\n");
+  assert.throws(() => verifyInjectLog(spool), /tail truncated/, "newest-entry deletion detected");
+
+  // Legacy log with no .head artifact: replay verdict stands (can't tell
+  // "never written" from "deleted" — fail-open on the artifact, never invent).
+  fs.rmSync(path.join(spool, "inject.log.head"));
+  assert.equal(verifyInjectLog(spool).length, 1, "legacy headless log still verifies");
+});
+
+test("log entries carry structured lineage meta; rework derives from the field, not detail text", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  await botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "one", task: { kind: "implement", reply_to: "R9" } });
+  await botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "two", task: { kind: "review", reply_to: "R9" } });
+  const entries = verifyInjectLog(spool);
+  const withMeta = entries.filter((e) => e.meta?.reply_to === "R9");
+  assert.equal(withMeta.length, 2, "both received entries carry meta.reply_to (hash-covered)");
+  // even with detail text gone, rework still derives — no format-drift zeroing
+  const report = renderInjectReport(spool);
+  assert.match(report, /rework rounds \(shared reply_to\): 1/);
 });
 
 test("fingerprintOfPublicKey accepts blobs and lines; rejects junk", () => {
