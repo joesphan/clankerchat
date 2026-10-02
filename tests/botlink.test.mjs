@@ -348,6 +348,59 @@ test("report: metrics derive from the audit log (latency, completed, rework)", a
   assert.ok(second.ok);
 });
 
+test("append queue survives a failed append — audit trail never freezes (their reviewer's catch)", async (t) => {
+  const { spool } = await makeServer(t);
+  const logPath = path.join(spool, "inject.log");
+  fs.writeFileSync(logPath, ""); // genesis — exists, so only the APPEND can fail
+  // Make the append fail once: read-only log (deterministic EACCES as non-root
+  // — same class as their reviewer's EBUSY/ENOSPC on Windows AV locks).
+  fs.chmodSync(logPath, 0o444);
+  t.after(() => fs.chmodSync(logPath, 0o644));
+  const first = await appendInjectEvent(spool, { event: "received", id: "a1", source: "s", target: "t" }).then(
+    () => "ok",
+    () => "failed",
+  );
+  assert.equal(first, "failed", "first append hits the read-only log");
+  fs.chmodSync(logPath, 0o644);
+  const second = await appendInjectEvent(spool, { event: "received", id: "a2", source: "s", target: "t" }).then(
+    () => "ok",
+    () => "failed",
+  );
+  assert.equal(second, "ok", "queue recovered — the failure did not poison later appends");
+  const entries = verifyInjectLog(spool);
+  assert.equal(entries.length, 1, "only the recovered entry landed");
+  assert.equal(entries[0].id, "a2");
+});
+
+test("report reconciles archive files against the log — a lost append is visible", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  // One clean inject (file + received event + consumed + archive move).
+  const ack = JSON.parse(
+    await botlinkRequest(peer, "inject", { source: "a", target: "shim", text: "logged one", task: { kind: "status" } }),
+  );
+  assert.ok(ack.ok);
+  await new Promise((r) => setTimeout(r, 150));
+  fs.mkdirSync(path.join(spool, "archive"), { recursive: true });
+  fs.renameSync(
+    path.join(spool, `${ack.id}.inject.json`),
+    path.join(spool, "archive", `${ack.id}.inject.json`),
+  );
+  // Now forge the failure signature: a file lands in archive whose received
+  // entry never made the log (simulates append-loss AFTER the spool write).
+  fs.writeFileSync(path.join(spool, "archive", "9999000000-dead00.inject.json"), '{"id":"9999000000-dead00"}');
+  const report = renderInjectReport(spool);
+  assert.match(report, /unlogged inject files \(audit append lost\): 1/);
+  assert.match(report, /9999000000-dead00/);
+  // and the clean case shows no false positive for the logged one
+  assert.doesNotMatch(report, new RegExp(`unlogged[^\n]*${ack.id}`));
+});
+
 test("fingerprintOfPublicKey accepts blobs and lines; rejects junk", () => {
   const key = generateBotKey("fp");
   assert.equal(fingerprintOfPublicKey(key.publicLine), key.fingerprint);

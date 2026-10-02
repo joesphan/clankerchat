@@ -104,7 +104,7 @@ export function appendInjectEvent(
   // injects simultaneously could otherwise interleave and break the chain.
   // (A cross-PROCESS race — daemon vs. trigger layer — still exists but is
   // detectable: verifyInjectLog throws, fail-visible not fail-silent.)
-  appendQueue = appendQueue.then(() => {
+  const flush = appendQueue.then(() => {
     const logPath = path.join(spoolDir, "inject.log");
     let prev = ""; // genesis entry chains from the empty string
     try {
@@ -118,11 +118,13 @@ export function appendInjectEvent(
     fs.mkdirSync(spoolDir, { recursive: true });
     fs.appendFileSync(logPath, `${JSON.stringify({ ...body, hash })}\n`);
   });
-  // Callers on the daemon path are fire-and-forget; a rejected link must
-  // not poison subsequent appends. Callers who need the flush (the daemon
-  // ACKs only after the audit entry landed) await the returned promise.
-  appendQueue.catch(() => {});
-  return appendQueue;
+  // The queue HEAD must survive a failed append: .then() on a rejected
+  // promise skips its work, so one EBUSY/ENOSPC would freeze the audit
+  // trail forever while ACKs kept flowing (their reviewer's catch, 2026-10-02).
+  // Branch instead — head absorbs failures, the returned promise doesn't, so
+  // this caller still sees its own flush fail (the daemon journals it).
+  appendQueue = flush.catch(() => {});
+  return flush;
 }
 
 /** Replay inject.log and verify the hash chain. Returns entries, or throws. */
@@ -217,6 +219,28 @@ export function renderInjectReport(spoolDir: string): string {
     `rework rounds (shared reply_to): ${m.reworkRounds}`,
   ];
   for (const c of m.completed) lines.push(`  completed ${c.id}${c.detail ? ` — ${c.detail}` : ""}`);
+  // Reconciliation: every inject FILE (spool + archive) must have a received
+  // entry. A file with no entry = an audit append that failed after the spool
+  // write — the log stays chain-valid through such a loss, so this cross-check
+  // is the only durable detector (the archive is the evidence; never delete it).
+  try {
+    const fileIds = new Set<string>();
+    for (const dir of [spoolDir, path.join(spoolDir, "archive")]) {
+      for (const f of fs.readdirSync(dir)) {
+        const idMatch = f.match(/^(.+)\.inject\.json$/);
+        if (idMatch) fileIds.add(idMatch[1]);
+      }
+    }
+    const logged = new Set(entries.filter((e) => e.event === "received").map((e) => e.id));
+    const orphans = [...fileIds].filter((id) => !logged.has(id));
+    lines.push(
+      orphans.length
+        ? `⚠ unlogged inject files (audit append lost): ${orphans.length} — ${orphans.join(", ")}`
+        : `archive reconciliation: clean (${fileIds.size} file(s), all logged)`,
+    );
+  } catch {
+    lines.push("archive reconciliation: skipped (unreadable spool/archive)");
+  }
   return lines.join("\n");
 }
 
@@ -417,8 +441,12 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                     .filter(Boolean)
                     .join(" "),
                 });
-              } catch {
-                /* audit failure must not drop the inject itself */
+              } catch (auditErr) {
+                // Audit failure must not drop the inject itself — but never
+                // silently: the entry is LOST while the log stays chain-valid,
+                // so journal it loudly. `report`'s archive reconciliation is
+                // the durable detector for exactly this case.
+                log(`botlink: AUDIT APPEND FAILED for inject ${id}: ${(auditErr as Error).message} — received entry lost, log remains chain-valid`);
               }
               log(`botlink: inject ${id} from ${payload.source} → ${payload.target} (${payload.text.length} chars)`);
               stream.write(JSON.stringify({ ok: true, id }) + "\n");
