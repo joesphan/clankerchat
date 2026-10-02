@@ -82,6 +82,10 @@ const ALLOWED_TOOLS = [
 interface DaemonConfig {
   /** Discord user IDs allowed to trigger prompts. */
   allow: string[];
+  /** Any human in the team channel may trigger (the private channel is the
+   *  perimeter — same posture as peers that run no human allowlist). Bots
+   *  stay gated by botAllow regardless. */
+  allowAllHumans: boolean;
   /** Let other machines' bots trigger too (agent-to-agent addressing). Our
    *  own bot never triggers itself. */
   allowBots: boolean;
@@ -160,14 +164,15 @@ function loadConfig(): DaemonConfig {
   } catch (err) {
     fatal(`daemon.json is not valid JSON: ${errText(err)}`);
   }
-  const allow = parsed.allow;
+  const allow = (parsed.allow ?? []) as unknown[];
+  const allowAllHumans = parsed.allowAllHumans === true;
   if (
     !Array.isArray(allow) ||
-    allow.length === 0 ||
-    !allow.every((id) => typeof id === "string" && /^\d+$/.test(id))
+    !allow.every((id) => typeof id === "string" && /^\d+$/.test(id)) ||
+    (allow.length === 0 && !allowAllHumans)
   ) {
     fatal(
-      'daemon.json needs an "allow" array with at least one Discord user ID (digits only) — this is who may trigger prompts.',
+      'daemon.json needs an "allow" array of Discord user IDs (digits only) with at least one entry — or "allowAllHumans": true to let any human in the team channel trigger.',
     );
   }
   const threads = (parsed.threads ?? {}) as Record<string, unknown>;
@@ -183,6 +188,7 @@ function loadConfig(): DaemonConfig {
   }
   return {
     allow: allow as string[],
+    allowAllHumans,
     allowBots: parsed.allowBots === true,
     botAllow: Array.isArray(parsed.botAllow)
       ? (parsed.botAllow as unknown[]).filter(
@@ -352,7 +358,7 @@ function isTrigger(m: Message, botUser: User): boolean {
   if (m.author.bot) {
     return config.allowBots && (config.botAllow.length === 0 || config.botAllow.includes(m.author.id));
   }
-  return config.allow.includes(m.author.id);
+  return config.allowAllHumans || config.allow.includes(m.author.id);
 }
 
 /** Drops the bot mention(s) so the remainder is the actual prompt text. */
