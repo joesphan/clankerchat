@@ -809,3 +809,32 @@ function botlinkRequestRaw(peer, raw) {
       });
   });
 }
+
+test("status surfaces watcher load while fresh, omits it when absent or stale", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t, { botName: "load-machine" });
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  // No watcher-state.json yet → no load key at all.
+  const bare = JSON.parse(await botlinkRequest(peer, "status"));
+  assert.equal(bare.ok, true);
+  assert.equal(bare.load, undefined, "absent watcher-state.json must not add a load key");
+  // Fresh state → served verbatim.
+  fs.writeFileSync(
+    path.join(spool, "watcher-state.json"),
+    JSON.stringify({ active: 1, queued_human: 0, queued_bot: 2, updated: new Date().toISOString() }) + "\n",
+  );
+  const withLoad = JSON.parse(await botlinkRequest(peer, "status"));
+  assert.equal(withLoad.load.active, 1);
+  assert.equal(withLoad.load.queued_bot, 2);
+  // Stale state (>60s old) → omitted, not served as truth.
+  fs.writeFileSync(
+    path.join(spool, "watcher-state.json"),
+    JSON.stringify({ active: 0, updated: new Date(Date.now() - 120_000).toISOString() }) + "\n",
+  );
+  const stale = JSON.parse(await botlinkRequest(peer, "status"));
+  assert.equal(stale.load, undefined, "stale watcher-state.json must be omitted");
+});

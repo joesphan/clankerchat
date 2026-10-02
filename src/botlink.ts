@@ -551,6 +551,20 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
             stream.once("close", () => clearTimeout(watchdog));
             if (verb === "status") {
               const pending = countPending();
+              // Load-balancing surface (2026-10-02): the tag-watcher writes
+              // watcher-state.json into the spool on every queue change;
+              // status serves it only while fresh (<60s), so a dispatching
+              // peer routes by real load, never a stale snapshot.
+              let load: Record<string, unknown> | undefined;
+              try {
+                const raw = fs.readFileSync(path.join(opts.spoolDir, "watcher-state.json"), "utf8");
+                const parsed = JSON.parse(raw) as { updated?: string };
+                if (parsed.updated && Date.now() - Date.parse(parsed.updated) < 60_000) {
+                  load = parsed as Record<string, unknown>;
+                }
+              } catch {
+                /* absent or unreadable — status answers without load */
+              }
               // Canonical ssh2 server pattern: write on the channel itself,
               // then exit-status, then close — ending a substream can close
               // the channel before the exit-status request is flushed.
@@ -561,6 +575,7 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                   uptime_s: Math.round((Date.now() - startedAt) / 1000),
                   spool_pending: pending,
                   injects_total: injectsTotal,
+                  ...(load ? { load } : {}),
                 }) + "\n",
               );
               stream.exit(0);
