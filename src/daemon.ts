@@ -59,7 +59,7 @@ const FETCH_LIMIT = 50; // messages per poll per thread (Discord caps at 100)
 const MAX_QUEUE = 8; // prompts waiting while one is running
 const MAX_STDOUT = 256 * 1024; // captured from a spawned session, for logging
 const MAX_STDERR = 64 * 1024;
-const ROUTER_TIMEOUT_MS = 120_000; // routing must be quick; it is not the work
+const ROUTER_TIMEOUT_MS = 180_000; // routing must be quick; it is not the work
 
 const CONFIG_FILE = path.join(PROJECT_ROOT, "daemon.json");
 const STATE_FILE = path.join(PROJECT_ROOT, "daemon.state.json");
