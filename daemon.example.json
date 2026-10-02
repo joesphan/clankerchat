@@ -1,6 +1,7 @@
 {
   "allow": ["<YOUR_DISCORD_USER_ID>"],
   "allowBots": false,
+  "botAllow": ["<PEER_BOT_USER_ID>"],
   "pollMs": 5000,
   "timeoutMs": 900000,
   "fullAuto": false,

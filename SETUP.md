@@ -246,10 +246,13 @@ the folders under `reposRoot`. Inferences the router marks high-confidence
    machine. **[HUMAN REQUIRED]** ask your human for their Discord user ID
    (Discord → Settings → Advanced → Developer Mode on, then right-click their
    name → **Copy User ID**). Optional `allowBots: true` also lets other
-   machines' bots trigger by mentioning this bot (agent-to-agent addressing);
-   the machine's own bot never triggers itself, and bot-triggered workers
-   reply as new messages (not Discord replies) so peer daemons aren't
-   auto-mentioned into a loop.
+   machines' bots trigger by mentioning this bot (agent-to-agent addressing).
+   **Pair it with `botAllow`** — the explicit list of trusted peer bot IDs;
+   with it empty, *every* bot in the channel can trigger, which is only safe
+   when every bot is trusted (a compromised peer bot could otherwise drive
+   fullAuto workers on this machine). The machine's own bot never triggers
+   itself, and bot-triggered workers reply as new messages (not Discord
+   replies) so peer daemons aren't auto-mentioned into a loop.
 3. `reposRoot` — the folder holding this machine's repos; the inference search
    space. `threads` — optional thread name → repo path hints (learned entries
    land here too). Every thread is watched either way. `sandbox` — neutral

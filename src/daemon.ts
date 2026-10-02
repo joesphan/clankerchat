@@ -82,9 +82,13 @@ const ALLOWED_TOOLS = [
 interface DaemonConfig {
   /** Discord user IDs allowed to trigger prompts. */
   allow: string[];
-  /** Let any OTHER bot in the team channel trigger too (agent-to-agent
-   *  addressing). Our own bot never triggers itself. */
+  /** Let other machines' bots trigger too (agent-to-agent addressing). Our
+   *  own bot never triggers itself. */
   allowBots: boolean;
+  /** Explicit bot user IDs allowed to trigger. Empty = every bot (only safe
+   *  when every bot in the channel is trusted; a compromised peer bot with
+   *  this open can drive fullAuto workers on this machine). */
+  botAllow: string[];
   /** Poll interval for the thread sweep, ms. */
   pollMs: number;
   /** Kill a worker after this long, ms. */
@@ -180,6 +184,11 @@ function loadConfig(): DaemonConfig {
   return {
     allow: allow as string[],
     allowBots: parsed.allowBots === true,
+    botAllow: Array.isArray(parsed.botAllow)
+      ? (parsed.botAllow as unknown[]).filter(
+          (id): id is string => typeof id === "string" && /^\d+$/.test(id),
+        )
+      : [],
     pollMs: Math.max(1000, typeof parsed.pollMs === "number" ? parsed.pollMs : 5000),
     timeoutMs:
       typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : 15 * 60_000,
@@ -340,7 +349,9 @@ async function sendToThread(threadId: string, message: string): Promise<string |
 function isTrigger(m: Message, botUser: User): boolean {
   if (m.author.id === botUser.id) return false;
   if (!m.mentions.has(botUser)) return false;
-  if (m.author.bot) return config.allowBots;
+  if (m.author.bot) {
+    return config.allowBots && (config.botAllow.length === 0 || config.botAllow.includes(m.author.id));
+  }
   return config.allow.includes(m.author.id);
 }
 
