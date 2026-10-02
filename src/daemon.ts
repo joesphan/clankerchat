@@ -80,8 +80,11 @@ const ALLOWED_TOOLS = [
 // ---------------------------------------------------------------------------
 
 interface DaemonConfig {
-  /** Discord user IDs allowed to trigger prompts. Bots never qualify. */
+  /** Discord user IDs allowed to trigger prompts. */
   allow: string[];
+  /** Let any OTHER bot in the team channel trigger too (agent-to-agent
+   *  addressing). Our own bot never triggers itself. */
+  allowBots: boolean;
   /** Poll interval for the thread sweep, ms. */
   pollMs: number;
   /** Kill a worker after this long, ms. */
@@ -176,6 +179,7 @@ function loadConfig(): DaemonConfig {
   }
   return {
     allow: allow as string[],
+    allowBots: parsed.allowBots === true,
     pollMs: Math.max(1000, typeof parsed.pollMs === "number" ? parsed.pollMs : 5000),
     timeoutMs:
       typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : 15 * 60_000,
@@ -289,11 +293,14 @@ async function sendToThread(threadId: string, message: string): Promise<string |
   }
 }
 
-/** A message triggers a prompt iff: human author, allowlisted, mentions the bot. */
+/** A message triggers a prompt iff it mentions the bot AND the author counts:
+ *  humans must be allowlisted; other bots count when allowBots is on. Our own
+ *  bot never triggers itself (self-loop). */
 function isTrigger(m: Message, botUser: User): boolean {
-  if (m.author.bot) return false;
-  if (!config.allow.includes(m.author.id)) return false;
-  return m.mentions.has(botUser);
+  if (m.author.id === botUser.id) return false;
+  if (!m.mentions.has(botUser)) return false;
+  if (m.author.bot) return config.allowBots;
+  return config.allow.includes(m.author.id);
 }
 
 /** Drops the bot mention(s) so the remainder is the actual prompt text. */
@@ -393,6 +400,7 @@ interface Job {
   cwd: string | null; // repo path from daemon.json, if the thread is mapped
   prompt: string; // mention-stripped message text
   from: string; // Discord username of the triggering human
+  fromBot: boolean; // triggered by a peer bot rather than an allowlisted human
   triggerId: string; // id of the Discord message that triggered this job
   skipWake?: boolean; // fallback run: route cwd only, never wake
 }
@@ -544,7 +552,10 @@ async function checkFollowups(): Promise<void> {
 function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   return [
-    `You are the ${name} overseer worker, spawned because a human replied to this machine's bot in the "${job.threadName}" Discord thread.`,
+    `You are the ${name} overseer worker, spawned because ${job.fromBot ? `another machine's agent (${job.from}) mentioned` : "a human replied to"} this machine's bot in the "${job.threadName}" Discord thread.`,
+    job.fromBot
+      ? `Reply as a NEW message in that thread — do NOT use a Discord reply to their message (replying auto-mentions their bot and can re-trigger their daemon into a loop). Address them by name in plain text instead.`
+      : ``,
     sandboxed
       ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
       : `Work in this repo: ${cwd}`,
@@ -836,6 +847,7 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
         cwd: mapped,
         prompt,
         from: m.author.username,
+        fromBot: m.author.bot,
         triggerId: m.id,
       });
     }

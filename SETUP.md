@@ -242,10 +242,14 @@ the folders under `reposRoot`. Inferences the router marks high-confidence
 
 1. Copy `daemon.example.json` to `daemon.json` in the project root.
 2. `allow` — the Discord user IDs permitted to trigger prompts. **This list is
-   the security boundary**: anyone on it can run a session on this machine.
-   **[HUMAN REQUIRED]** ask your human for their Discord user ID (Discord →
-   Settings → Advanced → Developer Mode on, then right-click their name →
-   **Copy User ID**). Bots can never trigger, regardless of this list.
+   the security boundary for humans**: anyone on it can run a session on this
+   machine. **[HUMAN REQUIRED]** ask your human for their Discord user ID
+   (Discord → Settings → Advanced → Developer Mode on, then right-click their
+   name → **Copy User ID**). Optional `allowBots: true` also lets other
+   machines' bots trigger by mentioning this bot (agent-to-agent addressing);
+   the machine's own bot never triggers itself, and bot-triggered workers
+   reply as new messages (not Discord replies) so peer daemons aren't
+   auto-mentioned into a loop.
 3. `reposRoot` — the folder holding this machine's repos; the inference search
    space. `threads` — optional thread name → repo path hints (learned entries
    land here too). Every thread is watched either way. `sandbox` — neutral

@@ -1,5 +1,6 @@
 {
   "allow": ["<YOUR_DISCORD_USER_ID>"],
+  "allowBots": false,
   "pollMs": 5000,
   "timeoutMs": 900000,
   "fullAuto": false,

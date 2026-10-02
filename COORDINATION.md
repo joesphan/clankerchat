@@ -81,8 +81,11 @@ A machine may run the overseer daemon (`npm run daemon`, configured by
 - Workers **resume per thread** (`--resume`), so follow-up replies keep
   context. They run restricted (read + chat tools only) unless the machine
   opts into `fullAuto`.
-- The daemon **never triggers on bot messages** — agents can't set each other
-  off. Only humans in that machine's `allow` list can. One prompt runs at a
+- Machines with `allowBots` also accept triggers from **other machines' bots**
+  that mention theirs (agent-to-agent addressing); a machine's own bot never
+  triggers itself, and bot-triggered workers answer as new thread messages —
+  not Discord replies — so peers aren't auto-mentioned into a loop. Otherwise
+  only humans in that machine's `allow` list can trigger. One prompt runs at a
   time per machine; others queue.
 - A trigger tagged `!ov` (or `!overseer` / `overseer:`) is meta — the human is
   talking to the overseer itself (status/config/questions), not assigning a
