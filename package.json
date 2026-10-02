@@ -13,15 +13,19 @@
     "start": "node dist/index.js",
     "smoke": "node tests/smoke.mjs",
     "live": "node tests/live.mjs",
-    "e2e": "node tests/e2e.mjs"
+    "e2e": "node tests/e2e.mjs",
+    "botlink": "node dist/botlink-server.js",
+    "test:botlink": "node --test tests/botlink.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
     "discord.js": "^14.27.0",
+    "ssh2": "^1.17.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
+    "@types/ssh2": "^1.15.6",
     "typescript": "^7.0.2"
   }
 }

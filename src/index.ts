@@ -46,6 +46,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(MODULE_DIR, "..");
@@ -658,6 +659,94 @@ function registerTools(server: McpServer): void {
           ...[...archived.threads.values()].map(toThread),
         ];
         return { channel_id: id, count: threads.length, threads };
+      }),
+  );
+
+  // -------------------------------------------------------------------------
+  // botlink — the SSH machine lane (peer bot's daemon, NOT Discord).
+  // Configured only when CLANKER_BOTLINK_PEER is set; unconfigured instances
+  // get a clear error instead of a silent capability. Works in project mode
+  // too: an inject is a PROMPT (same trust level as a Discord tag), and the
+  // receiving machine applies its own untrusted-input scrutiny.
+  // -------------------------------------------------------------------------
+
+  const botlinkPeer = (() => {
+    const peer = process.env.CLANKER_BOTLINK_PEER; // host[:port]
+    const keyPath = process.env.CLANKER_BOTLINK_KEY; // this bot's private key
+    const hostKey = process.env.CLANKER_BOTLINK_PEER_HOSTKEY; // pinned fingerprint/line
+    if (!peer || !keyPath || !hostKey) return null;
+    const [host, portStr] = peer.split(":");
+    return {
+      host,
+      port: portStr ? Number(portStr) : undefined,
+      username: process.env.CLANKER_BOTLINK_USER,
+      privateKeyPem: fs.readFileSync(path.resolve(keyPath), "utf8"),
+      expectedHostKey: hostKey,
+    } satisfies BotlinkPeer;
+  })();
+  const botlinkDisabled = (): string | null => {
+    if (!botlinkPeer) {
+      return (
+        "botlink is not configured on this instance. Set CLANKER_BOTLINK_PEER, " +
+        "CLANKER_BOTLINK_KEY and CLANKER_BOTLINK_PEER_HOSTKEY (see BOTLINK.md)."
+      );
+    }
+    return null;
+  };
+
+  server.registerTool(
+    "bot_status",
+    {
+      title: "Check peer machine's bot status over botlink",
+      description: [
+        "Ask the peer machine's botlink daemon for a health snapshot (uptime,",
+        "inject count, spool depth). Private SSH lane — nothing goes to Discord.",
+        "Use this before injecting, and for keepalive/cross-machine health checks.",
+      ].join(" "),
+      inputSchema: {},
+    },
+    () =>
+      guard(async () => {
+        const disabled = botlinkDisabled();
+        if (disabled) throw new Error(disabled);
+        const out = await botlinkRequest(botlinkPeer!, "status");
+        try {
+          return JSON.parse(out);
+        } catch {
+          return { raw: out };
+        }
+      }),
+  );
+
+  server.registerTool(
+    "bot_inject",
+    {
+      title: "Inject a prompt into the peer machine over botlink",
+      description: [
+        "Deliver a prompt to the peer machine's trigger layer over the private",
+        "SSH lane (NOT Discord — Discord stays the human-readable log). The peer",
+        "treats your text as UNTRUSTED INPUT with elevated scrutiny, exactly like",
+        "a bot-authored Discord tag. `target` routes it (e.g. 'orchestrator', or a",
+        "session/thread name the peer recognizes); `thread` optionally names the",
+        "Discord thread the peer should answer in for human visibility.",
+      ].join(" "),
+      inputSchema: {
+        target: z.string().min(1).max(64).describe("Routing hint on the peer, e.g. 'orchestrator' or 'shim'."),
+        text: z.string().min(1).max(4000).describe("The prompt text (untrusted input on the peer — keep it self-contained)."),
+        thread: z.string().max(64).optional().describe("Discord thread name/id the peer should answer in (human visibility)."),
+      },
+    },
+    ({ target, text, thread }) =>
+      guard(async () => {
+        const disabled = botlinkDisabled();
+        if (disabled) throw new Error(disabled);
+        const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
+        const out = await botlinkRequest(botlinkPeer!, "inject", { source, target, text, ...(thread ? { thread } : {}) });
+        try {
+          return JSON.parse(out);
+        } catch {
+          return { raw: out };
+        }
       }),
   );
 }
