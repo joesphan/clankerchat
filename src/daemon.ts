@@ -482,7 +482,7 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
     `Repo folders under ${config.reposRoot}: ${repoNames.join(", ") || "(none found)"}`,
     ``,
     `Steps:`,
-    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
+    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , commands/paths in fenced or inline code blocks (Discord mangles bare code), then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.`,
     `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
     ``,
     `Reply with ONLY one line of JSON, no prose:`,
@@ -609,6 +609,7 @@ function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
       ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
       : `Work in this repo: ${cwd}`,
     `When done — or if you cannot or should not do the task — reply in that thread by calling the MCP tool mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}". Keep the reply under 2000 chars; never paste secrets.`,
+    `Format for Discord: every command, path, snippet, or log excerpt goes in a fenced code block (triple backticks, language tag when known) or \`inline code\` — bare code gets mangled into goofy formatting by Discord markdown.`,
     `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
     ``,
     `--- task from Discord user ${job.from} ---`,
@@ -720,7 +721,7 @@ async function metaSession(job: Job, question: string): Promise<void> {
     `--- meta question from ${job.from} ---`,
     question,
     ``,
-    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", under 2000 chars, starting with the tag <@${job.fromId}> then "overseer meta:". Never paste secrets.`,
+    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", under 2000 chars, starting with the tag <@${job.fromId}> then "overseer meta:". Never paste secrets. Format for Discord: commands/paths/snippets in fenced or inline code blocks — bare code gets mangled by Discord markdown.`,
   ].join("\n");
   const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS, "--permission-mode", "default"];
   const stopTyping = startTyping(job.threadId);
