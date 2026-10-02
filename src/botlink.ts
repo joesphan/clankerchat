@@ -80,6 +80,50 @@ export function parseKey(material: string): ParsedKey {
 }
 
 // ---------------------------------------------------------------------------
+// Inject audit log — append-only, hash-chained. Every inject "received" (by
+// the daemon) and "consumed" (by the trigger layer) appends one JSON line to
+// <spoolDir>/inject.log; each entry's hash covers its predecessor, so
+// post-hoc edits, reorders, and deletions are detectable by replay. This is
+// the audit trail delete-after-queueing would have destroyed.
+// ---------------------------------------------------------------------------
+
+export function appendInjectEvent(
+  spoolDir: string,
+  evt: { event: "received" | "consumed"; id: string; source: string; target: string; detail?: string },
+): void {
+  const logPath = path.join(spoolDir, "inject.log");
+  let prev = ""; // genesis entry chains from the empty string
+  try {
+    const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+    if (lines.length > 0) prev = String(JSON.parse(lines[lines.length - 1]).hash ?? "");
+  } catch {
+    /* no log yet — genesis */
+  }
+  const body = { ...evt, ts: new Date().toISOString(), prev };
+  const hash = crypto.createHash("sha256").update(prev + JSON.stringify(body)).digest("hex");
+  fs.mkdirSync(spoolDir, { recursive: true });
+  fs.appendFileSync(logPath, `${JSON.stringify({ ...body, hash })}\n`);
+}
+
+/** Replay inject.log and verify the hash chain. Returns entries, or throws. */
+export function verifyInjectLog(spoolDir: string): Array<{ event: string; id: string; hash: string }> {
+  const lines = fs.readFileSync(path.join(spoolDir, "inject.log"), "utf8").split("\n").filter(Boolean);
+  let prev = "";
+  const out: Array<{ event: string; id: string; hash: string }> = [];
+  for (const line of lines) {
+    const entry = JSON.parse(line);
+    const { hash, ...body } = entry;
+    if (hash !== crypto.createHash("sha256").update(prev + JSON.stringify(body)).digest("hex")) {
+      throw new Error(`inject.log chain broken at entry ${entry.id ?? "?"} (ts ${entry.ts ?? "?"})`);
+    }
+    if (body.prev !== prev) throw new Error(`inject.log chain order broken at ${entry.id ?? "?"}`);
+    prev = hash;
+    out.push(entry);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Payload — what an `inject` may carry. Deliberately tiny: a prompt is text
 // plus routing hints, nothing else. The receiving machine treats it as
 // untrusted input (same rule as Discord messages).
@@ -135,8 +179,17 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   const server = new SshServer(
     { hostKeys: [opts.hostKeyPem], ident: "clankerchat-botlink" },
     (conn, info) => {
-      const peerIp = info.ip?.[0] ?? "?";
+      // info.ip's shape varies across ssh2 versions (string remoteAddress vs
+      // [addr, family]) — accept either, never index a string by accident.
+      const rawIp = info.ip as unknown;
+      const peerIp =
+        typeof rawIp === "string"
+          ? rawIp
+          : Array.isArray(rawIp)
+            ? String(rawIp.find((x) => typeof x === "string") ?? "?")
+            : "?";
       let authed = false;
+      let authedKeyFp = ""; // provenance: WHICH authorized key let this peer in
       conn.on("authentication", (ctx) => {
         const blob = ctx.method === "publickey" ? (ctx.key?.data ?? null) : null;
         if (ctx.username !== username || !blob) {
@@ -144,7 +197,11 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
           ctx.reject(["publickey"]);
           return;
         }
-        const known = allowedKeys.some((k) => Buffer.from(k.getPublicSSH()).equals(blob));
+        const known = allowedKeys.some((k) => {
+          if (!Buffer.from(k.getPublicSSH()).equals(blob)) return false;
+          authedKeyFp = fingerprintOfPublicKey(k.getPublicSSH().toString("base64"));
+          return true;
+        });
         if (!known) {
           log(`botlink: unknown key from ${peerIp}`);
           ctx.reject(["publickey"]);
@@ -211,8 +268,35 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               }
               const id = `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
               const file = path.join(opts.spoolDir, `${id}.inject.json`);
-              fs.writeFileSync(file, JSON.stringify({ id, received: new Date().toISOString(), ...payload }, null, 2));
+              // Provenance: the payload as validated, plus who delivered it —
+              // the consuming side can tell WHERE a prompt came from without
+              // trusting the sender's self-reported `source` field.
+              fs.writeFileSync(
+                file,
+                JSON.stringify(
+                  {
+                    id,
+                    received: new Date().toISOString(),
+                    ...payload,
+                    authenticated_key_fp: authedKeyFp,
+                    peer_ip: peerIp,
+                  },
+                  null,
+                  2,
+                ),
+              );
               injectsTotal++;
+              try {
+                appendInjectEvent(opts.spoolDir, {
+                  event: "received",
+                  id,
+                  source: payload.source,
+                  target: payload.target,
+                  detail: `key ${authedKeyFp} from ${peerIp}, ${payload.text.length} chars`,
+                });
+              } catch {
+                /* audit failure must not drop the inject itself */
+              }
               log(`botlink: inject ${id} from ${payload.source} → ${payload.target} (${payload.text.length} chars)`);
               stream.write(JSON.stringify({ ok: true, id }) + "\n");
               stream.exit(0);

@@ -17,7 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ssh2 from "ssh2";
 const { Client, utils } = ssh2;
-import { generateBotKey, fingerprintOfPublicKey, startBotlinkServer, botlinkRequest } from "../dist/botlink.js";
+import { generateBotKey, fingerprintOfPublicKey, startBotlinkServer, botlinkRequest, verifyInjectLog } from "../dist/botlink.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -94,6 +94,15 @@ test("status/inject roundtrip over localhost", async (t) => {
   assert.equal(saved.target, "orchestrator");
   assert.equal(saved.text, "health ping from the test suite");
   assert.equal(saved.thread, "shim");
+  // Provenance fields: WHICH key authenticated, from WHERE — independent of
+  // the sender's self-reported `source`.
+  assert.equal(saved.authenticated_key_fp, clientBot.fingerprint, "receiver recorded the authenticating key");
+  assert.equal(saved.peer_ip, "127.0.0.1", "receiver recorded the peer address");
+  // Audit log: one "received" entry, hash chain intact.
+  const log1 = verifyInjectLog(spool);
+  assert.equal(log1.length, 1);
+  assert.equal(log1[0].event, "received");
+  assert.equal(log1[0].id, ack.id);
 
   const status2 = JSON.parse(await botlinkRequest(peer, "status"));
   assert.equal(status2.injects_total, 1);
@@ -166,7 +175,7 @@ test("unknown verb and malformed payloads are refused; nothing spools", async (t
       });
   });
   assert.notEqual(forbidden, "ran-exit-0", "arbitrary commands must not run");
-  assert.equal(fs.readdirSync(spool).length, 0, "nothing spooled by refusal");
+  assert.equal(fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length, 0, "nothing spooled by refusal");
 
   // Oversized text.
   await assert.rejects(
@@ -175,7 +184,34 @@ test("unknown verb and malformed payloads are refused; nothing spools", async (t
   );
   // Missing target.
   await assert.rejects(botlinkRequest(peer, "inject", { source: "c", text: "hi" }), /invalid payload/i);
-  assert.equal(fs.readdirSync(spool).length, 0, "still nothing spooled");
+  assert.equal(fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length, 0, "still nothing spooled");
+});
+
+test("inject audit log is tamper-evident: edits and deletions are caught", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = {
+    host: "127.0.0.1",
+    port: srv.port,
+    privateKeyPem: clientBot.privatePem,
+    expectedHostKey: host.fingerprint,
+  };
+  await botlinkRequest(peer, "inject", { source: "a", target: "b", text: "one" });
+  await botlinkRequest(peer, "inject", { source: "c", target: "d", text: "two" });
+  assert.equal(verifyInjectLog(spool).length, 2, "both received entries chain cleanly");
+
+  // Tamper with an entry's text field → chain verify must fail.
+  const logPath = path.join(spool, "inject.log");
+  const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+  const doctored = JSON.parse(lines[0]);
+  doctored.detail = "innocent entry, honest";
+  lines[0] = JSON.stringify(doctored);
+  fs.writeFileSync(logPath, lines.join("\n") + "\n");
+  assert.throws(() => verifyInjectLog(spool), /chain broken/, "edited entry detected");
+
+  // Delete the FIRST entry → second entry's prev link no longer matches genesis.
+  const lines2 = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+  fs.writeFileSync(logPath, lines2.slice(1).join("\n") + "\n");
+  assert.throws(() => verifyInjectLog(spool), /chain/, "removed entry detected");
 });
 
 test("fingerprintOfPublicKey accepts blobs and lines; rejects junk", () => {

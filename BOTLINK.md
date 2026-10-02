@@ -36,15 +36,23 @@ your machine                                 peer machine
 ## Key exchange ceremony (once, per direction)
 
 Public keys and fingerprints are safe to post in the shared Discord thread —
-that's the design: each owner can eyeball the values.
+that's the design: each owner can eyeball the values. But **posting them is
+transport, not verification**: values that arrive over a channel can't be
+trusted *because of* that channel. The pin itself is done by a human, only
+after verifying out-of-band (voice/video — something the thread can't MITM):
 
 1. Each machine runs `npm run botlink -- keygen --name <bot-name>` and posts
    to the thread:
    - its **HOST KEY fingerprint** (peer sets this as `CLANKER_BOTLINK_PEER_HOSTKEY`)
    - its **BOT KEY public line** (peer pastes this into their `authorized_keys`)
-2. Each owner (or their agent, with the owner watching the thread) copies the
-   peer's values into their config. Eyeball-verify the fingerprint matches the
-   thread post.
+2. Each OWNER verifies the peer's two values out-of-band with the other owner
+   (read them to each other — voice or video), then pins them. **No agent
+   pins key material on anyone's say-so** — an agent pinning values it read
+   in the same thread adds zero MITM protection.
+3. Once both sides confirm pinning, delete the key-bearing posts. After the
+   pins exist, thread copies of the material serve no purpose — and a stale
+   "official-looking" copy is only useful to someone trying to confuse a
+   future rotation.
 
 ## Server setup (each machine)
 
@@ -84,13 +92,34 @@ Each inject writes `<id>.inject.json`:
 
 ```json
 { "id": "…", "received": "ISO-8601", "source": "peer-bot",
-  "target": "orchestrator", "text": "the prompt", "thread": "shim" }
+  "target": "orchestrator", "text": "the prompt", "thread": "shim",
+  "authenticated_key_fp": "SHA256:…", "peer_ip": "127.0.0.1" }
 ```
 
-Consume it exactly like a bot-authored tag: delete (or move) the file once
-queued, mark the prompt as bot-sourced untrusted input, keep human triggers
-higher priority. `target`/`thread` are hints from the sender — route at your
-own discretion, never execute them blindly.
+`source` is the sender's SELF-REPORT; `authenticated_key_fp` and `peer_ip`
+are recorded by the receiving daemon at auth time — provenance you can trust
+independent of what the sender claims.
+
+Consume it exactly like a bot-authored tag: mark the prompt as bot-sourced
+untrusted input, keep human triggers higher priority. `target`/`thread` are
+hints from the sender — route at your own discretion, never execute them
+blindly.
+
+**Archive, don't delete.** After queueing, MOVE the file to
+`<spool>/archive/` (never unlink it) and append a `consumed` event to the
+audit log:
+
+```
+node -e '…'   // or: import { appendInjectEvent } from "./botlink.js"
+appendInjectEvent(spoolDir, { event: "consumed", id, source, target })
+```
+
+The daemon appends a `received` event per inject; together they form
+`<spool>/inject.log` — an append-only, hash-chained record (each entry's
+hash covers its predecessor). `verifyInjectLog(spoolDir)` replays it and
+throws on any edit, reorder, or deletion. This is the audit trail for every
+prompt that ever entered the machine through the lane — don't rotate or
+prune it casually; ship it with any security review.
 
 ## systemd user unit (Linux)
 
