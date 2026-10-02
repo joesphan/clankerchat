@@ -17,7 +17,8 @@
     "botlink": "node dist/botlink-server.js",
     "test:botlink": "node --test tests/botlink.test.mjs",
     "test:guards": "node --test tests/guards.test.mjs",
-    "test": "node --test tests/botlink.test.mjs tests/guards.test.mjs"
+    "test:leaks": "node --test tests/leaks.test.mjs",
+    "test": "node --test tests/botlink.test.mjs tests/guards.test.mjs tests/leaks.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

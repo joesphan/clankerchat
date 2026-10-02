@@ -47,6 +47,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
+import { findLeakSignals, leakRefusal } from "./leaks.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(MODULE_DIR, "..");
@@ -439,9 +440,31 @@ function registerTools(server: McpServer): void {
             `Message is ${message.length} chars; Discord allows ${MAX_MESSAGE_LENGTH}. Split it into parts.`,
           );
         }
+        // Outbound exfil tripwire (OWASP output monitoring): secret SHAPES
+        // never leave through the post channel, no matter what the sending
+        // session was talked into. Applies to the caption and the attachment.
+        const captionLeaks = findLeakSignals(message);
+        if (captionLeaks.length > 0) throw new Error(leakRefusal(captionLeaks));
         let attachment: { attachment: string; name: string } | undefined;
         if (file_path) {
           attachment = resolveAttachment(file_path);
+          try {
+            // Scan the head of the attachment too — attaching IS sending.
+            const fh = fs.openSync(attachment.attachment, "r");
+            try {
+              const buf = Buffer.alloc(64 * 1024);
+              const n = fs.readSync(fh, buf, 0, buf.length, 0);
+              const fileLeaks = findLeakSignals(buf.subarray(0, n).toString("utf8"));
+              if (fileLeaks.length > 0) {
+                throw new Error(leakRefusal(fileLeaks.map((k) => `${k} (in attachment)`)));
+              }
+            } finally {
+              fs.closeSync(fh);
+            }
+          } catch (err) {
+            if ((err as Error).message?.startsWith("REFUSED")) throw err;
+            /* unreadable content (non-file? special file?) — the path jail already ran */
+          }
         }
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const id = channel.id;
@@ -766,6 +789,10 @@ function registerTools(server: McpServer): void {
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
+        // Outbound exfil tripwire, lane edition: injects are the machine-to-
+        // machine channel — same rule as send, secret shapes never ride it.
+        const injectLeaks = findLeakSignals(text);
+        if (injectLeaks.length > 0) throw new Error(leakRefusal(injectLeaks));
         const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
         const task = task_kind
           ? {
