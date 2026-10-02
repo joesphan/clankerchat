@@ -93,6 +93,9 @@ interface DaemonConfig {
    *  when every bot in the channel is trusted; a compromised peer bot with
    *  this open can drive fullAuto workers on this machine). */
   botAllow: string[];
+  /** Role IDs that trigger like a bot mention; a role NAMED "clanker"
+   *  always triggers regardless of this list. */
+  triggerRoles: string[];
   /** Poll interval for the thread sweep, ms. */
   pollMs: number;
   /** Kill a worker after this long, ms. */
@@ -192,6 +195,11 @@ function loadConfig(): DaemonConfig {
     allowBots: parsed.allowBots === true,
     botAllow: Array.isArray(parsed.botAllow)
       ? (parsed.botAllow as unknown[]).filter(
+          (id): id is string => typeof id === "string" && /^\d+$/.test(id),
+        )
+      : [],
+    triggerRoles: Array.isArray(parsed.triggerRoles)
+      ? (parsed.triggerRoles as unknown[]).filter(
           (id): id is string => typeof id === "string" && /^\d+$/.test(id),
         )
       : [],
@@ -352,18 +360,30 @@ async function sendToThread(threadId: string, message: string): Promise<string |
 /** A message triggers a prompt iff it mentions the bot AND the author counts:
  *  humans must be allowlisted; other bots count when allowBots is on. Our own
  *  bot never triggers itself (self-loop). */
+/** True when the message mentions our bot user or a triggering role
+ *  (@clanker by name, or any ID in triggerRoles). */
+function mentionsTarget(m: Message, botUser: User): boolean {
+  if (m.mentions.has(botUser)) return true;
+  return [...m.mentions.roles.values()].some(
+    (r) => r.name.toLowerCase() === "clanker" || config.triggerRoles.includes(r.id),
+  );
+}
+
 function isTrigger(m: Message, botUser: User): boolean {
   if (m.author.id === botUser.id) return false;
-  if (!m.mentions.has(botUser)) return false;
+  if (!mentionsTarget(m, botUser)) return false;
   if (m.author.bot) {
     return config.allowBots && (config.botAllow.length === 0 || config.botAllow.includes(m.author.id));
   }
   return config.allowAllHumans || config.allow.includes(m.author.id);
 }
 
-/** Drops the bot mention(s) so the remainder is the actual prompt text. */
+/** Drops the bot/role mention(s) so the remainder is the actual prompt text. */
 function stripMention(content: string, botId: string): string {
-  return content.replace(new RegExp(`<@!?${botId}>\\s*`, "g"), "").trim();
+  return content
+    .replace(new RegExp(`<@!?${botId}>\\s*`, "g"), "")
+    .replace(/<@&\d+>\s*/g, "")
+    .trim();
 }
 
 /** Returns the meta payload if the prompt is tagged for the overseer itself. */
