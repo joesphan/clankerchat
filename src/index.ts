@@ -46,7 +46,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
+import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal } from "./leaks.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -816,6 +816,53 @@ function registerTools(server: McpServer): void {
           ...(supersedes ? { supersedes } : {}),
           ...(task ? { task } : {}),
         });
+        try {
+          return JSON.parse(out);
+        } catch {
+          return { raw: out };
+        }
+      }),
+  );
+
+  server.registerTool(
+    "bot_file",
+    {
+      title: "Send a file to the peer machine over botlink",
+      description: [
+        "Transfer one file (≤2 MB) to the peer machine over the private SSH",
+        "lane — files cross machines HERE, never as Discord attachments.",
+        "The file lands in the peer's spool under a receiver-controlled path",
+        "with size+sha256 verification, and is surfaced to their trigger layer",
+        "as untrusted input with its hash. Leak-shape scanned on both ends.",
+        "Same trust level as bot_inject; use it when a peer genuinely needs a",
+        "file that git doesn't already carry.",
+      ].join(" "),
+      inputSchema: {
+        file_path: z.string().min(1).describe("Path of the local file to send (jailed to CLANKER_FILE_ROOT in project mode)."),
+        target: z.string().min(1).max(64).describe("Routing hint on the peer, e.g. 'orchestrator'."),
+        note: z.string().max(400).optional().describe("One line: what this file is / why the peer needs it."),
+        thread: z.string().max(64).optional().describe("Discord thread name/id hint for the peer's human log."),
+      },
+    },
+    ({ file_path, target, note, thread }) =>
+      guard(async () => {
+        const disabled = botlinkDisabled();
+        if (disabled) throw new Error(disabled);
+        // Same jail as send attachments: project-mode instances can only
+        // ship files from inside their own root ("none" disables entirely).
+        const { attachment } = resolveAttachment(file_path);
+        const bytes = fs.readFileSync(attachment);
+        const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
+        const built = buildFileTransfer({
+          source,
+          target,
+          name: path.basename(attachment),
+          bytes,
+          ...(note ? { note } : {}),
+          ...(thread ? { thread } : {}),
+        });
+        if ("error" in built) throw new Error(built.error);
+        const out = await botlinkRequest(botlinkPeer!, "inject", built.payload);
         try {
           return JSON.parse(out);
         } catch {
