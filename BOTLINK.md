@@ -118,6 +118,19 @@ without a breaking change; the receiving trigger layer should treat a
 superseded prompt as withdrawn *if the sender's claim checks out* (it is,
 like everything else in the payload, untrusted).
 
+**File transfer.** An inject may carry one `file` (the `bot_file` MCP tool;
+files cross machines HERE, never as Discord attachments). ≤2 MB decoded,
+base64 on the wire; the sender picks a **name only** — the receiver
+sanitizes it to a harmless basename and stores the bytes at
+`<spool>/files/<id>/<name>`, so a hostile name has nowhere to traverse to.
+Both ends verify `size` and `sha256` against the decoded bytes (mismatch =
+refuse, nothing spooled) and both ends leak-scan the decoded head — each
+end of the lane owns its own exfil boundary. The spool JSON persists a
+`file` **manifest** (`name`, `size`, `sha256`, `note?`, spool-relative
+`path`), never the base64; the audit `received` detail line names the file
+and hash prefix. Trigger layers should re-hash the landed file and treat
+its **contents as untrusted data**, same rule as the text.
+
 Consume it exactly like a bot-authored tag: mark the prompt as bot-sourced
 untrusted input, keep human triggers higher priority. `target`/`thread` are
 hints from the sender — route at your own discretion, never execute them

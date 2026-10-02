@@ -11,13 +11,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ssh2 from "ssh2";
 const { Client, utils } = ssh2;
-import { generateBotKey, fingerprintOfPublicKey, startBotlinkServer, botlinkRequest, verifyInjectLog, appendInjectEvent, renderInjectReport } from "../dist/botlink.js";
+import { generateBotKey, fingerprintOfPublicKey, startBotlinkServer, botlinkRequest, verifyInjectLog, appendInjectEvent, renderInjectReport, buildFileTransfer, sanitizeFileName, BOTLINK_MAX_FILE_BYTES } from "../dist/botlink.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -584,3 +585,227 @@ test("exec watchdog: an exec channel that never ends is dropped (idle-channel gu
   });
   assert.equal(verdict, "dropped", "stalled exec channel must be closed by the server");
 });
+
+// --- file transfer (payload.file / bot_file) ---------------------------------
+// Files cross machines on the lane, never Discord. Sender picks a NAME only;
+// the receiver sanitizes it and stores under files/<inject-id>/ — plus size,
+// sha256, and leak-shape checks at BOTH ends (each end owns its boundary).
+
+test("sanitizeFileName: traversal and junk collapse to harmless basenames", () => {
+  assert.equal(sanitizeFileName("../../etc/passwd"), "passwd");
+  assert.equal(sanitizeFileName("with/slash.txt"), "slash.txt");
+  assert.equal(sanitizeFileName("...hidden"), "_hidden");
+  assert.equal(sanitizeFileName(""), "file");
+  assert.equal(sanitizeFileName("ctl\x00\x1fname"), "ctlname");
+  assert.equal(sanitizeFileName("a".repeat(400)).length, 120);
+  // Windows-style separators are not path separators on POSIX basename() —
+  // the character replace must still neutralize them.
+  const evil = sanitizeFileName("..\\..\\evil.sh");
+  assert.ok(!/[\\/]/.test(evil) && !evil.startsWith("."), `windows-style traversal collapsed: "${evil}"`);
+});
+
+test("buildFileTransfer: verified payload out; empty/oversize/leak-shaped refused", () => {
+  const bytes = Buffer.from("patch content — line 1\nline 2\n");
+  const built = buildFileTransfer({ source: "sender-bot", target: "orchestrator", name: "p.txt", bytes });
+  if (!("payload" in built)) assert.fail(`clean file refused: ${built.error}`);
+  assert.equal(built.payload.file.size, bytes.length);
+  assert.equal(built.payload.file.sha256, crypto.createHash("sha256").update(bytes).digest("hex"));
+  assert.match(built.payload.text, /^file transfer: p\.txt \(\d+ bytes, sha256 /);
+
+  assert.match(
+    buildFileTransfer({ source: "a", target: "o", name: "x", bytes: Buffer.alloc(0) }).error,
+    /empty/,
+  );
+  assert.match(
+    buildFileTransfer({ source: "a", target: "o", name: "big.bin", bytes: Buffer.alloc(BOTLINK_MAX_FILE_BYTES + 1, 7) }).error,
+    /too large/,
+  );
+  // The leak tripwire applies to FILE content, not just captions — a file
+  // carrying a live token shape is an exfil attempt regardless of framing.
+  const leaky = buildFileTransfer({
+    source: "a",
+    target: "o",
+    name: "env.txt",
+    bytes: Buffer.from(`DISCORD_TOKEN=${"x".repeat(48)}\n`),
+  });
+  if (!("error" in leaky)) assert.fail("leak-shaped file passed the builder");
+  assert.match(leaky.error, /^REFUSED:/);
+});
+
+test("file inject: e2e roundtrip (manifest-only spool, byte-identical landing, audit detail); server refuses tamper/leak/oversize", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = { host: "127.0.0.1", port: srv.port, privateKeyPem: clientBot.privatePem, expectedHostKey: host.fingerprint };
+
+  const bytes = Buffer.from("the quick brown file\n".repeat(24));
+  const built = buildFileTransfer({ source: "client-bot", target: "orchestrator", name: "notes.txt", bytes, note: "e2e proof" });
+  if (!("payload" in built)) assert.fail(`builder refused a clean file: ${built.error}`);
+  const ack = JSON.parse(await botlinkRequest(peer, "inject", built.payload));
+  assert.ok(ack.ok && ack.id, "file inject acked");
+
+  const spoolJsons = fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json"));
+  assert.equal(spoolJsons.length, 1, "exactly one spool file");
+  const saved = JSON.parse(fs.readFileSync(path.join(spool, spoolJsons[0]), "utf8"));
+  assert.equal(saved.file.name, "notes.txt");
+  assert.equal(saved.file.size, bytes.length);
+  assert.ok(!JSON.stringify(saved).includes("content_b64"), "base64 never persists in the spool json");
+  assert.match(saved.file.path, /^files\/[^/]+\/notes\.txt$/);
+  assert.ok(fs.readFileSync(path.join(spool, saved.file.path)).equals(bytes), "byte-identical roundtrip");
+  const entries = verifyInjectLog(spool);
+  assert.match(entries[0].detail ?? "", /file notes\.txt \d+B sha256:/);
+  assert.match(renderInjectReport(spool), /chain verified/);
+
+  // Server-side refusal 1: sha256 lie (hostile peer skips the builder).
+  const wrongSha = crypto.createHash("sha256").update("different bytes").digest("hex");
+  await assert.rejects(
+    botlinkRequest(peer, "inject", {
+      source: "client-bot",
+      target: "orchestrator",
+      text: "tampered file transfer",
+      file: { name: "evil.bin", size: bytes.length, sha256: wrongSha, content_b64: bytes.toString("base64") },
+    }),
+    /hash mismatch/i,
+  );
+  // Server-side refusal 2: leak-shaped file content.
+  const leakBytes = Buffer.from(`ghp_${"a".repeat(36)}`);
+  await assert.rejects(
+    botlinkRequest(peer, "inject", {
+      source: "client-bot",
+      target: "orchestrator",
+      text: "leaky file transfer",
+      file: {
+        name: "tok.txt",
+        size: leakBytes.length,
+        sha256: crypto.createHash("sha256").update(leakBytes).digest("hex"),
+        content_b64: leakBytes.toString("base64"),
+      },
+    }),
+    /REFUSED/,
+  );
+  // Server-side refusal 3: oversize claim — refused before any decode/write.
+  await assert.rejects(
+    botlinkRequest(peer, "inject", {
+      source: "client-bot",
+      target: "orchestrator",
+      text: "oversize file transfer",
+      file: { name: "huge.bin", size: BOTLINK_MAX_FILE_BYTES + 1, sha256: "0".repeat(64), content_b64: "AAAA" },
+    }),
+    /too large/i,
+  );
+  assert.equal(
+    fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length,
+    1,
+    "every refusal spooled nothing",
+  );
+});
+
+test("file inject: hostile sender-supplied name is collapsed server-side (no traversal)", async (t) => {
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = { host: "127.0.0.1", port: srv.port, privateKeyPem: clientBot.privatePem, expectedHostKey: host.fingerprint };
+  const bytes = Buffer.from("traversal probe");
+  const ack = JSON.parse(
+    await botlinkRequest(peer, "inject", {
+      source: "client-bot",
+      target: "orchestrator",
+      text: "raw file with a hostile name",
+      file: {
+        name: "../../../evil.sh",
+        size: bytes.length,
+        sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+        content_b64: bytes.toString("base64"),
+      },
+    }),
+  );
+  assert.ok(ack.ok, "valid file accepted");
+  // Landed strictly inside spool/files/<id>/ with the name collapsed —
+  // nowhere outside the spool, no separators left in the name.
+  const destDir = path.join(spool, "files", ack.id);
+  assert.deepEqual(fs.readdirSync(destDir), ["evil.sh"]);
+  assert.ok(fs.readFileSync(path.join(destDir, "evil.sh")).equals(bytes));
+  assert.equal(fs.existsSync(path.join(spool, "..", "evil.sh")), false, "nothing escaped the spool");
+});
+
+test("file inject hardening: schema bounds the blob, raw accumulator cap refuses pre-parse", async (t) => {
+  // Schema-level: content_b64 beyond base64-of-2MB is rejected at PARSE —
+  // a hostile peer's oversized blob never reaches the decoder.
+  const bytes = Buffer.from("x");
+  const bloated = {
+    source: "client-bot",
+    target: "orchestrator",
+    text: "schema-bound probe",
+    file: {
+      name: "blob.bin",
+      size: 1,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      content_b64: "A".repeat(Math.ceil(BOTLINK_MAX_FILE_BYTES / 3) * 4 + 1),
+    },
+  };
+  const { srv, host, clientBot, spool } = await makeServer(t);
+  const peer = { host: "127.0.0.1", port: srv.port, privateKeyPem: clientBot.privatePem, expectedHostKey: host.fingerprint };
+  await assert.rejects(botlinkRequest(peer, "inject", bloated), /invalid payload/i);
+
+  // Accumulator cap: raw stdin beyond maxRawPayloadBytes is refused BEFORE
+  // parsing — junk that isn't even JSON gets the same wall. Tiny cap here so
+  // the test moves bytes, not tens of megabytes.
+  const { srv: srv2, host: host2, clientBot: clientBot2, spool: spool2 } = await makeServer(t, { maxRawPayloadBytes: 1024 });
+  const peer2 = { host: "127.0.0.1", port: srv2.port, privateKeyPem: clientBot2.privatePem, expectedHostKey: host2.fingerprint };
+  await assert.rejects(
+    botlinkRequestRaw(peer2, "x".repeat(4096)),
+    /payload too large/i,
+  );
+  assert.equal(
+    fs.readdirSync(spool).filter((f) => f.endsWith(".inject.json")).length +
+      fs.readdirSync(spool2).filter((f) => f.endsWith(".inject.json")).length,
+    0,
+    "nothing spooled by either refusal",
+  );
+});
+
+/** Raw-stdin inject: ship arbitrary bytes as the "payload" (no builder, no
+ *  valid JSON) — what a hostile authed peer actually controls. */
+function botlinkRequestRaw(peer, raw) {
+  // Reuse the public client but intercept the payload write: botlinkRequest
+  // only injects JSON for `inject` when given a payload object; without one
+  // it sends nothing. So drive ssh2 directly here.
+  return new Promise((resolve, reject) => {
+    const { Client } = ssh2;
+    const conn = new Client();
+    const done = (fn) => {
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(() => {
+      conn.end();
+      reject(new Error("raw probe timed out"));
+    }, 15_000);
+    conn
+      .on("ready", () => {
+        conn.exec("inject", (err, stream) => {
+          if (err) return done(() => reject(err));
+          let errOut = "";
+          let exitCode = null;
+          stream.on("data", () => {}); // drain: without a reader the channel window stalls and 'close' never fires
+          stream.stderr.on("data", (c) => (errOut += c.toString()));
+          stream.on("exit", (code) => (exitCode = code));
+          stream.on("close", () => {
+            conn.end();
+            done(() =>
+              exitCode === 0
+                ? resolve("unexpected ok")
+                : reject(new Error(errOut.trim() || `exit ${exitCode}`)),
+            );
+          });
+          stream.end(raw);
+        });
+      })
+      .on("error", (err) => done(() => reject(err)))
+      .on("close", () => done(() => reject(new Error("closed early"))))
+      .connect({
+        host: peer.host,
+        port: peer.port,
+        username: "clanker",
+        privateKey: peer.privateKeyPem,
+        hostVerifier: (key) => fingerprintOfPublicKey(key.toString("base64")) === peer.expectedHostKey,
+        readyTimeout: 10_000,
+      });
+  });
+}

@@ -10,7 +10,10 @@
  *                   via a spool file. The local watcher/overseer consumes the
  *                   spool and treats an inject exactly like a bot-authored
  *                   tag: untrusted input, elevated scrutiny, human tags
- *                   always keep priority.
+ *                   always keep priority. A payload may carry one FILE
+ *                   (≤2 MB, size+sha256 verified, leak-scanned both ends,
+ *                   stored under a receiver-controlled path) — files cross
+ *                   machines on this lane, never as Discord attachments.
  *
  * Auth model: publickey ONLY, one dedicated keypair per bot (never a human's
  * key), username pinned, host key pinned by fingerprint on the client side
@@ -28,10 +31,15 @@ import ssh2 from "ssh2";
 import type { ParsedKey } from "ssh2";
 const { Client: SshClient, Server: SshServer, utils } = ssh2;
 import { z } from "zod";
+import { findLeakSignals, leakRefusal } from "./leaks.js";
 
 export const BOTLINK_PORT_DEFAULT = 47421;
 export const BOTLINK_USER_DEFAULT = "clanker";
 export const BOTLINK_MAX_TEXT = 4000;
+// File-carrying injects: the lane moves prompts and small artifacts (a
+// patch, a log, a config), not arbitrary datasets — 2 MB decoded is the
+// deliberate ceiling on both ends.
+export const BOTLINK_MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Keys — ed25519 generation + OpenSSH wire format, pure crypto so it works
@@ -328,8 +336,78 @@ export const InjectPayload = z.object({
   thread: z.string().max(64).optional(), // reply venue hint (thread name/id)
   supersedes: z.string().max(64).optional(), // lineage: inject id this one replaces (same logical prompt, refined)
   task: InjectTask.optional(), // structured task — hints, same untrusted-input rules
+  file: z
+    .object({
+      name: z.string().min(1).max(160), // display/hint name — receiver sanitizes to a basename, sender NEVER picks a path
+      size: z.number().int().min(1), // decoded byte length (receiver verifies)
+      sha256: z.string().regex(/^[0-9a-f]{64}$/), // of the DECODED bytes (receiver verifies)
+      // Schema-level blob bound: base64 of the 2 MB cap is ~2.8 MB — anything
+      // larger is a hostile/buggy peer, rejected at PARSE before the raw
+      // accumulator or decoder ever sees it.
+      content_b64: z.string().min(1).max(Math.ceil(BOTLINK_MAX_FILE_BYTES / 3) * 4),
+      note: z.string().max(400).optional(), // one line: what it is / why
+    })
+    .optional(), // file transfer — same trust level as the text (untrusted on arrival)
 });
 export type InjectPayload = z.infer<typeof InjectPayload>;
+
+/** Strip a sender-supplied name to a harmless basename: no separators, no
+ *  control chars, no leading dots, bounded length. The receiver writes under
+ *  <spool>/files/<inject-id>/<name> so traversal has nowhere to go even
+ *  before this runs — this is the second lock, not the only one. */
+export function sanitizeFileName(name: string): string {
+  const base = path
+    .basename(String(name ?? ""))
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/[/\\:"*?<>|]/g, "_")
+    .replace(/^\.+/, "_")
+    .trim()
+    .slice(0, 120);
+  return base || "file";
+}
+
+/**
+ * Send-side file-transfer builder — everything the SENDING machine checks
+ * before a byte leaves: size cap, leak-shape scan of the head (same rule as
+ * `send` attachments — the lane is an exfil boundary, not a side door), then
+ * the payload with a self-framing text line. Pure and exported so the test
+ * suite pins the refusals without an SSH hop.
+ */
+export function buildFileTransfer(opts: {
+  source: string;
+  target: string;
+  name: string;
+  bytes: Buffer;
+  note?: string;
+  thread?: string;
+}): { payload: InjectPayload } | { error: string } {
+  if (opts.bytes.length === 0) return { error: "file is empty — nothing to send" };
+  if (opts.bytes.length > BOTLINK_MAX_FILE_BYTES) {
+    return { error: `file too large: ${opts.bytes.length} bytes (cap ${BOTLINK_MAX_FILE_BYTES} = 2 MB decoded)` };
+  }
+  const head = opts.bytes.subarray(0, 65536).toString("utf8");
+  const leaks = findLeakSignals(head);
+  if (leaks.length > 0) {
+    return { error: leakRefusal(leaks.map((k) => `${k} (in file ${opts.name})`)) };
+  }
+  const name = sanitizeFileName(opts.name);
+  const sha256 = crypto.createHash("sha256").update(opts.bytes).digest("hex");
+  return {
+    payload: {
+      source: opts.source,
+      target: opts.target,
+      text: `file transfer: ${name} (${opts.bytes.length} bytes, sha256 ${sha256.slice(0, 12)}…)${opts.note ? ` — ${opts.note}` : ""}`,
+      ...(opts.thread ? { thread: opts.thread } : {}),
+      file: {
+        name,
+        size: opts.bytes.length,
+        sha256,
+        content_b64: opts.bytes.toString("base64"),
+        ...(opts.note ? { note: opts.note } : {}),
+      },
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Server
@@ -346,6 +424,8 @@ export interface BotlinkServerOptions {
   maxSpoolPending?: number; // refuse injects at/above this many unconsumed files (default 100)
   maxConnections?: number; // concurrent SSH connection cap — slowloris guard (default 10)
   execTimeoutMs?: number; // per-exec watchdog: no payload-end by this → drop (default 30s)
+  maxFileBytes?: number; // per-file cap for file-carrying injects (default 2 MB decoded)
+  maxRawPayloadBytes?: number; // raw stdin accumulator cap BEFORE parsing (default 12 MB — headroom over one max file + envelope)
   log?: (line: string) => void;
 }
 
@@ -376,6 +456,12 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   const maxPending = opts.maxSpoolPending ?? 100;
   const maxConnections = opts.maxConnections ?? 10; // legit inject bursts clear; parked-idle channels are the thing being bounded
   const execTimeoutMs = opts.execTimeoutMs ?? 30_000;
+  const maxFileBytes = opts.maxFileBytes ?? BOTLINK_MAX_FILE_BYTES;
+  // Raw-accumulator cap: zod bounds the PARSED payload, but the stdin
+  // collector buffers whatever bytes arrive BEFORE parse — a hostile authed
+  // peer could stream gigabytes of junk-JSON into memory. Refuse the channel
+  // the moment the accumulator crosses the line.
+  const maxRawPayloadBytes = opts.maxRawPayloadBytes ?? 12 * 1024 * 1024;
 
   // Unconsumed-spool depth, shared by the status snapshot and the inject cap.
   const countPending = () => {
@@ -482,10 +568,25 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               return;
             }
             let data = "";
-            stream.stdin.on("data", (c: Buffer) => (data += c.toString("utf8")));
+            let rawRefused = false; // oversize accumulator: stop buffering, refuse at end
+            stream.stdin.on("data", (c: Buffer) => {
+              if (rawRefused) return; // already over the line — keep draining, keep nothing
+              data += c.toString("utf8");
+              if (data.length > maxRawPayloadBytes) {
+                rawRefused = true;
+                data = ""; // drop the buffer, not just the flag — the bytes are garbage to us
+              }
+            });
             stream.stdin.on("end", async () => {
               if (reaped) return; // watchdog already dropped this channel
               clearTimeout(watchdog); // payload arrived — normal processing from here
+              if (rawRefused) {
+                log(`botlink: payload refused from ${peerIp} — raw body over ${maxRawPayloadBytes} bytes (pre-parse accumulator cap)`);
+                stream.stderr.end(`payload too large: raw body exceeds ${maxRawPayloadBytes} bytes\n`);
+                stream.exit(1);
+                stream.close();
+                return;
+              }
               if (++injects > maxInjects) {
                 stream.stderr.end("inject limit for this connection\n");
                 stream.exit(1);
@@ -516,17 +617,68 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                 return;
               }
               const id = `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+              // File-carrying inject: verify, then persist the bytes under a
+              // receiver-controlled path. The sender picks a NAME (sanitized
+              // to a harmless basename); the destination is always
+              // <spool>/files/<inject-id>/<name> — traversal has nowhere to
+              // go even before the sanitizer runs. Refusals spool NOTHING.
+              let fileManifest:
+                | { name: string; size: number; sha256: string; note?: string; path: string }
+                | undefined;
+              const fileRefuse = (why: string) => {
+                log(`botlink: file inject REFUSED from ${peerIp} — ${why}; nothing spooled`);
+                stream.stderr.end(`${why}\n`);
+                stream.exit(1);
+                stream.close();
+              };
+              if (payload.file) {
+                const f = payload.file;
+                if (f.size > maxFileBytes) {
+                  return void fileRefuse(`file too large: ${f.size} bytes (cap ${maxFileBytes})`);
+                }
+                const bytes = Buffer.from(f.content_b64, "base64");
+                if (bytes.length === 0 || bytes.length !== f.size) {
+                  return void fileRefuse("file size mismatch — claimed size does not match decoded bytes");
+                }
+                const sha = crypto.createHash("sha256").update(bytes).digest("hex");
+                if (sha !== f.sha256) {
+                  return void fileRefuse("file hash mismatch — corrupted or tampered in transit");
+                }
+                // Receiver-side exfil boundary: the sender's leak scan is
+                // theirs; this end of the lane refuses secret shapes in
+                // arriving files regardless of what the far side checked.
+                const leakKinds = findLeakSignals(bytes.subarray(0, 65536).toString("utf8"));
+                if (leakKinds.length > 0) {
+                  return void fileRefuse(leakRefusal(leakKinds.map((k) => `${k} (in file "${f.name}")`)));
+                }
+                const safeName = sanitizeFileName(f.name);
+                const dest = path.join(opts.spoolDir, "files", id, safeName);
+                fs.mkdirSync(path.dirname(dest), { recursive: true });
+                fs.writeFileSync(dest, bytes);
+                fileManifest = {
+                  name: safeName,
+                  size: f.size,
+                  sha256: f.sha256,
+                  ...(f.note ? { note: f.note } : {}),
+                  path: path.relative(opts.spoolDir, dest),
+                };
+              }
               const file = path.join(opts.spoolDir, `${id}.inject.json`);
               // Provenance: the payload as validated, plus who delivered it —
               // the consuming side can tell WHERE a prompt came from without
-              // trusting the sender's self-reported `source` field.
+              // trusting the sender's self-reported `source` field. File
+              // injects persist a MANIFEST (bytes are already on disk under
+              // files/<id>/), never the base64 — the spool stays an audit
+              // artifact, not a blob store.
+              const { file: _fileBlock, ...payloadRest } = payload;
               fs.writeFileSync(
                 file,
                 JSON.stringify(
                   {
                     id,
                     received: new Date().toISOString(),
-                    ...payload,
+                    ...payloadRest,
+                    ...(fileManifest ? { file: fileManifest } : {}),
                     authenticated_key_fp: authedKeyFp,
                     peer_ip: peerIp,
                   },
@@ -549,6 +701,9 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                     payload.task?.kind ? `kind=${payload.task.kind}` : "",
                     payload.task?.reply_to ? `reply_to=${payload.task.reply_to}` : "",
                     payload.task?.correlation ? `correlation=${payload.task.correlation}` : "",
+                    fileManifest
+                      ? `file ${fileManifest.name} ${fileManifest.size}B sha256:${fileManifest.sha256.slice(0, 12)}`
+                      : "",
                   ]
                     .filter(Boolean)
                     .join(" "),
@@ -638,7 +793,11 @@ export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", pay
       conn.end();
       finish(() => reject(new Error(msg)));
     };
-    timer = setTimeout(() => fail(`botlink verb "${verb}" timed out after 30s without completing`), 30_000);
+    // File-carrying injects move ~2.8 MB of base64; give them double the
+    // absolute deadline so a slow link fails on the SERVER's watchdog, not
+    // on our own impatience (both fire well under a healthy tailnet's time).
+    const deadlineMs = verb === "inject" && payload?.file ? 60_000 : 30_000;
+    timer = setTimeout(() => fail(`botlink verb "${verb}" timed out after ${deadlineMs / 1000}s without completing`), deadlineMs);
     conn
       .on("ready", () => {
         conn.exec(verb, (err, stream) => {

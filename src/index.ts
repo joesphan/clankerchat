@@ -46,7 +46,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { loadEnvFile } from "./env.js";
-import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
+import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.js";
+import { findLeakSignals, leakRefusal } from "./leaks.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
 const READY_TIMEOUT_MS = 20_000;
@@ -412,9 +413,31 @@ function registerTools(server: McpServer): void {
             `Message is ${message.length} chars; Discord allows ${MAX_MESSAGE_LENGTH}. Split it into parts.`,
           );
         }
+        // Outbound exfil tripwire (OWASP output monitoring): secret SHAPES
+        // never leave through the post channel, no matter what the sending
+        // session was talked into. Applies to the caption and the attachment.
+        const captionLeaks = findLeakSignals(message);
+        if (captionLeaks.length > 0) throw new Error(leakRefusal(captionLeaks));
         let attachment: { attachment: string; name: string } | undefined;
         if (file_path) {
           attachment = resolveAttachment(file_path);
+          try {
+            // Scan the head of the attachment too — attaching IS sending.
+            const fh = fs.openSync(attachment.attachment, "r");
+            try {
+              const buf = Buffer.alloc(64 * 1024);
+              const n = fs.readSync(fh, buf, 0, buf.length, 0);
+              const fileLeaks = findLeakSignals(buf.subarray(0, n).toString("utf8"));
+              if (fileLeaks.length > 0) {
+                throw new Error(leakRefusal(fileLeaks.map((k) => `${k} (in attachment)`)));
+              }
+            } finally {
+              fs.closeSync(fh);
+            }
+          } catch (err) {
+            if ((err as Error).message?.startsWith("REFUSED")) throw err;
+            /* unreadable content (non-file? special file?) — the path jail already ran */
+          }
         }
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const id = channel.id;
@@ -739,6 +762,10 @@ function registerTools(server: McpServer): void {
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
+        // Outbound exfil tripwire, lane edition: injects are the machine-to-
+        // machine channel — same rule as send, secret shapes never ride it.
+        const injectLeaks = findLeakSignals(text);
+        if (injectLeaks.length > 0) throw new Error(leakRefusal(injectLeaks));
         const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
         const task = task_kind
           ? {
@@ -762,6 +789,53 @@ function registerTools(server: McpServer): void {
           ...(supersedes ? { supersedes } : {}),
           ...(task ? { task } : {}),
         });
+        try {
+          return JSON.parse(out);
+        } catch {
+          return { raw: out };
+        }
+      }),
+  );
+
+  server.registerTool(
+    "bot_file",
+    {
+      title: "Send a file to the peer machine over botlink",
+      description: [
+        "Transfer one file (≤2 MB) to the peer machine over the private SSH",
+        "lane — files cross machines HERE, never as Discord attachments.",
+        "The file lands in the peer's spool under a receiver-controlled path",
+        "with size+sha256 verification, and is surfaced to their trigger layer",
+        "as untrusted input with its hash. Leak-shape scanned on both ends.",
+        "Same trust level as bot_inject; use it when a peer genuinely needs a",
+        "file that git doesn't already carry.",
+      ].join(" "),
+      inputSchema: {
+        file_path: z.string().min(1).describe("Path of the local file to send (jailed to CLANKER_FILE_ROOT in project mode)."),
+        target: z.string().min(1).max(64).describe("Routing hint on the peer, e.g. 'orchestrator'."),
+        note: z.string().max(400).optional().describe("One line: what this file is / why the peer needs it."),
+        thread: z.string().max(64).optional().describe("Discord thread name/id hint for the peer's human log."),
+      },
+    },
+    ({ file_path, target, note, thread }) =>
+      guard(async () => {
+        const disabled = botlinkDisabled();
+        if (disabled) throw new Error(disabled);
+        // Same jail as send attachments: project-mode instances can only
+        // ship files from inside their own root ("none" disables entirely).
+        const { attachment } = resolveAttachment(file_path);
+        const bytes = fs.readFileSync(attachment);
+        const source = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? "clankerchat";
+        const built = buildFileTransfer({
+          source,
+          target,
+          name: path.basename(attachment),
+          bytes,
+          ...(note ? { note } : {}),
+          ...(thread ? { thread } : {}),
+        });
+        if ("error" in built) throw new Error(built.error);
+        const out = await botlinkRequest(botlinkPeer!, "inject", built.payload);
         try {
           return JSON.parse(out);
         } catch {
