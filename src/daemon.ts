@@ -852,6 +852,13 @@ async function dispatch(job: Job): Promise<void> {
   try {
     const metaRest = splitMeta(job.prompt);
     if (metaRest !== null) {
+      // B7 (spec law): meta commands are human-only. A bot-authored "!ov …"
+      // can steer routing (!ov map), drain contexts (!ov forget) and read
+      // state (!ov status) — never executable on a peer bot's say-so.
+      if (job.fromBot) {
+        log(`meta refused: bot-authored "!ov" from ${job.from} — meta is human-only`);
+        return;
+      }
       log(`meta: ${metaRest.slice(0, 80)}`);
       await handleMeta(job, metaRest);
       return;
@@ -963,6 +970,16 @@ function enqueue(job: Job): void {
   if (queue.length >= MAX_QUEUE) {
     log(`queue full — dropping prompt from ${job.from} in "${job.threadName}"`);
     return;
+  }
+  // Coalesce rapid re-sends from the same author in the same thread: the
+  // newer prompt supersedes the still-queued older one (the 02:09
+  // double-dispatch class — double-send inside one poll window).
+  const dupIdx = queue.findIndex(
+    (q) => q.fromId === job.fromId && q.threadName === job.threadName,
+  );
+  if (dupIdx >= 0) {
+    const old = queue.splice(dupIdx, 1)[0];
+    log(`coalesced: "${job.threadName}" from ${job.from} — trigger ${job.triggerId} supersedes queued ${old.triggerId}`);
   }
   queue.push(job);
   log(`queued: "${job.threadName}" from ${job.from} (queue=${queue.length})`);
