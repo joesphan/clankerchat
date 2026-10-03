@@ -46,6 +46,7 @@ import {
   type User,
 } from "discord.js";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
@@ -651,6 +652,8 @@ const isRunning = () => activeJobs.length > 0;
 const activeJobs: Job[] = [];
 let currentChild: ReturnType<typeof spawn> | null = null; // last spawned (signals kill all via children set)
 const children = new Set<ReturnType<typeof spawn>>();
+/** B5: unique canary per dispatched run; any appearing in our own posts = leak. */
+const activeCanaries = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // Wake watchdog — a routed wake only counts if an answer lands in the thread
@@ -698,12 +701,13 @@ async function checkFollowups(): Promise<void> {
   }
 }
 
-function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
+function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean, canary: string): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   const replyTarget = job.rootChannel
     ? `channel_id "${job.threadId}" (the channel ROOT — not a thread)`
     : `thread_name "${job.threadName}"`;
   return [
+    `SECURITY CANARY: the token ${canary} is a leak tripwire. NEVER write, quote, echo, or reference it in any output, file, or message. Its presence outside this prompt is treated as an exfiltration event.`,
     `You are the ${name} overseer worker, spawned because ${job.fromBot ? `another machine's agent (${job.from}) mentioned` : "a human replied to"} this machine's bot in the "${job.threadName}" Discord ${job.rootChannel ? "channel root" : "thread"}.`,
     `Start your reply by tagging the asker — the first characters of the message must be <@${job.fromId}> followed by a space.`,
     job.fromBot
@@ -927,7 +931,10 @@ async function dispatch(job: Job): Promise<void> {
     const sessionId = state.sessions[job.threadName];
     if (sessionId) args.push("--resume", sessionId);
 
-    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd, sandboxed), config.timeoutMs);
+    const canary = `cnry-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+    activeCanaries.add(canary);
+    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd, sandboxed, canary), config.timeoutMs);
+    activeCanaries.delete(canary);
     const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
     if (sessionIdOut) {
       state.sessions[job.threadName] = sessionIdOut;
@@ -1137,28 +1144,85 @@ async function main(): Promise<void> {
   log(
     `overseer: watching every thread in the team channel as ${me.user.username}; ` +
       `mapped=[${Object.keys(config.threads).join(", ")}]; reposRoot=${config.reposRoot}; ` +
-      `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; poll=${config.pollMs}ms`,
+      `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; EVENT-DRIVEN (gateway)`,
   );
 
+  // CLANKER SPEC A1: one REST catch-up at boot, then the gateway is the only
+  // trigger source — no idle polling, no cursor crawls, no swallowed history.
+  try {
+    await pollOnce(parent, me.user);
+  } catch (err) {
+    log(`catch-up error: ${errText(err)}`);
+  }
+
+  client.on(Events.MessageCreate, (m) => {
+    void handleLiveMessage(m, parent, me.user).catch((err) =>
+      log(`gateway handler error: ${errText(err)}`),
+    );
+  });
+
+  // CLANKER SPEC A3/A5 heartbeat: follow-ups + queue drain + watchdog feed.
   for (;;) {
     lastPollAt = Date.now();
-    try {
-      await pollOnce(parent, me.user);
-    } catch (err) {
-      log(`poll error: ${errText(err)}`);
-    }
     try {
       await checkFollowups();
     } catch (err) {
       log(`follow-up error: ${errText(err)}`);
     }
     try {
-      void drain(); // non-blocking: polling must never starve behind a long worker
+      void drain();
     } catch (err) {
       log(`dispatch error: ${errText(err)}`);
     }
-    await sleep(config.pollMs);
+    await sleep(30_000);
   }
+}
+
+/** Gateway path: a live message in the parent channel or any of its threads.
+ *  Webhooks never trigger (B6); own posts are canary-scanned (B5), not run. */
+async function handleLiveMessage(m: Message, parent: TextChannel | NewsChannel, botUser: User): Promise<void> {
+  lastPollAt = Date.now();
+  if (m.webhookId) return; // B6: webhook spoof class never triggers
+  if (m.author.id === botUser.id) {
+    // B5 tripwire: our own posts must never contain an active canary.
+    const leaked = [...activeCanaries].find((c) => m.content.includes(c));
+    if (leaked) {
+      log(`LEAK TRIPWIRE: canary ${leaked.slice(0, 8)}… appeared in our own post ${m.id}`);
+      await sendToThread(m.channelId, "LEAK TRIPWIRE: an outbound post contained a run canary — investigate immediately.");
+    }
+    return;
+  }
+  const inRoot = m.channelId === parent.id;
+  let threadName: string | null = null;
+  let threadId = parent.id;
+  if (!inRoot) {
+    const ch = m.channel;
+    if (!(ch instanceof ThreadChannel) || ch.parentId !== parent.id) return;
+    threadName = ch.name;
+    threadId = ch.id;
+  }
+  const tagged = isTrigger(m, botUser);
+  if (!tagged) {
+    if (inRoot) return;
+    if (!isUntaggedThreadTrigger(m, botUser, threadName)) return;
+  }
+  const prompt = stripMention(m.content, botUser.id);
+  if (!prompt) return;
+  enqueue({
+    threadName: threadName ?? "(channel root)",
+    threadId,
+    rootChannel: inRoot,
+    cwd: threadName ? mappedCwdFor(threadName) : null,
+    prompt,
+    from: m.author.username,
+    fromId: m.author.id,
+    fromBot: m.author.bot,
+    untagged: !tagged,
+    triggerId: m.id,
+  });
+  // Advance the cursor so a restart's catch-up doesn't replay this message.
+  state.cursors[threadId] = m.id;
+  saveState();
 }
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
