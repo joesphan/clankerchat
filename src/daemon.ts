@@ -400,6 +400,17 @@ function isTrigger(m: Message, botUser: User): boolean {
   return config.allowAllHumans || config.allow.includes(m.author.id);
 }
 
+/** Untagged human messages in MAPPED project threads also count — the thread
+ *  itself is the address (people post asks without tagging). The router
+ *  filters banter via the "ignore" decision. Bots/root still need a tag. */
+function isUntaggedThreadTrigger(m: Message, botUser: User, threadName: string): boolean {
+  if (m.author.bot || m.author.id === botUser.id) return false;
+  if (mentionsTarget(m, botUser)) return false; // handled by isTrigger
+  if (config.pausedThreads.some((n) => n.toLowerCase() === threadName.toLowerCase())) return false;
+  if (mappedCwdFor(threadName) === null) return false; // mapped threads only
+  return config.allowAllHumans || config.allow.includes(m.author.id);
+}
+
 /** Drops the bot/role mention(s) so the remainder is the actual prompt text. */
 function stripMention(content: string, botId: string): string {
   return content
@@ -516,6 +527,7 @@ interface Job {
   from: string; // Discord username of the triggering human
   fromId: string; // Discord user/bot id of the asker — replies tag this
   fromBot: boolean; // triggered by a peer bot rather than an allowlisted human
+  untagged?: boolean; // no mention — human posted in a mapped thread
   triggerId: string; // id of the Discord message that triggered this job
   skipWake?: boolean; // fallback run: route cwd only, never wake
 }
@@ -524,6 +536,7 @@ interface RouteDecision {
   woke: string | null; // name of the live session that was messaged
   cwd: string | null; // inferred repo for a worker
   confidence: "high" | "low"; // high = the task itself names the project
+  ignore?: boolean; // untagged message wasn't for us — drop silently
   reason: string;
 }
 
@@ -558,8 +571,11 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
     `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , max 30 words of prose (code blocks exempt), commands/paths in fenced code, then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.${job.rootChannel ? " (This job is a CHANNEL-ROOT post — do NOT wake; go straight to step 2 and reply woke=null.)" : ""}`,
     `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
     ``,
+    job.untagged
+      ? `This message was NOT tagged — the human just posted it in a project thread. If it is not an ask directed at this machine's agents (banter, acks like "ok"/"rebooted", humans talking to each other, FYIs), set "ignore": true and nothing else happens.`
+      : ``,
     `Reply with ONLY one line of JSON, no prose:`,
-    `{"woke": <session name or null>, "cwd": <absolute path or null>, "confidence": "high"|"low", "reason": "<=10 words"}`,
+    `{"woke": <session name or null>, "cwd": <absolute path or null>, "confidence": "high"|"low", "ignore": <true|false, untagged only>, "reason": "<=10 words"}`,
   ].join("\n");
 }
 
@@ -594,6 +610,7 @@ async function runRouter(job: Job, mappedCwd: string | null): Promise<RouteDecis
           ? path.resolve(d.cwd)
           : null,
       confidence: d.confidence === "high" ? "high" : "low",
+      ignore: d.ignore === true,
       reason: typeof d.reason === "string" ? d.reason : "",
     };
   } catch {
@@ -841,8 +858,12 @@ async function dispatch(job: Job): Promise<void> {
     let cwd = job.cwd;
     let woke: string | null = null;
     let routeConfidence: "high" | "low" = "high"; // explicit mapping is always trusted
-    if (!job.skipWake && !job.rootChannel && (!cwd || config.wake)) {
+    if (!job.skipWake && !job.rootChannel && (!cwd || config.wake || job.untagged)) {
       const decision = await runRouter(job, cwd);
+      if (decision?.ignore) {
+        log(`router: ignored untagged message in "${job.threadName}" (${decision.reason})`);
+        return; // banter/ack — not for us, no worker, no reply
+      }
       if (decision) {
         woke = decision.woke;
         if (!cwd && decision.cwd) cwd = decision.cwd;
@@ -986,7 +1007,9 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
     const messages = [...fetched.values()].sort(byIdAscending);
     for (const m of messages) {
       cursor = m.id;
-      if (!isTrigger(m, botUser)) {
+      const tagged = isTrigger(m, botUser);
+      const untagged = !tagged && isUntaggedThreadTrigger(m, botUser, thread.name);
+      if (!tagged && !untagged) {
         // Circuit-broken thread: refuse LOUDLY — silence reads as death.
         if (
           mentionsTarget(m, botUser) &&
@@ -1013,6 +1036,7 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
         from: m.author.username,
         fromId: m.author.id,
         fromBot: m.author.bot,
+        untagged: !tagged,
         triggerId: m.id,
       });
     }
