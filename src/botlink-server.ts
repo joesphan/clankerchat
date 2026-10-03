@@ -18,6 +18,24 @@
  *       Chain-verify inject.log and print lane metrics (counts by source/
  *       target, received→consumed latency, completed events, rework rounds).
  *
+ *   node dist/botlink-server.js pair --arm [--rotate] [--port N] [--bind H]
+ *       One-tap pairing (docs/one-tap-pairing.md). Arms a single-use,
+ *       10-minute-TTL ephemeral listener on main-port+1 and prints the SAS
+ *       tap block when the peer dials. --rotate stages .next candidate keys
+ *       and authenticates the exchange with the OLD bot key.
+ *
+ *   node dist/botlink-server.js pair --dial <host>[:47422]
+ *       Dial the peer's armed pairing listener; runs the same exchange from
+ *       the initiator side, prints the SAS, saves state for --confirm.
+ *
+ *   node dist/botlink-server.js pair --confirm
+ *       The tap. LOCAL interactive TTY only — shows the peer's full
+ *       fingerprints + SAS, requires typing the peer's SAS back (transcription
+ *       check), then commits pins atomically with a journaled two-phase write.
+ *
+ *   node dist/botlink-server.js pair --status | pair --rollback
+ *       Inspect pairing state / finish-or-clean an interrupted commit.
+ *
  *   node dist/botlink-server.js serve
  *       Listen and serve the two verbs (status / inject). Config from env:
  *         CLANKER_BOTLINK_LISTEN          host:port   (default 127.0.0.1:47421)
@@ -34,11 +52,31 @@
  * stdout is reserved for keygen/fingerprint output; serve logs to stderr.
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { fingerprintOfPublicKey, generateBotKey, parseKey, renderInjectReport, startBotlinkServer } from "./botlink.js";
+import { appendInjectEvent, fingerprintOfPublicKey, generateBotKey, parseKey, renderInjectReport, startBotlinkServer } from "./botlink.js";
+import {
+  buildConfirmPlan,
+  clearPairingState,
+  deriveSas,
+  freshNonce,
+  keydirPaths,
+  loadPairingState,
+  normalizeSasInput,
+  pairDial,
+  PAIRING_TTL_MS,
+  renderTapBlock,
+  rollbackInterruptedCommit,
+  sanitizePeerText,
+  savePairingState,
+  stageAndCommit,
+  startPairingListener,
+  type PairingState,
+} from "./pairing.js";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT_DEFAULT = 47421;
@@ -76,7 +114,7 @@ function cmdServe(): void {
   const [host, portStr] = listenSpec.split(":");
   const hostKeyPath = requiredEnv("CLANKER_BOTLINK_HOST_KEY");
   const authorizedPath = requiredEnv("CLANKER_BOTLINK_AUTHORIZED_KEYS");
-  const spoolDir = process.env.CLANKER_BOTLINK_SPOOL ?? path.join(PROJECT_ROOT, "botlink-spool");
+  const spoolDir = defaultSpoolDir();
   const botName = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? os.hostname();
 
   const { close } = startBotlinkServer({
@@ -87,6 +125,10 @@ function cmdServe(): void {
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith("#")),
+    // Rotation cutover (docs/one-tap-pairing.md): with the PATH, the daemon
+    // auto-revokes a `# rotating-from` line after the first successful auth
+    // on its replacement, and sweeps stale grace lines at boot.
+    authorizedKeysPath: authorizedPath,
     username: process.env.CLANKER_BOTLINK_USER,
     spoolDir,
     botName,
@@ -111,6 +153,12 @@ function cmdServe(): void {
 function argValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
   return i >= 0 ? args[i + 1] : undefined;
+}
+
+/** Shared spool resolution so `serve` and `pair --confirm` audit into the
+ *  same hash-chained inject.log. */
+function defaultSpoolDir(): string {
+  return process.env.CLANKER_BOTLINK_SPOOL ?? path.join(PROJECT_ROOT, "botlink-spool");
 }
 
 function requiredEnv(name: string): string {
@@ -144,12 +192,254 @@ function cmdReport(dirArg?: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// pair — one-tap first pairing + rotation (docs/one-tap-pairing.md)
+// ---------------------------------------------------------------------------
+
+function readPub(file: string, what: string): string {
+  try {
+    const line = fs.readFileSync(file, "utf8").split(/\r?\n/).find((l) => l.trim() && !l.startsWith("#"));
+    if (!line) throw new Error("empty");
+    return line.trim();
+  } catch {
+    console.error(`botlink-server pair: cannot read ${what} (${file}) — run keygen first.`);
+    process.exit(1);
+  }
+}
+
+function authorizedLinesOf(p: ReturnType<typeof keydirPaths>): string[] {
+  try {
+    return fs
+      .readFileSync(p.authorizedKeys, "utf8")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+function selfValuesOf(p: ReturnType<typeof keydirPaths>, mode: "first" | "rotate", name: string) {
+  const [hostPub, botPub] =
+    mode === "rotate"
+      ? [readPub(p.hostKeyNext + ".pub", "staged host_key.next.pub"), readPub(p.botKeyNext + ".pub", "staged bot_key.next.pub")]
+      : [readPub(p.hostKey + ".pub", "host_key.pub"), readPub(p.botKey + ".pub", "bot_key.pub")];
+  return { name, hostkeyFp: fingerprintOfPublicKey(hostPub), botPub };
+}
+
+/** SAS over a completed exchange, initiator-first per the canonical
+ *  transcript — both sides derive the identical string. */
+function sasOf(s: PairingState): string | null {
+  if (s.status !== "exchanged" || !s.peer?.nonce) return null;
+  const selfSide = { ...s.self, nonce: s.nonce };
+  const peerSide = { hostkeyFp: s.peer.hostkeyFp, botPub: s.peer.botPub, nonce: s.peer.nonce };
+  return s.role === "initiator" ? deriveSas(selfSide, peerSide) : deriveSas(peerSide, selfSide);
+}
+
+async function cmdPair(args: string[]): Promise<void> {
+  const keydir = argValue(args, "--keys") ?? path.join(PROJECT_ROOT, "botlink-keys");
+  const p = keydirPaths(keydir);
+  const name =
+    process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? os.hostname();
+  const log = (line: string) => console.error(`botlink-server pair: ${line}`);
+
+  // Always finish/clean an interrupted commit before anything else.
+  if (rollbackInterruptedCommit(p)) {
+    console.error("botlink-server pair: finished an interrupted commit from the journal (see backups).");
+  }
+
+  const sub = args.find((a) => a.startsWith("--")) ?? "--status";
+
+  if (sub === "--status") {
+    const s = loadPairingState(p);
+    if (!s) return void console.log("pairing: no state (never armed, or consumed/expired).");
+    console.log(renderTapBlock(s, sasOf(s) ?? "(pending exchange)"));
+    return;
+  }
+
+  if (sub === "--rollback") {
+    console.log(
+      rollbackInterruptedCommit(p)
+        ? "pairing: interrupted commit finished/cleaned."
+        : "pairing: no interrupted commit found.",
+    );
+    return;
+  }
+
+  if (sub === "--arm") {
+    const mode = args.includes("--rotate") ? "rotate" : "first";
+    if (mode === "rotate") {
+      // Staged candidates only — active keys never move until the confirm
+      // cutover, so a failed rotation cannot strand the working lane.
+      if (!fs.existsSync(p.hostKey) || !fs.existsSync(p.botKey)) {
+        console.error("botlink-server pair: --rotate needs existing active keys (keygen first).");
+        process.exit(1);
+      }
+      const host = generateBotKey(`${name} host key next`);
+      const bot = generateBotKey(`${name} bot key next`);
+      fs.writeFileSync(p.hostKeyNext, host.privatePem + "\n", { mode: 0o600 });
+      fs.writeFileSync(p.hostKeyNext + ".pub", host.publicLine + "\n");
+      fs.writeFileSync(p.botKeyNext, bot.privatePem + "\n", { mode: 0o600 });
+      fs.writeFileSync(p.botKeyNext + ".pub", bot.publicLine + "\n");
+      for (const f of [p.hostKeyNext, p.botKeyNext]) fs.chmodSync(f, 0o600);
+    }
+    const state: PairingState = {
+      v: 1,
+      mode,
+      status: "armed",
+      armedAt: Date.now(),
+      self: selfValuesOf(p, mode, name),
+      nonce: freshNonce(),
+    };
+    savePairingState(p, state);
+    const listenSpec = process.env.CLANKER_BOTLINK_LISTEN ?? "127.0.0.1:47421";
+    const mainPort = Number(listenSpec.split(":")[1]) || 47421;
+    const bind = argValue(args, "--bind") ?? listenSpec.split(":")[0] ?? "127.0.0.1";
+    const port = Number(argValue(args, "--port")) || mainPort + 1;
+    const listener = startPairingListener({
+      bind,
+      port,
+      state,
+      paths: p,
+      authorizedLines: () => authorizedLinesOf(p),
+      onExchanged: ({ state: s, sas }) => {
+        console.error("\n" + renderTapBlock(s, sas) + "\n");
+        console.error("Exchange complete. Compare the two owners' SAS values, then run:");
+        console.error("  npm run botlink -- pair --confirm        (each owner, locally)");
+        clearTimeout(ttl);
+        setTimeout(() => process.exit(0), 250);
+      },
+      log,
+    });
+    const ttl = setTimeout(() => {
+      clearPairingState(p);
+      listener.close();
+      console.error(`botlink-server pair: TTL ${PAIRING_TTL_MS / 60000}min expired — state cleared, nothing written.`);
+      process.exit(1);
+    }, PAIRING_TTL_MS);
+    console.error(
+      `armed (${mode}) as "${name}" — single-use listener on ${bind}:${listener.port}, TTL ${PAIRING_TTL_MS / 60000}min.\n` +
+        `The PEER runs:  npm run botlink -- pair --dial <this-host>:${listener.port}\n` +
+        `Already-paired boxes: this is also how a rotation starts (--rotate).`,
+    );
+    setInterval(() => void 0, 1 << 30); // stay up like serve
+    return;
+  }
+
+  if (sub === "--dial") {
+    const target = argValue(args, "--dial") ?? "";
+    const [host, portStr] = target.split(":");
+    if (!host) {
+      console.error('botlink-server pair: --dial needs <host>[:port] (peer\'s armed pairing port, main+1).');
+      process.exit(1);
+    }
+    const mode = args.includes("--rotate") ? "rotate" : "first";
+    const state: PairingState = {
+      v: 1,
+      mode,
+      status: "armed",
+      armedAt: Date.now(),
+      self: selfValuesOf(p, mode, name),
+      nonce: freshNonce(),
+    };
+    if (mode === "rotate") {
+      if (!fs.existsSync(p.botKeyNext + ".pub")) {
+        console.error("botlink-server pair: --dial --rotate needs staged keys — run pair --arm --rotate first.");
+        process.exit(1);
+      }
+    }
+    try {
+      const { state: done, sas } = await pairDial({
+        host,
+        port: Number(portStr) || 47422,
+        state,
+        paths: p,
+        authorizedLines: () => authorizedLinesOf(p),
+        log,
+      });
+      console.error("\n" + renderTapBlock(done, sas) + "\n");
+      console.error("Exchange complete. Compare the two owners' SAS values, then run:");
+      console.error("  npm run botlink -- pair --confirm        (each owner, locally)");
+    } catch (err) {
+      console.error(`botlink-server pair: dial failed — ${(err as Error).message}`);
+      console.error("Nothing was written; arm again if the TTL lapsed.");
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (sub === "--confirm") {
+    if (!process.stdin.isTTY) {
+      // Intent-gathering, not a security boundary (see docs). Refusing
+      // non-interactive use keeps scripted/remote automation from riding
+      // this path without a human at the terminal.
+      console.error("botlink-server pair --confirm: requires an interactive terminal (TTY). Nothing done.");
+      process.exit(1);
+    }
+    const s = loadPairingState(p);
+    if (!s || s.status !== "exchanged" || !s.peer?.nonce) {
+      console.error('botlink-server pair --confirm: no completed exchange — run "--arm" + peer "--dial" (or vice versa).');
+      process.exit(1);
+    }
+    const sas = sasOf(s);
+    if (sas === null) {
+      console.error("botlink-server pair --confirm: exchange incomplete.");
+      process.exit(1);
+    }
+    const plan = buildConfirmPlan(p, s);
+    console.error("\n" + renderTapBlock(s, sas) + "\n");
+    if (plan.changes.length === 0) {
+      console.error("Nothing to change — the peer's values are already pinned. Clearing pairing state.");
+      clearPairingState(p);
+      return;
+    }
+    console.error(`This confirm will write: ${plan.changes.join(", ")} (backups kept).`);
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    const typed = await rl.question(
+      `Type the PEER's 8-character SAS exactly as shown on the PEER's screen (XXXX-XXXX), to confirm you compared both: `,
+    );
+    if (normalizeSasInput(typed) !== normalizeSasInput(sas)) {
+      rl.close();
+      console.error("SAS transcription mismatch — refusing. (If the two SCREENS differ, do NOT confirm: report a possible MITM.)");
+      process.exit(1);
+    }
+    const yes = await rl.question("Commit the pins now? [y/N] ");
+    rl.close();
+    if (!/^y(es)?$/i.test(yes.trim())) {
+      console.error("Declined — nothing written; pairing state kept until TTL expiry.");
+      return;
+    }
+    stageAndCommit(p, plan, new Date().toISOString().replace(/[:.]/g, ""));
+    clearPairingState(p); // single-use: a confirmed arm can never confirm twice
+    // Pin changes land in the same tamper-evident audit trail as injects
+    // (docs/one-tap-pairing.md). Audit-only: a failure is loud but never
+    // undoes the committed pins.
+    try {
+      await appendInjectEvent(defaultSpoolDir(), {
+        event: s.mode === "rotate" ? "rotated" : "paired",
+        id: `pair-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`,
+        source: sanitizePeerText(s.peer!.name),
+        target: "pairing",
+        detail: `hostkey ${s.peer!.hostkeyFp}, bot ${fingerprintOfPublicKey(s.peer!.botPub)}`,
+      });
+    } catch (auditErr) {
+      console.error(`pair --confirm: AUDIT APPEND FAILED: ${(auditErr as Error).message} — pins are committed, the log entry is lost`);
+    }
+    console.error(`Committed: ${plan.changes.join(", ")}. Restart botlink services to load the new pins.`);
+    return;
+  }
+
+  console.error(`botlink-server pair: unknown option "${sub}" (--arm | --dial | --confirm | --status | --rollback)`);
+  process.exit(1);
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "keygen") cmdKeygen(rest);
 else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
 else if (cmd === "report") cmdReport(rest[0]);
+else if (cmd === "pair") void cmdPair(rest);
 else if (cmd === "serve" || cmd === undefined) cmdServe();
 else {
-  console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | serve)`);
+  console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | report | pair | serve)`);
   process.exit(1);
 }
