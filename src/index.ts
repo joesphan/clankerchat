@@ -172,11 +172,16 @@ async function fetchChannelShim(channelId: string): Promise<ChatChannel> {
     messages: { fetch: (o) => fetchMessages(channelId, o) },
     threads: {
       fetchActive: async () => {
-        const r = (await api().get(`/channels/${channelId}/threads/active`)) as { threads: RThread[] };
-        return { threads: r.threads.map(toThreadShim) };
+        // Channel-level /threads/active was removed by Discord (404 for all) —
+        // the live route is guild-level; filter to this channel's threads.
+        const raw = (await api().get(Routes.channel(channelId))) as { guild_id?: string };
+        const gid = raw.guild_id;
+        if (!gid) throw new Error(`Channel ${channelId} has no guild (DM or deleted).`);
+        const r = (await api().get(`/guilds/${gid}/threads/active`)) as { threads: RThread[] };
+        return { threads: r.threads.filter((t) => t.parent_id === channelId).map(toThreadShim) };
       },
       fetchArchived: async () => {
-        const r = (await api().get(`/channels/${channelId}/threads/archived`)) as { threads: RThread[] };
+        const r = (await api().get(`/channels/${channelId}/threads/archived/public`)) as { threads: RThread[] };
         return { threads: r.threads.map(toThreadShim) };
       },
       create: async (o) =>
