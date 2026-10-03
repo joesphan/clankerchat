@@ -30,7 +30,13 @@ function startServer(extraEnv) {
       // extraEnv explicitly sets them (undefined values are omitted from
       // the child env by node's spawn).
       ...Object.fromEntries(
-        ["CLANKER_ROLE", "CLANKER_ALLOWED_THREADS", "CLANKER_FILE_ROOT"].map((k) => [k, undefined]),
+        [
+          "CLANKER_ROLE",
+          "CLANKER_ALLOWED_THREADS",
+          "CLANKER_FILE_ROOT",
+          "CLANKER_BLOCKED_IDS",
+          "CLANKER_BLOCKLIST_FILE",
+        ].map((k) => [k, undefined]),
       ),
       DISCORD_TOKEN: "guards-test-dummy-token",
       ...extraEnv,
@@ -132,6 +138,67 @@ test("send with empty ALLOWED_THREADS refuses every target", async () => {
   none.stop();
   assert.ok(r.isError);
   assert.match(r.body.error, /refusing every target/);
+});
+
+// --- blocked-ID quarantine (mode-independent, absolute) ----------------------
+
+const BLOCKED = "222222222222222222";
+
+test("quarantine: send/read/list_threads/create_thread on a blocked id fail closed, any role", async () => {
+  const q = startServer({ CLANKER_BLOCKED_IDS: BLOCKED }); // NO role set — must apply anyway
+  await ready(q);
+  for (const [tool, args] of [
+    ["send", { channel_id: BLOCKED, message: "x" }],
+    ["read", { channel_id: BLOCKED }],
+    ["list_threads", { channel_id: BLOCKED }],
+    ["create_thread", { name: "t", channel_id: BLOCKED }],
+  ]) {
+    const r = await q.call(tool, args);
+    assert.ok(r.isError, `${tool} must be an error`);
+    assert.match(r.body.error, /blocked/); // canned quarantine error, not Discord noise
+  }
+  q.stop();
+});
+
+test("quarantine: unblocked id still passes to Discord (dummy-token failure)", async () => {
+  const q = startServer({ CLANKER_BLOCKED_IDS: BLOCKED });
+  await ready(q);
+  const r = await q.call("send", { channel_id: ALLOWED, message: "x" });
+  q.stop();
+  assert.ok(r.isError);
+  assert.doesNotMatch(r.body.error, /blocked|not permitted|refusing/);
+});
+
+test("quarantine: takes precedence over the project-mode allowlist", async () => {
+  const q = startServer({
+    CLANKER_ROLE: "project",
+    CLANKER_ALLOWED_THREADS: ALLOWED,
+    CLANKER_BLOCKED_IDS: `${BLOCKED},${ALLOWED}`,
+  });
+  await ready(q);
+  const r = await q.call("send", { channel_id: ALLOWED, message: "x" });
+  q.stop();
+  assert.ok(r.isError);
+  assert.match(r.body.error, /blocked/); // quarantine error, not the allowlist's "not permitted"
+});
+
+test("quarantine: blocklist file re-reads on mtime change, no restart", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clanker-block-"));
+  const file = path.join(dir, "blocklist.txt");
+  fs.writeFileSync(file, `# comment line\n${BLOCKED}\nnot-a-snowflake\n`);
+  const q = startServer({ CLANKER_BLOCKLIST_FILE: file });
+  await ready(q);
+  const first = await q.call("send", { channel_id: BLOCKED, message: "x" });
+  assert.ok(first.isError);
+  assert.match(first.body.error, /blocked/);
+  const LATER = "444444444444444444";
+  fs.appendFileSync(file, `${LATER}\n`);
+  fs.utimesSync(file, new Date(), new Date(Date.now() + 5000)); // force a distinct mtime
+  const second = await q.call("send", { channel_id: LATER, message: "x" });
+  q.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.ok(second.isError);
+  assert.match(second.body.error, /blocked/);
 });
 
 test("attachment outside FILE_ROOT is rejected", async () => {
