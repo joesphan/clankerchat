@@ -8,3 +8,5 @@ botlink-keys/
 botlink-spool/
 .botlink.env
 .claude/settings.local.json
+.release-state
+release-watch.log
