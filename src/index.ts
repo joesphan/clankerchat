@@ -26,6 +26,14 @@
  * read lazily from the real environment (per-instance `--env` flags), not
  * .env (main() actively undoes any hardening values loadEnvFile injected),
  * so a shared checkout can serve locked and unlocked instances at once.
+ *
+ * Separately and independently of role: CLANKER_BLOCKED_IDS (comma list)
+ * and/or CLANKER_BLOCKLIST_FILE (one snowflake per line, # comments, mtime-
+ * cached re-read so the list extends without a restart) define an ABSOLUTE
+ * quarantine — those channel/thread IDs fail closed on every tool (send,
+ * read, create_thread, list_threads, and bot_inject/bot_file thread hints),
+ * taking precedence over the project-mode allowlist. Both unset = upstream
+ * behavior.
  */
 
 import {
@@ -145,6 +153,58 @@ function assertThreadAllowed(channelId: string): void {
 function assertNotProjectMode(tool: string): void {
   if (projectMode()) {
     throw new Error(`${tool} is disabled on this clankerchat instance (CLANKER_ROLE=project).`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked-ID quarantine — see header comment. Mode-independent absolute deny:
+// unlike the project-mode locks above, this applies to EVERY instance
+// (orchestrator included) and is checked before the allowlist, so a blocked
+// ID never reaches Discord through any tool. The blocklist file mirrors the
+// tag-watcher's forbiddenId(): mtime-cached, # comments, snowflakes only.
+// ---------------------------------------------------------------------------
+
+let blockedFileCache: { mtimeMs: number; ids: Set<string> } | null = null;
+
+function blockedIds(): Set<string> {
+  const ids = new Set(
+    (process.env.CLANKER_BLOCKED_IDS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  const file = process.env.CLANKER_BLOCKLIST_FILE?.trim();
+  if (file) {
+    let cached = blockedFileCache;
+    try {
+      const mtimeMs = fs.statSync(file).mtimeMs;
+      if (!cached || cached.mtimeMs !== mtimeMs) {
+        cached = {
+          mtimeMs,
+          ids: new Set(
+            fs
+              .readFileSync(file, "utf8")
+              .split("\n")
+              .map((l) => l.replace(/#.*$/, "").trim())
+              .filter((l) => /^\d{15,25}$/.test(l)),
+          ),
+        };
+        blockedFileCache = cached;
+      }
+    } catch {
+      /* unreadable/missing file → keep the last-known cache */
+    }
+    if (cached) for (const id of cached.ids) ids.add(id);
+  }
+  return ids;
+}
+
+/** Absolute quarantine: this channel/thread ID is never a valid target. */
+function assertNotBlocked(channelId: string): void {
+  if (blockedIds().has(channelId)) {
+    throw new Error(
+      `clankerchat: channel ${channelId} is blocked on this instance (CLANKER_BLOCKED_IDS / CLANKER_BLOCKLIST_FILE).`,
+    );
   }
 }
 
@@ -289,15 +349,18 @@ async function resolveTargetChannel(
   threadName: string | undefined,
 ): Promise<ChatChannel> {
   if (channelId) {
+    assertNotBlocked(channelId); // absolute quarantine, before any lock
     assertThreadAllowed(channelId); // fail fast, before any Discord fetch
     return getFetchedThreadAllowed(channelId);
   }
   if (threadName) {
     const thread = await findThreadByName(threadName);
+    assertNotBlocked(thread.id);
     assertThreadAllowed(thread.id);
     return thread;
   }
   const id = resolveChannelId(undefined, "CLANKER_THREAD_ID", "channel_id or thread_name");
+  assertNotBlocked(id);
   assertThreadAllowed(id);
   return getFetchedThreadAllowed(id);
 }
@@ -558,6 +621,7 @@ function registerTools(server: McpServer): void {
       guard(async () => {
         assertNotProjectMode("create_thread");
         const parentId = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
+        assertNotBlocked(parentId);
         const parent = await getChatChannel(parentId);
         if (parent instanceof ThreadChannel) {
           throw new Error(`${parentId} is a thread, not a text channel.`);
@@ -566,6 +630,7 @@ function registerTools(server: McpServer): void {
           (t) => t.name.toLowerCase() === name.toLowerCase(),
         );
         if (existing) {
+          assertNotBlocked(existing.id); // a quarantined thread is never "found"
           if (existing.archived) {
             try {
               await existing.setArchived(false);
@@ -649,6 +714,7 @@ function registerTools(server: McpServer): void {
       guard(async () => {
         assertNotProjectMode("list_threads");
         const id = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
+        assertNotBlocked(id);
         const channel = await getChatChannel(id);
         if (channel instanceof ThreadChannel) {
           throw new Error(
@@ -762,6 +828,9 @@ function registerTools(server: McpServer): void {
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
+        // Quarantine applies to lane traffic too: never name a blocked venue,
+        // even as a reply-thread hint for the peer.
+        if (thread) assertNotBlocked(thread);
         // Outbound exfil tripwire, lane edition: injects are the machine-to-
         // machine channel — same rule as send, secret shapes never ride it.
         const injectLeaks = findLeakSignals(text);
@@ -821,6 +890,7 @@ function registerTools(server: McpServer): void {
       guard(async () => {
         const disabled = botlinkDisabled();
         if (disabled) throw new Error(disabled);
+        if (thread) assertNotBlocked(thread); // quarantined venues, lane edition
         // Same jail as send attachments: project-mode instances can only
         // ship files from inside their own root ("none" disables entirely).
         const { attachment } = resolveAttachment(file_path);
@@ -856,7 +926,13 @@ async function main(): Promise<void> {
   // every instance on the machine — including the orchestrator. Snapshot
   // which keys the launch env actually defined, load .env, then undo any
   // hardening values the loader injected.
-  const HARDENING_KEYS = ["CLANKER_ROLE", "CLANKER_ALLOWED_THREADS", "CLANKER_FILE_ROOT"];
+  const HARDENING_KEYS = [
+    "CLANKER_ROLE",
+    "CLANKER_ALLOWED_THREADS",
+    "CLANKER_FILE_ROOT",
+    "CLANKER_BLOCKED_IDS",
+    "CLANKER_BLOCKLIST_FILE",
+  ];
   const launchDefined = new Set(
     HARDENING_KEYS.filter((k) => process.env[k] !== undefined && process.env[k] !== ""),
   );
