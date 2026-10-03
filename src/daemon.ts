@@ -400,14 +400,16 @@ function isTrigger(m: Message, botUser: User): boolean {
   return config.allowAllHumans || config.allow.includes(m.author.id);
 }
 
-/** Untagged human messages in MAPPED project threads (and the team channel
- *  root) also count — the surface itself is the address (people post asks
- *  without tagging). The router filters banter via "ignore". Bots still need
- *  a tag. threadName null = channel root. */
+/** Untagged-message triggering — OFF by owner directive 2026-10-03: only
+ *  explicitly tagged messages (bot mention or @clanker role) trigger. The
+ *  machinery stays for a future flag flip. */
+let untaggedTriggersEnabled = false;
+
 function isUntaggedThreadTrigger(m: Message, botUser: User, threadName: string | null): boolean {
+  if (!untaggedTriggersEnabled) return false;
   if (m.author.bot || m.author.id === botUser.id) return false;
   if (mentionsTarget(m, botUser)) return false; // handled by isTrigger
-  const name = threadName ?? ""; // root: no pause/mapping gate, it IS the workspace
+  const name = threadName ?? "";
   if (threadName !== null) {
     if (config.pausedThreads.some((n) => n.toLowerCase() === name.toLowerCase())) return false;
     if (mappedCwdFor(name) === null) return false; // mapped threads only
@@ -710,6 +712,7 @@ function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean): string {
       ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
       : `Work in this repo: ${cwd}`,
     `When done — or if you cannot or should not do the task — reply by calling the MCP tool mcp__clankerchat__send with sender "${name}" and ${replyTarget}. Keep the reply under 2000 chars; never paste secrets.`,
+    `Addressing rules (owner-set): only act on messages explicitly tagged for this machine — never respond to posts directed at other bots or humans. If you need something from another machine's bot, TAG it with mention markup and say you're waiting on its reply; don't passively watch threads.`,
     `Format for Discord: every command, path, snippet, or log excerpt goes in a fenced code block (triple backticks, language tag when known) or \`inline code\` — bare code gets mangled into goofy formatting by Discord markdown. HARD LIMIT: the reply is at most 30 words of prose, code blocks exempt — cut everything else, link or point at local files instead.`,
     `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
     ``,
