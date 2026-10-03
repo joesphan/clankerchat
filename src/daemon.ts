@@ -1,0 +1,1261 @@
+#!/usr/bin/env node
+/**
+ * clankerchat daemon — reply-to-prompt overseer.
+ *
+ * Model:
+ *   - Runs alongside the MCP server (same .env, same bot) and polls EVERY
+ *     thread in the team channel with the same REST `after`-cursor reads
+ *     agents use — no extra Discord permissions beyond the MessageContent
+ *     intent the MCP server also needs.
+ *   - A message becomes a prompt ONLY when ALL of these hold:
+ *       1. the author is not a bot,
+ *       2. the author's Discord user ID is listed in daemon.json `allow`,
+ *       3. the message mentions this machine's bot — a Discord *reply* to one
+ *          of the bot's messages mentions it automatically; an explicit
+ *          @mention works too.
+ *     Everything else is ignored; agents keep polling as usual.
+ *   - A triggered message goes to a ROUTING stage: a small headless session
+ *     with ListAgents/SendMessage that either wakes a matching live LOCAL
+ *     session or picks the repo a worker should run in — the daemon.json
+ *     `threads` map first, else inference over the folders under `reposRoot`.
+ *     Successful inferences are written back to daemon.json (learned). A wake
+ *     is only trusted if an answer lands in the thread within `wakeGraceMs`;
+ *     otherwise the daemon spawns a worker fallback — an answer always lands.
+ *     Set "wake": false to always spawn.
+ *   - A worker is `claude -p` with the message piped on stdin, run in the
+ *     routed repo; it answers by calling the clankerchat MCP `send` tool
+ *     itself — the daemon never parses or relays model output.
+ *   - Workers are restricted by default: default permission mode plus an
+ *     explicit allowlist of the clankerchat tools (read the repo + chat,
+ *     nothing else) unless daemon.json sets `fullAuto`. One prompt at a time
+ *     per machine; further triggers queue. Workers resume per thread
+ *     (`--resume`), so follow-up replies keep context; a failed resume falls
+ *     back to a fresh session.
+ *
+ * Run with `npm run daemon`. Diagnostics go to stdout and daemon.log.
+ */
+
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  NewsChannel,
+  TextChannel,
+  ThreadChannel,
+  type Message,
+  type User,
+} from "discord.js";
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { loadEnvFile, PROJECT_ROOT } from "./env.js";
+
+const READY_TIMEOUT_MS = 20_000;
+const DAEMON_START_MS = Date.now();
+const START_ISO = new Date().toISOString();
+/** Meta tag: a trigger starting with one of these addresses the overseer
+ *  itself (status/config/questions), never the task router. */
+const META_PREFIX_RE = /^(?:!ov\b|!overseer\b|overseer:)\s*/i;
+const FETCH_LIMIT = 50; // messages per poll per thread (Discord caps at 100)
+const MAX_QUEUE = 8; // prompts waiting while one is running
+const MAX_STDOUT = 256 * 1024; // captured from a spawned session, for logging
+const MAX_STDERR = 64 * 1024;
+const ROUTER_TIMEOUT_MS = 180_000; // routing must be quick; it is not the work
+
+const CONFIG_FILE = path.join(PROJECT_ROOT, "daemon.json");
+const STATE_FILE = path.join(PROJECT_ROOT, "daemon.state.json");
+const LOG_FILE = path.join(PROJECT_ROOT, "daemon.log");
+
+/** Workers may chat (all clankerchat tools) and read the repo — nothing else,
+ *  unless daemon.json sets fullAuto. */
+const ALLOWED_TOOLS = [
+  "mcp__clankerchat__send",
+  "mcp__clankerchat__read",
+  "mcp__clankerchat__create_thread",
+  "mcp__clankerchat__list_threads",
+  "mcp__clankerchat__list_channels",
+];
+
+// ---------------------------------------------------------------------------
+// Config + state
+// ---------------------------------------------------------------------------
+
+interface DaemonConfig {
+  /** Discord user IDs allowed to trigger prompts. */
+  allow: string[];
+  /** Any human in the team channel may trigger (the private channel is the
+   *  perimeter — same posture as peers that run no human allowlist). Bots
+   *  stay gated by botAllow regardless. */
+  allowAllHumans: boolean;
+  /** Let other machines' bots trigger too (agent-to-agent addressing). Our
+   *  own bot never triggers itself. */
+  allowBots: boolean;
+  /** Explicit bot user IDs allowed to trigger. Empty = every bot (only safe
+   *  when every bot in the channel is trusted; a compromised peer bot with
+   *  this open can drive fullAuto workers on this machine). */
+  botAllow: string[];
+  /** Role IDs that trigger like a bot mention; a role NAMED "clanker"
+   *  always triggers regardless of this list. */
+  triggerRoles: string[];
+  /** Poll interval for the thread sweep, ms. */
+  pollMs: number;
+  /** Kill a worker after this long, ms. */
+  timeoutMs: number;
+  /** Max workers running at once. Same thread never runs concurrently. */
+  maxConcurrent: number;
+  /** Spawn with --dangerously-skip-permissions instead of restricted mode. */
+  fullAuto: boolean;
+  /** Post a short ack into the thread when a prompt is dispatched. */
+  ack: boolean;
+  /** Try to wake a matching live local session before spawning a worker.
+   *  The receiving session may ask its human to approve the wake message. */
+  wake: boolean;
+  /** How long a woken session has to answer in-thread before the daemon
+   *  spawns a worker fallback, ms. */
+  wakeGraceMs: number;
+  /** Folder holding this machine's repos — the inference search space. */
+  reposRoot: string;
+  /** Neutral cwd for tasks routing can't place (no mapping, session match,
+   *  or repo match). Unset → unplaceable tasks are refused, as before. */
+  sandbox: string | null;
+  /** Thread name (project slug) -> repo path. A HINT map: unmapped threads
+   *  are routed by inference, and successful inferences land here. */
+  threads: Record<string, string>;
+  /** Thread names whose triggers are refused outright — circuit breaker for
+   *  work that crashes the machine (e.g. unsafe driver stacks). */
+  pausedThreads: string[];
+}
+
+interface DaemonState {
+  /** thread id -> last processed message id */
+  cursors: Record<string, string>;
+  /** thread name -> claude session id for --resume continuity */
+  sessions: Record<string, string>;
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function fatal(message: string): never {
+  console.error(`clankerchat-daemon: ${message}`);
+  process.exit(1);
+}
+
+function log(line: string): void {
+  const stamped = `${new Date().toISOString()} ${line}`;
+  console.log(stamped);
+  try {
+    fs.appendFileSync(LOG_FILE, stamped + "\n");
+  } catch {
+    // logging is best-effort; never let it kill the daemon
+  }
+}
+
+/** One log line per event — result excerpts must not splinter across lines
+ *  (splinters would false-positive error greps). */
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function loadConfig(): DaemonConfig {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(CONFIG_FILE, "utf8");
+  } catch {
+    fatal(
+      `daemon.json not found at ${CONFIG_FILE} — copy daemon.example.json to daemon.json and edit it (see SETUP.md Step 11).`,
+    );
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch (err) {
+    fatal(`daemon.json is not valid JSON: ${errText(err)}`);
+  }
+  const allow = (parsed.allow ?? []) as unknown[];
+  const allowAllHumans = parsed.allowAllHumans === true;
+  if (
+    !Array.isArray(allow) ||
+    !allow.every((id) => typeof id === "string" && /^\d+$/.test(id)) ||
+    (allow.length === 0 && !allowAllHumans)
+  ) {
+    fatal(
+      'daemon.json needs an "allow" array of Discord user IDs (digits only) with at least one entry — or "allowAllHumans": true to let any human in the team channel trigger.',
+    );
+  }
+  const threads = (parsed.threads ?? {}) as Record<string, unknown>;
+  if (
+    typeof threads !== "object" ||
+    threads === null ||
+    Array.isArray(threads) ||
+    !Object.values(threads).every((p) => typeof p === "string" && p.length > 0)
+  ) {
+    fatal(
+      'daemon.json "threads" must map thread name -> repo path, e.g. {"clankerchat": "C:\\\\repo\\\\clankerchat"} (may be empty {}).',
+    );
+  }
+  return {
+    allow: allow as string[],
+    allowAllHumans,
+    allowBots: parsed.allowBots === true,
+    botAllow: Array.isArray(parsed.botAllow)
+      ? (parsed.botAllow as unknown[]).filter(
+          (id): id is string => typeof id === "string" && /^\d+$/.test(id),
+        )
+      : [],
+    triggerRoles: Array.isArray(parsed.triggerRoles)
+      ? (parsed.triggerRoles as unknown[]).filter(
+          (id): id is string => typeof id === "string" && /^\d+$/.test(id),
+        )
+      : [],
+    pollMs: Math.max(1000, typeof parsed.pollMs === "number" ? parsed.pollMs : 5000),
+    timeoutMs:
+      typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : 15 * 60_000,
+    maxConcurrent: Math.min(
+      8,
+      Math.max(1, typeof parsed.maxConcurrent === "number" ? parsed.maxConcurrent : 3),
+    ),
+    fullAuto: parsed.fullAuto === true,
+    ack: parsed.ack !== false,
+    wake: parsed.wake !== false,
+    wakeGraceMs:
+      typeof parsed.wakeGraceMs === "number" ? Math.max(60_000, parsed.wakeGraceMs) : 4 * 60_000,
+    reposRoot:
+      typeof parsed.reposRoot === "string"
+        ? path.resolve(parsed.reposRoot)
+        : path.dirname(PROJECT_ROOT), // repo sits in the repos folder by default
+    sandbox:
+      typeof parsed.sandbox === "string" && fs.existsSync(parsed.sandbox)
+        ? path.resolve(parsed.sandbox)
+        : null,
+    threads: threads as Record<string, string>,
+    pausedThreads: Array.isArray(parsed.pausedThreads)
+      ? (parsed.pausedThreads as unknown[]).filter(
+          (n): n is string => typeof n === "string" && n.length > 0,
+        )
+      : [],
+  };
+}
+
+function loadState(): DaemonState {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) as DaemonState;
+    return {
+      cursors: parsed.cursors ?? {},
+      sessions: parsed.sessions ?? {},
+    };
+  } catch {
+    return { cursors: {}, sessions: {} };
+  }
+}
+
+function saveState(): void {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    log(`could not save state: ${errText(err)}`);
+  }
+}
+
+let config!: DaemonConfig;
+let state: DaemonState = { cursors: {}, sessions: {} };
+
+// ---------------------------------------------------------------------------
+// Discord client — same pattern as index.ts: gateway connects with the
+// Guilds + MessageContent intents (MessageContent is required to read other
+// participants' messages — see the note in index.ts), REST below.
+// ---------------------------------------------------------------------------
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.MessageContent] });
+
+let resolveReady!: (c: Client<true>) => void;
+const ready = new Promise<Client<true>>((res) => {
+  resolveReady = res;
+});
+
+client.once(Events.ClientReady, (c) => {
+  console.error(`clankerchat-daemon: connected as ${c.user.username} (${c.user.id})`);
+  resolveReady(c);
+});
+
+client.on(Events.Error, (err) => {
+  log(`discord client error: ${err.message}`);
+});
+
+function startDiscord(token: string): void {
+  client.login(token).catch((err) => {
+    fatal(`Discord login failed: ${errText(err)}. Check DISCORD_TOKEN in .env (SETUP.md Step 2).`);
+  });
+}
+
+async function awaitReady(): Promise<Client<true>> {
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(
+      () => reject(new Error(`Discord connection not ready after ${READY_TIMEOUT_MS / 1000}s.`)),
+      READY_TIMEOUT_MS,
+    ).unref();
+  });
+  return Promise.race([ready, timeout]);
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers (kept local — same shape as index.ts)
+// ---------------------------------------------------------------------------
+
+function withSender(sender: string | undefined, message: string): string {
+  if (!sender) return message;
+  const clean = sender.replace(/[*_`~|\\\n\r]/g, "").trim();
+  return clean ? `**${clean}**: ${message}` : message;
+}
+
+function byIdAscending(a: { id: string }, b: { id: string }): number {
+  const cmp = BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0;
+  return cmp;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Typing indicator — Discord's lasts ~10s, so re-trigger every 8s while work
+// runs. Refcounted per thread (router + worker on the same thread stack).
+// ---------------------------------------------------------------------------
+
+const typing = new Map<string, { timer: NodeJS.Timeout; refs: number }>();
+
+async function typingTick(threadId: string): Promise<void> {
+  try {
+    const channel = await client.channels.fetch(threadId, { cache: false });
+    if (channel instanceof ThreadChannel) await channel.sendTyping();
+  } catch {
+    // thread gone/unreachable — stop() clears us; nothing to log per tick
+  }
+}
+
+function startTyping(threadId: string): () => void {
+  const existing = typing.get(threadId);
+  if (existing) {
+    existing.refs++;
+    return () => stopTypingRef(threadId);
+  }
+  void typingTick(threadId);
+  const timer = setInterval(() => void typingTick(threadId), 8_000);
+  typing.set(threadId, { timer, refs: 1 });
+  return () => stopTypingRef(threadId);
+}
+
+function stopTypingRef(threadId: string): void {
+  const t = typing.get(threadId);
+  if (!t) return;
+  if (--t.refs > 0) return;
+  clearInterval(t.timer);
+  typing.delete(threadId);
+}
+
+/** Message ids the daemon itself posted (acks, notices). A wake counts as
+ *  answered only when a SESSION replies — never the daemon's own messages. */
+const daemonMessageIds = new Set<string>();
+
+async function sendToThread(threadId: string, message: string): Promise<string | null> {
+  try {
+    const channel = await client.channels.fetch(threadId, { cache: false });
+    if (channel instanceof ThreadChannel) {
+      if (channel.archived) await channel.setArchived(false).catch(() => {});
+    } else if (!(channel instanceof TextChannel)) {
+      return null;
+    }
+    const sent = await channel.send(withSender(process.env.CLANKER_NAME, message));
+    daemonMessageIds.add(sent.id);
+    return sent.id;
+  } catch (err) {
+    log(`ack send failed in ${threadId}: ${errText(err)}`);
+    return null;
+  }
+}
+
+/** A message triggers a prompt iff it mentions the bot AND the author counts:
+ *  humans must be allowlisted; other bots count when allowBots is on. Our own
+ *  bot never triggers itself (self-loop). */
+/** True when the message mentions our bot user or a triggering role
+ *  (@clanker by name, or any ID in triggerRoles). */
+function mentionsTarget(m: Message, botUser: User): boolean {
+  if (m.mentions.has(botUser)) return true;
+  return [...m.mentions.roles.values()].some(
+    (r) => r.name.toLowerCase() === "clanker" || config.triggerRoles.includes(r.id),
+  );
+}
+
+function isTrigger(m: Message, botUser: User): boolean {
+  if (m.author.id === botUser.id) return false;
+  if (!mentionsTarget(m, botUser)) return false;
+  const channelName = m.channel && "name" in m.channel ? String(m.channel.name) : "";
+  if (config.pausedThreads.some((n) => n.toLowerCase() === channelName.toLowerCase())) {
+    return false; // circuit-breaked thread: triggers refused until unpaused
+  }
+
+  if (m.author.bot) {
+    return config.allowBots && (config.botAllow.length === 0 || config.botAllow.includes(m.author.id));
+  }
+  return config.allowAllHumans || config.allow.includes(m.author.id);
+}
+
+/** Untagged-message triggering — OFF by owner directive 2026-10-03: only
+ *  explicitly tagged messages (bot mention or @clanker role) trigger. The
+ *  machinery stays for a future flag flip. */
+let untaggedTriggersEnabled = false;
+
+function isUntaggedThreadTrigger(m: Message, botUser: User, threadName: string | null): boolean {
+  if (!untaggedTriggersEnabled) return false;
+  if (m.author.bot || m.author.id === botUser.id) return false;
+  if (mentionsTarget(m, botUser)) return false; // handled by isTrigger
+  const name = threadName ?? "";
+  if (threadName !== null) {
+    if (config.pausedThreads.some((n) => n.toLowerCase() === name.toLowerCase())) return false;
+    if (mappedCwdFor(name) === null) return false; // mapped threads only
+  }
+  return config.allowAllHumans || config.allow.includes(m.author.id);
+}
+
+/** Drops the bot/role mention(s) so the remainder is the actual prompt text. */
+function stripMention(content: string, botId: string): string {
+  return content
+    .replace(new RegExp(`<@!?${botId}>\\s*`, "g"), "")
+    .replace(/<@&\d+>\s*/g, "")
+    .trim();
+}
+
+/** Returns the meta payload if the prompt is tagged for the overseer itself. */
+function splitMeta(prompt: string): string | null {
+  const m = META_PREFIX_RE.exec(prompt);
+  return m ? prompt.slice(m[0].length).trim() : null;
+}
+
+function mappedCwdFor(threadName: string): string | null {
+  const hit = Object.entries(config.threads).find(
+    ([n]) => n.toLowerCase() === threadName.toLowerCase(),
+  );
+  return hit ? hit[1] : null;
+}
+
+function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => void }): void {
+  if (process.platform === "win32" && child.pid) {
+    // shell:true spawns cmd.exe, so the real claude process is a child — kill the tree.
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+  } else {
+    child.kill("SIGKILL");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Headless claude plumbing — one spawn helper for router and workers
+// ---------------------------------------------------------------------------
+
+interface ClaudeRun {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+async function runClaude(
+  args: string[],
+  cwd: string,
+  stdinText: string,
+  timeoutMs: number,
+): Promise<ClaudeRun> {
+  return new Promise((resolve) => {
+    const child = spawn("claude", args, { cwd, shell: true });
+    currentChild = child;
+    children.add(child);
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    child.stdout?.on("data", (d: Buffer) => {
+      if (stdout.length < MAX_STDOUT) stdout += d.toString();
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      if (stderr.length < MAX_STDERR) stderr += d.toString();
+    });
+    child.on("error", (err) => {
+      log(`spawn error: ${errText(err)} — is claude on PATH for this daemon?`);
+    });
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timedOut);
+      clearTimeout(hardFail);
+      if (currentChild === child) currentChild = null;
+      children.delete(child);
+      resolve({ code, stdout, stderr });
+    };
+    const timedOut = setTimeout(() => {
+      log(`claude run in ${cwd} exceeded ${timeoutMs}ms — killing it`);
+      killTree(child);
+    }, timeoutMs);
+    // Safety net: if close never fires (observed once — shell:true trees can
+    // outlive taskkill), resolve anyway so the serial queue can never jam.
+    const hardFail = setTimeout(() => {
+      log(`claude run in ${cwd} never closed after kill — abandoning it (queue unblocked)`);
+      finish(null);
+    }, timeoutMs + 30_000);
+    try {
+      child.stdin?.write(stdinText + "\n");
+      child.stdin?.end();
+    } catch {
+      // claude died before accepting stdin — the close handler reports it
+    }
+    child.on("close", (code) => finish(code));
+  });
+}
+
+/** Parses `claude -p --output-format json` output. */
+function parseSessionResult(stdout: string): { sessionId?: string; result: string } {
+  const trimmed = stdout.trim();
+  try {
+    const parsed = JSON.parse(trimmed) as { session_id?: string; result?: string };
+    return { sessionId: parsed.session_id, result: parsed.result ?? "" };
+  } catch {
+    const m = /"session_id"\s*:\s*"([0-9a-f-]+)"/.exec(trimmed);
+    return { sessionId: m?.[1], result: "" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routing stage — wake a live local session, or infer the repo for a worker
+// ---------------------------------------------------------------------------
+
+interface Job {
+  threadName: string; // canonical name from Discord ("(channel root)" for root posts)
+  threadId: string;
+  rootChannel?: boolean; // trigger landed in the channel root, not a thread
+  cwd: string | null; // repo path from daemon.json, if the thread is mapped
+  prompt: string; // mention-stripped message text
+  from: string; // Discord username of the triggering human
+  fromId: string; // Discord user/bot id of the asker — replies tag this
+  fromBot: boolean; // triggered by a peer bot rather than an allowlisted human
+  untagged?: boolean; // no mention — human posted in a mapped thread
+  triggerId: string; // id of the Discord message that triggered this job
+  skipWake?: boolean; // fallback run: route cwd only, never wake
+}
+
+interface RouteDecision {
+  woke: string | null; // name of the live session that was messaged
+  cwd: string | null; // inferred repo for a worker
+  confidence: "high" | "low"; // high = the task itself names the project
+  ignore?: boolean; // untagged message wasn't for us — drop silently
+  reason: string;
+}
+
+function repoFolderNames(reposRoot: string): string[] {
+  try {
+    return fs
+      .readdirSync(reposRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
+  const name = process.env.CLANKER_NAME ?? "clankerchat";
+  const repoNames = repoFolderNames(config.reposRoot);
+  return [
+    `You are the routing stage of the ${name} overseer on this machine. Route ONE incoming question; be decisive and fast — do NOT do the task yourself.`,
+    ``,
+    `Question (Discord user ${job.from}) in thread "${job.threadName}":`,
+    `"""`,
+    job.prompt,
+    `"""`,
+    ``,
+    `Known thread→repo map: ${JSON.stringify(config.threads)}`,
+    mappedCwd ? `This thread is mapped to: ${mappedCwd}` : `This thread is NOT mapped.`,
+    `Repo folders under ${config.reposRoot}: ${repoNames.join(", ") || "(none found)"}`,
+    ``,
+    `Steps:`,
+    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , max 30 words of prose (code blocks exempt), commands/paths in fenced code, then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.${job.rootChannel ? " (This job is a CHANNEL-ROOT post — do NOT wake; go straight to step 2 and reply woke=null.)" : ""}`,
+    `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
+    ``,
+    job.untagged
+      ? `This message was NOT tagged — the human just posted it in a project thread. If it is not an ask directed at this machine's agents (banter, acks like "ok"/"rebooted", humans talking to each other, FYIs), set "ignore": true and nothing else happens.`
+      : ``,
+    `Reply with ONLY one line of JSON, no prose:`,
+    `{"woke": <session name or null>, "cwd": <absolute path or null>, "confidence": "high"|"low", "ignore": <true|false, untagged only>, "reason": "<=10 words"}`,
+  ].join("\n");
+}
+
+async function runRouter(job: Job, mappedCwd: string | null): Promise<RouteDecision | null> {
+  const args = [
+    "-p",
+    "--output-format",
+    "json",
+    "--allowed-tools",
+    "ListAgents",
+    "SendMessage",
+    "--permission-mode",
+    "default",
+  ];
+  const run = await runClaude(args, config.reposRoot, buildRouterPrompt(job, mappedCwd), ROUTER_TIMEOUT_MS);
+  if (run.code !== 0) {
+    log(`router failed (exit ${run.code}): ${run.stderr.slice(0, 200)}`);
+    return null;
+  }
+  const { result } = parseSessionResult(run.stdout);
+  const m = /\{[\s\S]*\}/.exec(result); // the decision is one JSON line; tolerate prose around it
+  if (!m) {
+    log(`router returned no decision: ${result.slice(0, 200)}`);
+    return null;
+  }
+  try {
+    const d = JSON.parse(m[0]) as Partial<RouteDecision>;
+    return {
+      woke: typeof d.woke === "string" && d.woke ? d.woke : null,
+      cwd:
+        typeof d.cwd === "string" && d.cwd && fs.existsSync(d.cwd)
+          ? path.resolve(d.cwd)
+          : null,
+      confidence: d.confidence === "high" ? "high" : "low",
+      ignore: d.ignore === true,
+      reason: typeof d.reason === "string" ? d.reason : "",
+    };
+  } catch {
+    log(`router decision unparseable: ${result.slice(0, 200)}`);
+    return null;
+  }
+}
+
+/** Persist an inferred thread→repo mapping so the next trigger is instant. */
+function rememberMapping(threadName: string, cwd: string): void {
+  if (config.threads[threadName] === cwd) return;
+  config.threads[threadName] = cwd;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) as Record<string, unknown>;
+    parsed.threads = config.threads;
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2) + "\n");
+    log(`learned mapping: "${threadName}" -> ${cwd}`);
+  } catch (err) {
+    log(`could not persist learned mapping: ${errText(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch — route, then spawn the worker; the worker answers via MCP send
+// ---------------------------------------------------------------------------
+
+const queue: Job[] = [];
+let running = false; // true while any dispatch is in flight (status output only)
+const isRunning = () => activeJobs.length > 0;
+/** Jobs currently dispatched (concurrent). One per thread max; diverse cwds preferred. */
+const activeJobs: Job[] = [];
+let currentChild: ReturnType<typeof spawn> | null = null; // last spawned (signals kill all via children set)
+const children = new Set<ReturnType<typeof spawn>>();
+/** B5: unique canary per dispatched run; any appearing in our own posts = leak. */
+const activeCanaries = new Set<string>();
+
+// ---------------------------------------------------------------------------
+// Wake watchdog — a routed wake only counts if an answer lands in the thread
+// ---------------------------------------------------------------------------
+
+interface FollowUp {
+  job: Job;
+  ackId: string; // ack (or trigger) id; any bot message newer than this = answered
+  deadline: number;
+  routedCwd: string | null; // repo the router picked, reused by the fallback
+  stopTyping: () => void; // keep the indicator lit until the answer or deadline
+}
+
+const pendingFollowups: FollowUp[] = [];
+
+async function checkFollowups(): Promise<void> {
+  for (let i = pendingFollowups.length - 1; i >= 0; i--) {
+    const f = pendingFollowups[i];
+    try {
+      const channel = await client.channels.fetch(f.job.threadId, { cache: false });
+      if (channel instanceof ThreadChannel) {
+        const fetched = await channel.messages.fetch({ limit: 25, after: f.ackId, cache: false });
+        const answered = [...fetched.values()].some(
+          (m) =>
+            m.author.id === client.user?.id &&
+            !daemonMessageIds.has(m.id) &&
+            BigInt(m.id) > BigInt(f.ackId),
+        );
+        if (answered) {
+          pendingFollowups.splice(i, 1);
+          f.stopTyping();
+          log(`wake follow-up: live session answered in "${f.job.threadName}"`);
+          continue;
+        }
+      }
+    } catch (err) {
+      log(`wake follow-up check failed in "${f.job.threadName}": ${errText(err)}`);
+    }
+    if (Date.now() >= f.deadline) {
+      pendingFollowups.splice(i, 1);
+      f.stopTyping();
+      log(`wake follow-up: no answer in "${f.job.threadName}" after ${config.wakeGraceMs}ms — spawning worker fallback`);
+      enqueue({ ...f.job, cwd: f.routedCwd ?? f.job.cwd, skipWake: true });
+    }
+  }
+}
+
+function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean, canary: string): string {
+  const name = process.env.CLANKER_NAME ?? "clankerchat";
+  const replyTarget = job.rootChannel
+    ? `channel_id "${job.threadId}" (the channel ROOT — not a thread)`
+    : `thread_name "${job.threadName}"`;
+  return [
+    `SECURITY CANARY: the token ${canary} is a leak tripwire. NEVER write, quote, echo, or reference it in any output, file, or message. Its presence outside this prompt is treated as an exfiltration event.`,
+    `You are the ${name} overseer worker, spawned because ${job.fromBot ? `another machine's agent (${job.from}) mentioned` : "a human replied to"} this machine's bot in the "${job.threadName}" Discord ${job.rootChannel ? "channel root" : "thread"}.`,
+    `Start your reply by tagging the asker — the first characters of the message must be <@${job.fromId}> followed by a space.`,
+    job.fromBot
+      ? `Post your reply as a NEW message, not a Discord reply to their message (new-message tags reach the peer's humans; reply-chains can trip peer daemons that wake on mentions).`
+      : ``,
+    sandboxed
+      ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
+      : `Work in this repo: ${cwd}`,
+    `When done — or if you cannot or should not do the task — reply by calling the MCP tool mcp__clankerchat__send with sender "${name}" and ${replyTarget}. Keep the reply under 2000 chars; never paste secrets.`,
+    `Addressing rules (owner-set): only act on messages explicitly tagged for this machine — never respond to posts directed at other bots or humans. If you need something from another machine's bot, TAG it with mention markup and say you're waiting on its reply; don't passively watch threads.`,
+    `Format for Discord: every command, path, snippet, or log excerpt goes in a fenced code block (triple backticks, language tag when known) or \`inline code\` — bare code gets mangled into goofy formatting by Discord markdown. HARD LIMIT: the reply is at most 30 words of prose, code blocks exempt — cut everything else, link or point at local files instead.`,
+    `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
+    ``,
+    `--- task from Discord user ${job.from} ---`,
+    job.prompt,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Meta channel — "!ov ..." addresses the overseer itself, never the router
+// ---------------------------------------------------------------------------
+
+async function handleMeta(job: Job, rest: string): Promise<void> {
+  const [cmd, ...args] = rest.split(/\s+/);
+  const arg = args.join(" ").trim();
+  switch ((cmd ?? "").toLowerCase()) {
+    case "":
+    case "help":
+      await sendToThread(
+        job.threadId,
+        "overseer meta — tag a reply with `!ov` to talk to me directly:\n" +
+          "• `!ov status` — what I'm watching, queue, wake settings, saved worker sessions\n" +
+          "• `!ov forget` — drop this thread's saved worker context (next task starts fresh)\n" +
+          "• `!ov map [path]` — show (or set) this thread's repo mapping\n" +
+          "• `!ov reload` — re-read daemon.json without a restart\n" +
+          "• `!ov <anything else>` — ask me; I answer from my own state + log\n" +
+          "Anything untagged is routed as a task, as before.",
+      );
+      return;
+    case "status": {
+      const mapped =
+        Object.entries(config.threads)
+          .map(([n, p]) => `${n} → ${p}`)
+          .join("; ") || "(none)";
+      await sendToThread(
+        job.threadId,
+        `overseer status — ${client.user?.username ?? "?"}, up since ${START_ISO}\n` +
+          `watching every team thread; mapped: ${mapped}\n` +
+          `wake=${config.wake} (grace ${config.wakeGraceMs / 1000}s), fullAuto=${config.fullAuto}, poll=${config.pollMs}ms, reposRoot=${config.reposRoot}\n` +
+          `queue=${queue.length}, busy=${activeJobs.length}/${config.maxConcurrent}, wake-checks pending=${pendingFollowups.length}\n` +
+          `worker sessions: ${Object.entries(state.sessions).map(([n, id]) => `${n}: ${id.slice(0, 8)}`).join(", ") || "(none yet)"}`,
+      );
+      return;
+    }
+    case "forget":
+      delete state.sessions[job.threadName];
+      saveState();
+      await sendToThread(
+        job.threadId,
+        `overseer: dropped the saved worker context for "${job.threadName}" — the next task in this thread starts fresh.`,
+      );
+      return;
+    case "map": {
+      if (!arg) {
+        await sendToThread(
+          job.threadId,
+          `overseer: "${job.threadName}" → ${mappedCwdFor(job.threadName) ?? "(unmapped — inference decides)"}`,
+        );
+        return;
+      }
+      const abs = path.resolve(arg);
+      if (!fs.existsSync(abs)) {
+        await sendToThread(job.threadId, `overseer: \`${abs}\` does not exist — mapping unchanged.`);
+        return;
+      }
+      rememberMapping(job.threadName, abs);
+      await sendToThread(job.threadId, `overseer: mapped "${job.threadName}" → ${abs}`);
+      return;
+    }
+    case "reload":
+      try {
+        config = loadConfig();
+        await sendToThread(
+          job.threadId,
+          `overseer: reloaded daemon.json — mapped=[${Object.keys(config.threads).join(", ")}], wake=${config.wake}, grace=${config.wakeGraceMs / 1000}s`,
+        );
+      } catch (err) {
+        await sendToThread(job.threadId, `overseer: reload refused — ${errText(err)} (config unchanged).`);
+      }
+      return;
+    default:
+      await metaSession(job, rest);
+      return;
+  }
+}
+
+/** Free-form meta question → a small session that IS the overseer, answering
+ *  from its own config, queue state, and recent daemon.log. */
+async function metaSession(job: Job, question: string): Promise<void> {
+  await sendToThread(job.threadId, "overseer meta: on it — answering from my own state.");
+  let logTail = "";
+  try {
+    logTail = fs.readFileSync(LOG_FILE, "utf8").split(/\r?\n/).slice(-60).join("\n");
+  } catch {
+    // no log yet — fine
+  }
+  const { allow: _allow, ...configSansIds } = config;
+  const facts = [
+    `config: ${JSON.stringify(configSansIds)}`,
+    `queue=${queue.length}, busy=${activeJobs.length}/${config.maxConcurrent}, wake-checks pending=${pendingFollowups.length}`,
+    `worker sessions: ${JSON.stringify(state.sessions)}`,
+    `recent daemon.log tail:\n${logTail}`,
+  ].join("\n");
+  const name = process.env.CLANKER_NAME ?? "clankerchat";
+  const prompt = [
+    `You ARE the overseer itself on machine ${name} — the daemon behind clankerchat's reply-to-prompt system (repo: ${PROJECT_ROOT}). A human tagged you directly with a meta question about you/your machinery. This is NOT a project task — do not route it, do not work on any repo; answer about yourself. Answer ONLY from the facts provided below — do not explore the filesystem, repos, or processes; if the facts don't cover it, say so plainly.`,
+    ``,
+    facts,
+    ``,
+    `--- meta question from ${job.from} ---`,
+    question,
+    ``,
+    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", starting with the tag <@${job.fromId}> then "overseer meta:". Never paste secrets. Format for Discord: commands/paths/snippets in fenced or inline code blocks — bare code gets mangled by Discord markdown. HARD LIMIT: 30 words of prose max, code blocks exempt.`,
+  ].join("\n");
+  const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS, "--permission-mode", "default"];
+  const stopTyping = startTyping(job.threadId);
+  const run = await runClaude(args, PROJECT_ROOT, prompt, config.timeoutMs);
+  stopTyping();
+  const { result } = parseSessionResult(run.stdout);
+  log(
+    `meta done: exit ${run.code}${result ? ` — ${oneLine(result).slice(0, 200)}` : run.stderr ? ` — stderr: ${oneLine(run.stderr).slice(0, 200)}` : ""}`,
+  );
+  if (run.code !== 0) {
+    await sendToThread(job.threadId, `overseer meta: session exited ${run.code} before replying — see daemon.log.`);
+  }
+}
+
+async function dispatch(job: Job): Promise<void> {
+  running = isRunning();
+  log(`dispatch: "${job.threadName}" (prompt from ${job.from}) [${activeJobs.length}/${config.maxConcurrent}]`);
+  let stopTyping: (() => void) | null = null;
+  try {
+    const metaRest = splitMeta(job.prompt);
+    if (metaRest !== null) {
+      // B7 (spec law): meta commands are human-only. A bot-authored "!ov …"
+      // can steer routing (!ov map), drain contexts (!ov forget) and read
+      // state (!ov status) — never executable on a peer bot's say-so.
+      if (job.fromBot) {
+        log(`meta refused: bot-authored "!ov" from ${job.from} — meta is human-only`);
+        return;
+      }
+      log(`meta: ${metaRest.slice(0, 80)}`);
+      await handleMeta(job, metaRest);
+      return;
+    }
+
+    // "Thinking…" in the thread from routing until the answer lands.
+    stopTyping = startTyping(job.threadId);
+    const ackId = config.ack
+      ? await sendToThread(
+          job.threadId,
+          "overseer: prompt received — routing it; the answer lands in this thread.",
+        )
+      : null;
+
+    // Route: wake a live local session if one fits, else decide the worker's repo.
+    let cwd = job.cwd;
+    let woke: string | null = null;
+    let routeConfidence: "high" | "low" = "high"; // explicit mapping is always trusted
+    if (!job.skipWake && (!cwd || config.wake || job.untagged)) {
+      const decision = await runRouter(job, cwd);
+      if (decision?.ignore) {
+        log(`router: ignored untagged message in "${job.threadName}" (${decision.reason})`);
+        return; // banter/ack — not for us, no worker, no reply
+      }
+      if (decision) {
+        woke = decision.woke;
+        if (!cwd && decision.cwd) cwd = decision.cwd;
+        routeConfidence = decision.confidence;
+        log(`router: woke=${woke ?? "-"} cwd=${cwd ?? "-"} conf=${routeConfidence} (${decision.reason})`);
+      }
+    }
+
+    if (woke) {
+      pendingFollowups.push({
+        job,
+        ackId: ackId ?? job.triggerId,
+        deadline: Date.now() + config.wakeGraceMs,
+        routedCwd: cwd,
+        stopTyping: stopTyping ?? (() => {}),
+      });
+      stopTyping = null; // ownership moves to the follow-up (lit until answer/deadline)
+      log(`done: "${job.threadName}" routed to live session "${woke}" (watchdog ${config.wakeGraceMs / 1000}s)`);
+      return; // the watchdog spawns a worker if no answer lands in time
+    }
+    let sandboxed = false;
+    if (!cwd) {
+      // Unplaceable (no mapping, session match, or repo match): run in the
+      // sandbox rather than refusing — but never learn a sandbox "mapping".
+      if (config.sandbox) {
+        cwd = config.sandbox;
+        sandboxed = true;
+        log(`routing could not place "${job.threadName}" — worker runs in sandbox ${cwd}`);
+      } else {
+        await sendToThread(
+          job.threadId,
+          "overseer: could not tell which repo this thread is about, and no sandbox is configured — add it to daemon.json (SETUP.md Step 11) and reply again.",
+        );
+        return;
+      }
+    }
+    if (!fs.existsSync(cwd)) {
+      log(`routed path does not exist: ${cwd} (thread "${job.threadName}")`);
+      await sendToThread(
+        job.threadId,
+        `overseer: this thread routes to \`${cwd}\`, which does not exist on this machine — fix daemon.json (SETUP.md Step 11).`,
+      );
+      return;
+    }
+    if (!job.cwd && !sandboxed && routeConfidence === "high") rememberMapping(job.threadName, cwd);
+
+    const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS];
+    if (config.fullAuto) {
+      args.push("--dangerously-skip-permissions");
+    } else {
+      args.push("--permission-mode", "default");
+    }
+    const sessionId = state.sessions[job.threadName];
+    if (sessionId) args.push("--resume", sessionId);
+
+    const canary = `cnry-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+    activeCanaries.add(canary);
+    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd, sandboxed, canary), config.timeoutMs);
+    activeCanaries.delete(canary);
+    const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
+    if (sessionIdOut) {
+      state.sessions[job.threadName] = sessionIdOut;
+      saveState();
+    }
+    log(
+      `done: "${job.threadName}" exit ${run.code}${result ? ` — ${oneLine(result).slice(0, 200)}` : run.stderr ? ` — stderr: ${oneLine(run.stderr).slice(0, 200)}` : ""}`,
+    );
+
+    if (run.code !== 0) {
+      // Most often a stale --resume id; drop it so the next trigger starts fresh.
+      delete state.sessions[job.threadName];
+      saveState();
+      await sendToThread(
+        job.threadId,
+        `overseer: the worker session exited with code ${run.code} before replying — see daemon.log on this machine. (Session context dropped; next reply starts fresh.)`,
+      );
+    }
+  } finally {
+    stopTyping?.();
+    running = isRunning();
+  }
+}
+
+function enqueue(job: Job): void {
+  if (queue.length >= MAX_QUEUE) {
+    log(`queue full — dropping prompt from ${job.from} in "${job.threadName}"`);
+    return;
+  }
+  // Coalesce rapid re-sends from the same author in the same thread: the
+  // newer prompt supersedes the still-queued older one (the 02:09
+  // double-dispatch class — double-send inside one poll window).
+  const dupIdx = queue.findIndex(
+    (q) => q.fromId === job.fromId && q.threadName === job.threadName,
+  );
+  if (dupIdx >= 0) {
+    const old = queue.splice(dupIdx, 1)[0];
+    log(`coalesced: "${job.threadName}" from ${job.from} — trigger ${job.triggerId} supersedes queued ${old.triggerId}`);
+  }
+  queue.push(job);
+  log(`queued: "${job.threadName}" from ${job.from} (queue=${queue.length})`);
+}
+
+function drain(): void {
+  while (queue.length > 0 && activeJobs.length < config.maxConcurrent) {
+    // Only hard rule: one job per thread at a time (resume-state safety).
+    // Same-repo parallel workers are allowed — threads map to shared repos
+    // (shim/echo-dot/fire-tv → shim-xcompile) and serializing them starved
+    // threads behind whichever job happened to start first.
+    const conflicts = (j: Job) => activeJobs.some((a) => a.threadName === j.threadName);
+    let idx = queue.findIndex((j) => !conflicts(j));
+    if (idx < 0 && activeJobs.length === 0) idx = 0; // idle: head of queue always runs
+    if (idx < 0) break; // only same-thread jobs left and concurrency budget spent
+    const job = queue.splice(idx, 1)[0];
+    activeJobs.push(job);
+    void dispatch(job).finally(() => {
+      const i = activeJobs.indexOf(job);
+      if (i >= 0) activeJobs.splice(i, 1);
+      drain();
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Poll loop — same REST reads the agents use, over EVERY thread
+// ---------------------------------------------------------------------------
+
+async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promise<void> {
+  const [active, archived] = await Promise.all([
+    parent.threads.fetchActive(),
+    parent.threads.fetchArchived(),
+  ]);
+  const threads = [...active.threads.values(), ...archived.threads.values()];
+
+  for (const thread of threads) {
+    const mapped = mappedCwdFor(thread.name);
+
+    const latest = thread.lastMessageId;
+    let cursor = state.cursors[thread.id];
+    if (cursor === undefined) {
+      // First sight. Threads created AFTER this daemon started replay from
+      // the beginning (their opening tagged message is live traffic, not
+      // backlog — a new thread's first tag was once swallowed this way).
+      // Pre-existing threads skip backlog; empty threads seed "0".
+      const isNewThread = (thread.createdAt?.getTime() ?? 0) > DAEMON_START_MS;
+      state.cursors[thread.id] = isNewThread || !latest ? "0" : latest;
+      saveState();
+      continue;
+    }
+    if (!latest || BigInt(cursor) >= BigInt(latest)) continue;
+
+    const fetched = await thread.messages.fetch({
+      limit: FETCH_LIMIT,
+      after: cursor,
+      cache: false,
+    });
+    const messages = [...fetched.values()].sort(byIdAscending);
+    for (const m of messages) {
+      cursor = m.id;
+      const tagged = isTrigger(m, botUser);
+      const untagged = !tagged && isUntaggedThreadTrigger(m, botUser, thread.name);
+      if (!tagged && !untagged) {
+        // Circuit-broken thread: refuse LOUDLY — silence reads as death.
+        if (
+          mentionsTarget(m, botUser) &&
+          config.pausedThreads.some((n) => n.toLowerCase() === thread.name.toLowerCase()) &&
+          !m.author.bot
+        ) {
+          await sendToThread(
+            thread.id,
+            `circuit breaker: this thread is paused (machine-safety). Triggers refused until unpaused.`,
+          );
+        }
+        continue;
+      }
+      const prompt = stripMention(m.content, botUser.id);
+      if (!prompt) {
+        log(`skip: trigger from ${m.author.username} in "${thread.name}" had no text`);
+        continue;
+      }
+      enqueue({
+        threadName: thread.name,
+        threadId: thread.id,
+        cwd: mapped,
+        prompt,
+        from: m.author.username,
+        fromId: m.author.id,
+        fromBot: m.author.bot,
+        untagged: !tagged,
+        triggerId: m.id,
+      });
+    }
+    if (messages.length > 0) {
+      state.cursors[thread.id] = cursor;
+      saveState();
+    }
+  }
+
+  // Channel ROOT sweep — the parent channel is watched like a thread of its
+  // own, so tags landing outside any thread still trigger (replies land in
+  // the root). Same cursor, first-sight-skip, and trigger rules as threads.
+  let rootCursor = state.cursors[parent.id];
+  const rootLatest = parent.lastMessageId;
+  if (rootCursor === undefined || (rootCursor === "0" && rootLatest)) {
+    // The root always has history — never replay it; a "0" cursor would crawl
+    // 50 messages per poll while live tags pile up behind ancient messages.
+    state.cursors[parent.id] = rootLatest ?? "0";
+    saveState();
+  }
+  if (rootLatest && BigInt(state.cursors[parent.id] ?? "0") < BigInt(rootLatest)) {
+    rootCursor = state.cursors[parent.id] ?? "0"; // re-sync after any jump
+    const fetched = await parent.messages.fetch({ limit: FETCH_LIMIT, after: rootCursor, cache: false });
+    const rootMessages = [...fetched.values()].sort(byIdAscending);
+    for (const m of rootMessages) {
+      rootCursor = m.id;
+      const tagged = isTrigger(m, botUser);
+      const untagged = !tagged && isUntaggedThreadTrigger(m, botUser, null);
+      if (!tagged && !untagged) continue;
+      const prompt = stripMention(m.content, botUser.id);
+      if (!prompt) {
+        log(`skip: root trigger from ${m.author.username} had no text`);
+        continue;
+      }
+      enqueue({
+        threadName: "(channel root)",
+        threadId: parent.id,
+        rootChannel: true,
+        cwd: null,
+        prompt,
+        from: m.author.username,
+        fromId: m.author.id,
+        fromBot: m.author.bot,
+        untagged: !tagged,
+        triggerId: m.id,
+      });
+    }
+    if (rootMessages.length > 0) {
+      state.cursors[parent.id] = rootCursor;
+      saveState();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+// Freeze watchdog: a stalled event loop (observed once — 13 min of silence,
+// triggers queued minutes late) is worse than dead. If a poll cycle doesn't
+// complete within 2 minutes, exit so the revive path (health loop / logon
+// task) brings the daemon back instead of it sitting frozen.
+let lastPollAt = Date.now();
+setInterval(() => {
+  if (Date.now() - lastPollAt > 120_000) {
+    log(`FREEZE WATCHDOG: no completed poll for ${Math.round((Date.now() - lastPollAt) / 1000)}s — exiting for revival`);
+    process.exit(1);
+  }
+}, 60_000).unref();
+
+async function main(): Promise<void> {
+  loadEnvFile();
+  config = loadConfig();
+  state = loadState();
+
+  const token = process.env.DISCORD_TOKEN;
+  if (!token) fatal("DISCORD_TOKEN is not set in .env (SETUP.md Step 4).");
+  const channelId = process.env.CLANKER_CHANNEL_ID;
+  if (!channelId) fatal("CLANKER_CHANNEL_ID is not set in .env (SETUP.md Step 6).");
+
+  startDiscord(token);
+  const me = await awaitReady();
+  const parent = await client.channels.fetch(channelId, { cache: false });
+  if (!(parent instanceof TextChannel) && !(parent instanceof NewsChannel)) {
+    fatal(`CLANKER_CHANNEL_ID ${channelId} is not a text channel.`);
+  }
+
+  log(
+    `overseer: watching every thread in the team channel as ${me.user.username}; ` +
+      `mapped=[${Object.keys(config.threads).join(", ")}]; reposRoot=${config.reposRoot}; ` +
+      `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; EVENT-DRIVEN (gateway)`,
+  );
+
+  // CLANKER SPEC A1: one REST catch-up at boot, then the gateway is the only
+  // trigger source — no idle polling, no cursor crawls, no swallowed history.
+  try {
+    await pollOnce(parent, me.user);
+  } catch (err) {
+    log(`catch-up error: ${errText(err)}`);
+  }
+
+  client.on(Events.MessageCreate, (m) => {
+    void handleLiveMessage(m, parent, me.user).catch((err) =>
+      log(`gateway handler error: ${errText(err)}`),
+    );
+  });
+
+  // CLANKER SPEC A3/A5 heartbeat: follow-ups + queue drain + watchdog feed.
+  for (;;) {
+    lastPollAt = Date.now();
+    try {
+      await checkFollowups();
+    } catch (err) {
+      log(`follow-up error: ${errText(err)}`);
+    }
+    try {
+      void drain();
+    } catch (err) {
+      log(`dispatch error: ${errText(err)}`);
+    }
+    await sleep(30_000);
+  }
+}
+
+/** Gateway path: a live message in the parent channel or any of its threads.
+ *  Webhooks never trigger (B6); own posts are canary-scanned (B5), not run. */
+async function handleLiveMessage(m: Message, parent: TextChannel | NewsChannel, botUser: User): Promise<void> {
+  lastPollAt = Date.now();
+  if (m.webhookId) return; // B6: webhook spoof class never triggers
+  if (m.author.id === botUser.id) {
+    // B5 tripwire: our own posts must never contain an active canary.
+    const leaked = [...activeCanaries].find((c) => m.content.includes(c));
+    if (leaked) {
+      log(`LEAK TRIPWIRE: canary ${leaked.slice(0, 8)}… appeared in our own post ${m.id}`);
+      await sendToThread(m.channelId, "LEAK TRIPWIRE: an outbound post contained a run canary — investigate immediately.");
+    }
+    return;
+  }
+  const inRoot = m.channelId === parent.id;
+  let threadName: string | null = null;
+  let threadId = parent.id;
+  if (!inRoot) {
+    const ch = m.channel;
+    if (!(ch instanceof ThreadChannel) || ch.parentId !== parent.id) return;
+    threadName = ch.name;
+    threadId = ch.id;
+  }
+  const tagged = isTrigger(m, botUser);
+  if (!tagged) {
+    if (inRoot) return;
+    if (!isUntaggedThreadTrigger(m, botUser, threadName)) return;
+  }
+  const prompt = stripMention(m.content, botUser.id);
+  if (!prompt) return;
+  enqueue({
+    threadName: threadName ?? "(channel root)",
+    threadId,
+    rootChannel: inRoot,
+    cwd: threadName ? mappedCwdFor(threadName) : null,
+    prompt,
+    from: m.author.username,
+    fromId: m.author.id,
+    fromBot: m.author.bot,
+    untagged: !tagged,
+    triggerId: m.id,
+  });
+  // Advance the cursor so a restart's catch-up doesn't replay this message.
+  state.cursors[threadId] = m.id;
+  saveState();
+}
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    log("shutting down");
+    if (currentChild) killTree(currentChild);
+    for (const c of children) killTree(c);
+    void client.destroy();
+    process.exit(0);
+  });
+}
+
+process.on("unhandledRejection", (reason) => {
+  log(`unhandled rejection: ${errText(reason)}`);
+});
+
+main().catch((err) => {
+  fatal(errText(err));
+});

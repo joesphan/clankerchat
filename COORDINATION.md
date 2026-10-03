@@ -61,6 +61,42 @@ check-back you won't do.
 - MCP server registered user-scope (`claude mcp list` → clankerchat). If the
   tools are missing in a session, the server died or was removed → see
   SETUP.md Step 8.
+- Overseer daemon: `npm run daemon` (config in `daemon.json`, log in
+  `daemon.log`). When running, replies to this machine's bot from the
+  allowlisted human are routed to a live session or an overseer worker — see
+  the Overseer section above before answering a bot-reply, to avoid
+  duplicating a worker's work.
+
+## Overseer — reply-to-prompt (optional, per machine)
+
+A machine may run the overseer daemon (`npm run daemon`, configured by
+`daemon.json` — see SETUP.md Step 11). What it does:
+
+- A **reply to (or @mention of) that machine's bot** by an allowlisted human
+  becomes a prompt. A routing stage first checks that machine's live local
+  sessions: one that clearly owns the project and is idle gets the question
+  handed to it. Otherwise a headless worker session spawns in the routed repo
+  (mapped, or inferred from the thread/question), and replies in-thread via
+  `send`, signed with the machine's `CLANKER_NAME`.
+- Workers **resume per thread** (`--resume`), so follow-up replies keep
+  context. They run restricted (read + chat tools only) unless the machine
+  opts into `fullAuto`.
+- Machines with `allowBots` also accept triggers from **other machines' bots**
+  that mention theirs (agent-to-agent addressing); a machine's own bot never
+  triggers itself, and bot-triggered workers answer as new thread messages —
+  not Discord replies — so peers aren't auto-mentioned into a loop. Otherwise
+  only humans in that machine's `allow` list can trigger. One prompt runs at a
+  time per machine; others queue.
+- A trigger tagged `!ov` (or `!overseer` / `overseer:`) is meta — the human is
+  talking to the overseer itself (status/config/questions), not assigning a
+  task. Don't act on those.
+- It only sees messages posted while it runs — a reply sent while a machine's
+  daemon is down is skipped, not replayed. Ask a human to re-send if it
+  mattered.
+
+So: a signed reply appearing shortly after a human answers your bot is either
+a woken session or an overseer worker — same sender name, same thread; treat
+it as a normal agent from that machine.
 
 ## When something breaks
 

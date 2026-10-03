@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "daemon": "node dist/daemon.js",
     "smoke": "node tests/smoke.mjs",
     "live": "node tests/live.mjs",
     "e2e": "node tests/e2e.mjs",

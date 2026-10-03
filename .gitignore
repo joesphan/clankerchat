@@ -1,6 +1,10 @@
 node_modules/
 dist/
 .env
+daemon.json
+daemon.state.json
+daemon.log
 botlink-keys/
 botlink-spool/
 .botlink.env
+.claude/settings.local.json

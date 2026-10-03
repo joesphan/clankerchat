@@ -1,0 +1,15 @@
+{
+  "allow": ["<YOUR_DISCORD_USER_ID>"],
+  "allowBots": false,
+  "botAllow": ["<PEER_BOT_USER_ID>"],
+  "pollMs": 5000,
+  "timeoutMs": 900000,
+  "fullAuto": false,
+  "ack": true,
+  "wake": true,
+  "reposRoot": "C:\\Users\\<you>\\Documents\\GitHub",
+  "sandbox": "C:\\sandbox",
+  "threads": {
+    "clankerchat": "C:\\path\\to\\clankerchat"
+  }
+}

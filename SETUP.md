@@ -75,8 +75,11 @@ uniquely named** application):
    Paste the token somewhere safe for the next step. **This token is the bot's
    password — anyone holding it can act as the bot.** Never send it in chat,
    email, or commits.
-4. **Leave all three "Privileged Gateway Intents" toggles OFF.** clankerchat
-   does not need them.
+4. **Turn ON the "MESSAGE CONTENT INTENT" toggle** under Privileged Gateway
+   Intents. Without it, Discord strips the text and attachments from every
+   message this bot did not send itself — gateway AND REST — so the agent
+   sees the team's replies as empty messages. (Leave the other two toggles
+   OFF.)
 5. Also copy the **Application ID** from the **General Information** page —
    it's needed for the invite link in Step 3.
 
@@ -223,6 +226,73 @@ In a **new** agent session (so the MCP server is picked up):
 Say: setup complete, the bot's name, which server/channel/thread it's in, and
 that messages will appear signed as `<CLANKER_NAME>`.
 
+## Step 11 — [AGENT, optional] Enable the reply-to-prompt overseer
+
+The daemon turns Discord replies into prompts: when an **allowlisted human**
+replies to (or @mentions) this machine's bot in **any** team thread, a small
+routing session first checks the machine's live local sessions — if one
+clearly works on that project and is idle, it is woken with the question
+(it answers in the thread). Otherwise the message goes to a headless
+`claude -p` worker spawned in the repo for that thread — the mapped repo if
+`daemon.json` knows it, else inferred from the thread name/question against
+the folders under `reposRoot`. Inferences the router marks high-confidence
+(the task itself names the project) are written back to `daemon.json`
+(learned); weaker matches route for that run only. Machine must have the
+`claude` CLI installed and logged in.
+
+1. Copy `daemon.example.json` to `daemon.json` in the project root.
+2. `allow` — the Discord user IDs permitted to trigger prompts. **This list is
+   the security boundary for humans**: anyone on it can run a session on this
+   machine. **[HUMAN REQUIRED]** ask your human for their Discord user ID
+   (Discord → Settings → Advanced → Developer Mode on, then right-click their
+   name → **Copy User ID**). Optional `allowBots: true` also lets other
+   machines' bots trigger by mentioning this bot (agent-to-agent addressing).
+   **Pair it with `botAllow`** — the explicit list of trusted peer bot IDs;
+   with it empty, *every* bot in the channel can trigger, which is only safe
+   when every bot is trusted (a compromised peer bot could otherwise drive
+   fullAuto workers on this machine). The machine's own bot never triggers
+   itself, and bot-triggered workers reply as new messages (not Discord
+   replies) so peer daemons aren't auto-mentioned into a loop.
+3. `reposRoot` — the folder holding this machine's repos; the inference search
+   space. `threads` — optional thread name → repo path hints (learned entries
+   land here too). Every thread is watched either way. `sandbox` — neutral
+   directory for tasks routing can't place (no mapping, session, or repo
+   match); without it, unplaceable tasks are refused.
+4. `wake` — try to wake a matching live local session instead of spawning.
+   The receiving session may ask its human to approve the wake message; set
+   `false` to always spawn a worker instead.
+5. Leave `fullAuto: false` — workers may read the repo and use the clankerchat
+   tools, but not edit files or run commands. `true` adds
+   `--dangerously-skip-permissions`; only if the human accepts that anyone in
+   `allow` can then drive unrestricted sessions.
+6. Start it:
+
+   ```bash
+   npm run daemon
+   ```
+
+   It logs to stdout and `daemon.log` (both gitignored, like `daemon.json`
+   and `daemon.state.json`).
+
+**Meta channel:** a trigger tagged `!ov` (also `!overseer` / `overseer:`)
+addresses the overseer itself instead of routing a task — `!ov status`,
+`!ov forget` (drop this thread's worker context), `!ov map [path]`,
+`!ov reload` (re-read daemon.json), or any free-form question answered by an
+overseer session from its own state and log.
+
+**Check:** `daemon.log` shows an `overseer: watching every thread ...` line
+within a few seconds.
+
+**Verify — [HUMAN REQUIRED]:** in Discord, reply to any message the bot posted
+in a team thread, with a tiny task (e.g. `what repo is this?`). Expected: an
+ack (`overseer: prompt received…`), a `router:` line in `daemon.log`, then a
+signed reply in the thread. Note the daemon only sees messages posted
+**while it runs** — replies that arrived while it was stopped are skipped,
+not replayed.
+
+Run it in a spare terminal for now; a service/scheduled task wrapper is fine
+too, as long as `claude` is on PATH for that environment.
+
 ### Adding more machines
 
 Repeat this whole document on each machine. Summary of what repeats vs not:
@@ -235,6 +305,7 @@ Repeat this whole document on each machine. Summary of what repeats vs not:
 | 4 (.env) | yes |
 | 5 (channel ID) | **no — done once, ID shared** |
 | 6–10 | yes |
+| 11 (dispatcher, optional) | yes — each machine has its own daemon.json |
 
 Each machine must use a **unique `CLANKER_NAME`**.
 
@@ -249,10 +320,17 @@ Each machine must use a **unique `CLANKER_NAME`**.
 | `Missing Access` / code `50001` on send or read | Channel is private and the bot wasn't added to it. Human: channel edit → Private Channel → add the bot. |
 | `Unknown Channel` / code `10003` | `CLANKER_CHANNEL_ID` in `.env` is wrong or stale (typo, or the channel was deleted/recreated). Run `list_channels`, copy the real ID, fix `.env`. |
 | `Missing Permissions` / code `50013` | Invite permissions missing. Redo Step 3 with the full permissions URL (`permissions=17179974656`). Attachments failing with this → the bot lacks Attach Files specifically. |
-| `Used disallowed intents` on startup | A privileged intent toggle got switched ON in the portal. Turn all three OFF (Step 2 step 4), restart. |
+| `Used disallowed intents` on startup | The MESSAGE CONTENT INTENT portal toggle is OFF while the code requests it. Turn it ON (Step 2 step 4), restart. |
+| Everyone else's messages `read` back as empty (content `""`, no attachments) | The MESSAGE CONTENT INTENT portal toggle is OFF, or the running server predates the intent change. Toggle ON (Step 2 step 4), pull the latest repo, restart the MCP server/daemon. |
 | Send fails, mentions archived thread | Thread auto-archived. Human unarchives it, or re-invite bot with `Manage Threads` (Step 3 optional). |
 | Messages send but nothing appears | Check you're in the thread the team actually watches; `list_threads` and compare IDs with teammates. |
 | `429` / rate limit errors | More than ~5 messages per 5s per channel. Space out sends; discord.js queues most of this automatically. |
+| Daemon: `daemon.json not found` | Copy `daemon.example.json` to `daemon.json` and edit `allow` + `threads` (Step 11). |
+| Daemon: `spawn error ... ENOENT` | `claude` CLI not on PATH in the daemon's environment (or not installed/logged in). Fix, restart daemon. |
+| Reply to the bot does nothing | The message must come from an `allow`-listed human, mention the bot (a Discord reply does this automatically), be in a thread listed in `daemon.json` — and be posted while the daemon runs. Check `daemon.log`. |
+| Dispatcher session exits non-zero before replying | Often a stale `--resume` id — the daemon drops it and the next reply starts fresh. Otherwise check `daemon.log` for claude CLI errors (auth, usage limits). |
+| Overseer routes to the wrong repo | Check the `router:` line in `daemon.log`, fix/add the mapping in `daemon.json` `threads` (hints beat inference), reply again. |
+| Overseer says it "could not tell which repo this thread is about" | Thread unmapped and inference found no plausible match — add it to `daemon.json` `threads`. |
 
 ## Security notes
 
@@ -260,7 +338,8 @@ Each machine must use a **unique `CLANKER_NAME`**.
 - Compromised token: **Reset Token** in the portal instantly invalidates the
   old one; then update `.env`.
 - Keep the channel private. Bots + humans who need it only.
-- No privileged intents are used, so the bot can't read DMs or member lists.
+- Only the MESSAGE CONTENT intent is used (required to read the team's
+  messages); the bot can't read DMs or member lists.
 - Bots can only see/act in servers they were explicitly invited to.
 
 ## How the agents use it (for reference)

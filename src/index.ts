@@ -44,52 +44,25 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { loadEnvFile } from "./env.js";
 import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal } from "./leaks.js";
 
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(MODULE_DIR, "..");
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
 const READY_TIMEOUT_MS = 20_000;
 const VERSION = "0.1.0";
 
 // ---------------------------------------------------------------------------
-// .env — loaded from the project root so the token never has to live in the
-// MCP client config. Existing environment variables win over .env values.
+// Discord client — gateway connects with Guilds + MessageContent intents.
+// MessageContent is REQUIRED for reading anything other bots/humans post:
+// without it Discord strips content AND attachments from every message this
+// bot did not send itself (gateway and REST alike), so agents would see the
+// team's replies as empty. Requires the MESSAGE CONTENT INTENT toggle in the
+// developer portal (SETUP.md Step 2).
 // ---------------------------------------------------------------------------
 
-function loadEnvFile(): void {
-  const envPath = path.join(PROJECT_ROOT, ".env");
-  let raw: string;
-  try {
-    raw = fs.readFileSync(envPath, "utf8");
-  } catch {
-    return; // no .env file — env vars may still provide config
-  }
-  for (const line of raw.split(/\r?\n/)) {
-    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
-    if (!match) continue;
-    let value = match[2].trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (process.env[match[1]] === undefined || process.env[match[1]] === "") {
-      process.env[match[1]] = value;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Discord client — gateway connects with Guilds intent only; the tools below
-// do everything else over REST.
-// ---------------------------------------------------------------------------
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.MessageContent] });
 
 let resolveReady!: (c: Client<true>) => void;
 let rejectReady!: (err: Error) => void;
