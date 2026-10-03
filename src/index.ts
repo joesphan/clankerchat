@@ -28,17 +28,7 @@
  * so a shared checkout can serve locked and unlocked instances at once.
  */
 
-import {
-  Client,
-  ChannelType,
-  Events,
-  GatewayIntentBits,
-  NewsChannel,
-  TextChannel,
-  ThreadAutoArchiveDuration,
-  ThreadChannel,
-  type Message,
-} from "discord.js";
+import { REST, Routes, ChannelType } from "discord.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -50,64 +40,165 @@ import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.j
 import { findLeakSignals, leakRefusal } from "./leaks.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
-const READY_TIMEOUT_MS = 20_000;
 const VERSION = "0.1.0";
 
 // ---------------------------------------------------------------------------
-// Discord client — gateway connects with Guilds + MessageContent intents.
-// MessageContent is REQUIRED for reading anything other bots/humans post:
-// without it Discord strips content AND attachments from every message this
-// bot did not send itself (gateway and REST alike), so agents would see the
-// team's replies as empty. Requires the MESSAGE CONTENT INTENT toggle in the
-// developer portal (SETUP.md Step 2).
+// Discord access — REST ONLY, no gateway session (CLANKER SPEC A1): the
+// daemon holds the machine's single gateway connection. Every MCP instance
+// that logged a gateway session with the same token EVICTED the daemon's
+// session, silently killing its triggers. Reading message text still needs
+// the MESSAGE CONTENT INTENT portal toggle (SETUP.md Step 2) — REST honors
+// it too.
 // ---------------------------------------------------------------------------
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.MessageContent] });
+const rest = new REST({ version: "10" });
+let restTokenSet = false;
 
-let resolveReady!: (c: Client<true>) => void;
-let rejectReady!: (err: Error) => void;
-const ready = new Promise<Client<true>>((res, rej) => {
-  resolveReady = res;
-  rejectReady = rej;
-});
+function api(): REST {
+  if (!restTokenSet) {
+    const token = process.env.DISCORD_TOKEN;
+    if (!token) throw new Error("DISCORD_TOKEN is not set in .env (SETUP.md Step 2).");
+    rest.setToken(token);
+    restTokenSet = true;
+  }
+  return rest;
+}
 
-client.once(Events.ClientReady, (c) => {
-  console.error(`clankerchat: connected as ${c.user.username} (${c.user.id})`);
-  resolveReady(c);
-});
+// Raw REST payloads, only the fields the tools use.
+interface RAttachment { id?: string; filename?: string; name?: string; url?: string }
+interface RMessage {
+  id: string;
+  timestamp: string;
+  content: string;
+  author: { username: string; id: string; bot?: boolean };
+  attachments?: RAttachment[] | Map<string, RAttachment>;
+}
+interface RThread {
+  id: string;
+  name: string;
+  type: number;
+  parent_id?: string;
+  thread_metadata?: { archived: boolean; auto_archive_duration?: number };
+  archived?: boolean;
+  last_message_id?: string | null;
+}
 
-client.on(Events.Error, (err) => {
-  console.error(`clankerchat: discord client error: ${err.message}`);
-});
+function errTextOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
-async function startDiscord(token: string): Promise<void> {
+async function sendMessage(
+  channelId: string,
+  payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } },
+): Promise<{ id: string }> {
+  const body = typeof payload === "string" ? { content: payload } : { content: payload.content };
+  const files = typeof payload === "string" || !payload.files
+    ? undefined
+    : payload.files.map((f) => ({ data: fs.readFileSync(f.attachment), name: f.name }));
+  const ref = typeof payload === "string" || !payload.reply ? undefined : { message_id: payload.reply.messageReference };
   try {
-    await client.login(token);
+    return (await api().post(Routes.channelMessages(channelId), {
+      body: { ...body, message_reference: ref, allowed_mentions: ref ? { replied_user: false } : undefined },
+      files,
+    })) as { id: string };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`clankerchat: Discord login failed: ${message}`);
-    rejectReady(
-      new Error(
-        `Discord login failed: ${message}. Check DISCORD_TOKEN in .env (see SETUP.md).`,
-      ),
-    );
+    // failIfNotExists parity: a deleted reply target degrades to a plain send.
+    if (ref && /10008|Unknown Message/i.test(errTextOf(err))) {
+      return (await api().post(Routes.channelMessages(channelId), { body, files })) as { id: string };
+    }
+    throw err;
   }
 }
 
-async function awaitReady(): Promise<Client<true>> {
-  const timeout = new Promise<never>((_, reject) => {
-    setTimeout(
-      () =>
-        reject(
-          new Error(
-            `Discord connection not ready after ${READY_TIMEOUT_MS / 1000}s (still connecting or login failed — check stderr).`,
-          ),
-        ),
-      READY_TIMEOUT_MS,
-    ).unref();
-  });
-  return Promise.race([ready, timeout]);
+async function fetchMessages(channelId: string, o: { limit: number; after?: string }): Promise<RMessage[]> {
+  // API returns newest-first; callers sort ascending.
+  return (await api().get(Routes.channelMessages(channelId), {
+    query: new URLSearchParams({ limit: String(o.limit), ...(o.after ? { after: o.after } : {}) }),
+  })) as RMessage[];
 }
+
+function toThreadShim(raw: RThread): ThreadShim {
+  return {
+    ...raw,
+    kind: "thread",
+    archived: raw.thread_metadata?.archived ?? raw.archived ?? false,
+    autoArchiveDuration: raw.thread_metadata?.auto_archive_duration,
+    parentId: raw.parent_id,
+    lastMessageId: raw.last_message_id,
+    setArchived: (v: boolean) => api().patch(Routes.channel(raw.id), { body: { archived: v } }) as unknown as Promise<void>,
+    send: (payload) => sendMessage(raw.id, payload),
+    messages: { fetch: (o) => fetchMessages(raw.id, o) },
+  };
+}
+
+/** Minimal channel/thread interfaces the tool bodies rely on (shims for the
+ *  old discord.js class instances — instanceof checks became kind checks). */
+interface ThreadShim extends RThread {
+  kind: "thread";
+  parentId?: string;
+  autoArchiveDuration?: number;
+  archived: boolean;
+  lastMessageId?: string | null;
+  setArchived(v: boolean): Promise<void>;
+  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } }): Promise<{ id: string }>;
+  messages: { fetch(o: { limit: number; after?: string }): Promise<RMessage[]> };
+}
+type ChatChannel = ThreadShim | ({
+  kind: "channel";
+  id: string;
+  name?: string;
+  type: number;
+  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } }): Promise<{ id: string }>;
+  messages: { fetch(o: { limit: number; after?: string }): Promise<RMessage[]> };
+  threads: {
+    fetchActive(): Promise<{ threads: ThreadShim[] }>;
+    fetchArchived(): Promise<{ threads: ThreadShim[] }>;
+    create(o: { name: string; autoArchiveDuration?: number }): Promise<ThreadShim>;
+  };
+});
+
+const THREAD_TYPES = [ChannelType.GuildPublicThread, ChannelType.GuildPrivateThread];
+const isThread = (c: ChatChannel): c is ThreadShim => c.kind === "thread";
+
+async function fetchChannelShim(channelId: string): Promise<ChatChannel> {
+  const raw = (await api().get(Routes.channel(channelId))) as RThread & { position?: number };
+  if (THREAD_TYPES.includes(raw.type as ChannelType)) return toThreadShim(raw);
+  const ch: ChatChannel = {
+    kind: "channel",
+    id: raw.id,
+    name: raw.name,
+    type: raw.type,
+    send: (payload) => sendMessage(channelId, payload),
+    messages: { fetch: (o) => fetchMessages(channelId, o) },
+    threads: {
+      fetchActive: async () => {
+        const r = (await api().get(`/channels/${channelId}/threads/active`)) as { threads: RThread[] };
+        return { threads: r.threads.map(toThreadShim) };
+      },
+      fetchArchived: async () => {
+        const r = (await api().get(`/channels/${channelId}/threads/archived`)) as { threads: RThread[] };
+        return { threads: r.threads.map(toThreadShim) };
+      },
+      create: async (o) =>
+        toThreadShim(
+          (await api().post(`/channels/${channelId}/threads`, {
+            body: {
+              name: o.name,
+              auto_archive_duration: o.autoArchiveDuration ?? 10080, // 7 days, the longest offered
+              type: ChannelType.GuildPublicThread,
+            },
+          })) as RThread,
+        ),
+    },
+  };
+  return ch;
+}
+
+/** REST replacement for the old ClientReady identity lookup. */
+async function getBotMe(): Promise<{ username: string; id: string }> {
+  return (await api().get(Routes.user())) as { username: string; id: string };
+}
+
 
 // ---------------------------------------------------------------------------
 // Hardening locks — see header comment. Env is read lazily so per-instance
@@ -185,8 +276,6 @@ function resolveAttachment(file_path: string): { attachment: string; name: strin
 // Helpers
 // ---------------------------------------------------------------------------
 
-type ChatChannel = TextChannel | ThreadChannel | NewsChannel;
-
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -208,18 +297,11 @@ async function guard(body: () => Promise<unknown>): Promise<CallToolResult> {
 }
 
 async function getChatChannel(channelId: string): Promise<ChatChannel> {
-  await awaitReady();
-  const channel = await client.channels.fetch(channelId);
-  if (
-    channel instanceof TextChannel ||
-    channel instanceof ThreadChannel ||
-    channel instanceof NewsChannel
-  ) {
-    return channel;
+  try {
+    return await fetchChannelShim(channelId);
+  } catch (err) {
+    throw new Error(`Channel ${channelId} not accessible: ${errTextOf(err)}.`);
   }
-  throw new Error(
-    `Channel ${channelId} is not a text channel or thread${channel ? ` (type: ${channel.type})` : " (not found or no access)"}.`,
-  );
 }
 
 /**
@@ -243,7 +325,7 @@ function resolveChannelId(
 
 /** Lists active + archived threads of a text channel (archived included so
  *  auto-archived project threads stay addressable). */
-async function allThreads(channel: Exclude<ChatChannel, ThreadChannel>) {
+async function allThreads(channel: Exclude<ChatChannel, ThreadShim>) {
   const [active, archived] = await Promise.all([
     channel.threads.fetchActive(),
     channel.threads.fetchArchived(),
@@ -253,7 +335,7 @@ async function allThreads(channel: Exclude<ChatChannel, ThreadChannel>) {
 
 /** Finds a project thread by name in the .env channel — the human-friendly
  *  handle for the one-thread-per-project convention. */
-async function findThreadByName(name: string): Promise<ThreadChannel> {
+async function findThreadByName(name: string): Promise<ThreadShim> {
   const channelId = process.env.CLANKER_CHANNEL_ID;
   if (!channelId) {
     throw new Error(
@@ -261,7 +343,7 @@ async function findThreadByName(name: string): Promise<ThreadChannel> {
     );
   }
   const parent = await getChatChannel(channelId);
-  if (parent instanceof ThreadChannel) {
+  if (isThread(parent)) {
     throw new Error(`CLANKER_CHANNEL_ID ${channelId} is a thread, not a text channel.`);
   }
   const wanted = name.toLowerCase().replace(/^#/, "").trim();
@@ -310,7 +392,7 @@ async function resolveTargetChannel(
  */
 async function getFetchedThreadAllowed(channelId: string): Promise<ChatChannel> {
   const channel = await getChatChannel(channelId);
-  if (projectMode() && !(channel instanceof ThreadChannel)) {
+  if (projectMode() && !isThread(channel)) {
     throw new Error(
       `clankerchat project mode permits threads only, but ${channelId} resolved to a ` +
         `non-thread channel (${ChannelType[channel.type] ?? String(channel.type)}) — refusing. ` +
@@ -329,17 +411,17 @@ function withSender(sender: string | undefined, message: string): string {
   return clean ? `**${clean}**: ${message}` : message;
 }
 
-function serializeMessage(m: Message) {
+function serializeMessage(m: RMessage) {
   const match = SENDER_PREFIX.exec(m.content);
   return {
     id: m.id,
-    timestamp: m.createdAt.toISOString(),
+    timestamp: new Date(m.timestamp).toISOString(),
     author: { username: m.author.username, id: m.author.id, bot: m.author.bot },
     // sender = the identity the agent declared when sending (null for plain messages)
     sender: match ? match[1] : null,
     content: match ? m.content.slice(match[0].length) : m.content,
-    attachments: [...m.attachments.values()].map((a) => ({
-      filename: a.name,
+    attachments: (Array.isArray(m.attachments) ? m.attachments : [...(m.attachments as Map<string, RAttachment>).values()]).map((a) => ({
+      filename: a.filename ?? a.name,
       url: a.url,
     })),
   };
@@ -442,7 +524,7 @@ function registerTools(server: McpServer): void {
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const id = channel.id;
         let note: string | undefined;
-        if (channel instanceof ThreadChannel && channel.archived) {
+        if (isThread(channel) && channel.archived) {
           try {
             await channel.setArchived(false);
             note = "thread was archived; unarchived it to send";
@@ -512,9 +594,8 @@ function registerTools(server: McpServer): void {
         const fetched = await channel.messages.fetch({
           limit: limit ?? 50,
           ...(after ? { after } : {}),
-          cache: false,
         });
-        const messages = [...fetched.values()].sort(byIdAscending).map(serializeMessage);
+        const messages = [...fetched].sort(byIdAscending).map(serializeMessage);
         const last = messages.at(-1);
         return {
           channel_id: id,
@@ -559,7 +640,7 @@ function registerTools(server: McpServer): void {
         assertNotProjectMode("create_thread");
         const parentId = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         const parent = await getChatChannel(parentId);
-        if (parent instanceof ThreadChannel) {
+        if (isThread(parent)) {
           throw new Error(`${parentId} is a thread, not a text channel.`);
         }
         const existing = (await allThreads(parent)).find(
@@ -582,7 +663,7 @@ function registerTools(server: McpServer): void {
           created = await parent.threads.create({
             name,
             // 7 days — the longest Discord offers; minimizes auto-archive churn.
-            autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+            autoArchiveDuration: 10080, // 7 days — the longest Discord offers
           });
         } catch (err) {
           throw new Error(
@@ -610,21 +691,23 @@ function registerTools(server: McpServer): void {
     () =>
       guard(async () => {
         assertNotProjectMode("list_channels");
-        const me = await awaitReady();
+        const me = await getBotMe();
+        const guilds = (await api().get("/users/@me/guilds")) as { id: string; name: string }[];
         return {
-          bot: { username: me.user.username, id: me.user.id },
-          guilds: me.guilds.cache.map((guild) => ({
-            id: guild.id,
-            name: guild.name,
-            channels: guild.channels.cache
-              .filter(
-                (c) =>
-                  c.type === ChannelType.GuildText ||
-                  c.type === ChannelType.GuildAnnouncement,
-              )
-              .sort((a, b) => a.position - b.position)
-              .map((c) => ({ id: c.id, name: c.name, type: "text" })),
-          })),
+          bot: me,
+          guilds: await Promise.all(
+            guilds.map(async (g) => {
+              const channels = (await api().get(Routes.guildChannels(g.id))) as { id: string; name: string; type: number; position?: number }[];
+              return {
+                id: g.id,
+                name: g.name,
+                channels: channels
+                  .filter((c) => c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement)
+                  .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+                  .map((c) => ({ id: c.id, name: c.name, type: "text" })),
+              };
+            }),
+          ),
         };
       }),
   );
@@ -650,14 +733,14 @@ function registerTools(server: McpServer): void {
         assertNotProjectMode("list_threads");
         const id = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         const channel = await getChatChannel(id);
-        if (channel instanceof ThreadChannel) {
+        if (isThread(channel)) {
           throw new Error(
             `${id} is itself a thread (parent: ${channel.parentId}). Pass the parent text channel ID instead.`,
           );
         }
         const active = await channel.threads.fetchActive();
         const archived = await channel.threads.fetchArchived();
-        const toThread = (t: ThreadChannel) => ({
+        const toThread = (t: ThreadShim) => ({
           id: t.id,
           name: t.name,
           archived: t.archived,
@@ -665,10 +748,7 @@ function registerTools(server: McpServer): void {
           last_message_id: t.lastMessageId,
           parent_id: t.parentId,
         });
-        const threads = [
-          ...[...active.threads.values()].map(toThread),
-          ...[...archived.threads.values()].map(toThread),
-        ];
+        const threads = [...active.threads.map(toThread), ...archived.threads.map(toThread)];
         return { channel_id: id, count: threads.length, threads };
       }),
   );
@@ -869,25 +949,18 @@ async function main(): Promise<void> {
   const server = new McpServer({ name: "clankerchat", version: VERSION });
   registerTools(server);
 
-  // Start Discord in the background — the MCP server itself always comes up
-  // (so health checks and tools/list work), and tools surface configuration
-  // and connection problems as clear errors pointing at SETUP.md.
+  // REST-only: no gateway, no login handshake. The MCP server always comes
+  // up (health checks and tools/list work); tools surface configuration and
+  // connection problems as clear errors pointing at SETUP.md.
   if (!token) {
     console.error(
       "clankerchat: DISCORD_TOKEN is not set. Copy .env.example to .env in the project root " +
         "and paste a bot token (see SETUP.md Step 2). Tools will return this error until then.",
     );
-    rejectReady(
-      new Error(
-        "clankerchat is not configured: DISCORD_TOKEN is missing. Copy .env.example to .env in the project root and paste a bot token (SETUP.md Step 2).",
-      ),
-    );
-  } else {
-    void startDiscord(token);
   }
 
   await server.connect(new StdioServerTransport());
-  console.error("clankerchat: MCP server ready on stdio");
+  console.error("clankerchat: MCP server ready on stdio (REST-only, no gateway)");
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -895,10 +968,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    void client.destroy();
-    process.exit(0);
-  });
+  process.on(signal, () => process.exit(0));
 }
 
 main().catch((err) => {
