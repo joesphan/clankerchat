@@ -53,6 +53,9 @@ import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 
 const READY_TIMEOUT_MS = 20_000;
 const DAEMON_START_MS = Date.now();
+/** Last gateway event of any kind — a live process with a dead gateway sat
+ *  silent for 7h once; this feeds the staleness self-heal. */
+let lastGatewayEventAt = Date.now();
 const START_ISO = new Date().toISOString();
 /** Meta tag: a trigger starting with one of these addresses the overseer
  *  itself (status/config/questions), never the task router. */
@@ -282,6 +285,16 @@ client.once(Events.ClientReady, (c) => {
 
 client.on(Events.Error, (err) => {
   log(`discord client error: ${err.message}`);
+});
+client.on(Events.ShardDisconnect, (event, id) => {
+  log(`gateway DISCONNECT (shard ${id}, code ${event.code}): ${event.reason ?? "no reason"}`);
+});
+client.on(Events.ShardResume, (id) => {
+  lastGatewayEventAt = Date.now();
+  log(`gateway resumed (shard ${id})`);
+});
+client.on(Events.ShardReady, (id) => {
+  lastGatewayEventAt = Date.now();
 });
 
 function startDiscord(token: string): void {
@@ -1182,6 +1195,11 @@ async function main(): Promise<void> {
   for (;;) {
     lastPollAt = Date.now();
     try {
+      await checkGatewayHealth(parent);
+    } catch (err) {
+      log(`gateway health check error: ${errText(err)}`);
+    }
+    try {
       await checkFollowups();
     } catch (err) {
       log(`follow-up error: ${errText(err)}`);
@@ -1195,10 +1213,40 @@ async function main(): Promise<void> {
   }
 }
 
+/** Self-heal for a zombie gateway (observed: live process, dead socket, 7h
+ *  of missed triggers, discord.js never resumed). REST is the truth source:
+ *  if the parent channel has messages past our cursor that the gateway never
+ *  delivered for 90+s, tear the gateway down and log in fresh — then catch
+ *  up everything the dead socket missed. */
+async function checkGatewayHealth(parent: TextChannel | NewsChannel): Promise<void> {
+  const staleFor = Date.now() - lastGatewayEventAt;
+  if (staleFor < 90_000) return;
+  const fresh = (await client.channels.fetch(parent.id, { cache: false })) as TextChannel;
+  const latest = fresh.lastMessageId;
+  const cursor = state.cursors[parent.id] ?? "0";
+  if (!latest || BigInt(cursor) >= BigInt(latest)) return; // channel truly quiet
+  log(
+    `GATEWAY STALE: root has ${latest} past cursor ${cursor}, no gateway events for ${Math.round(staleFor / 1000)}s — re-logging in`,
+  );
+  const token = process.env.DISCORD_TOKEN!;
+  await client.destroy();
+  await client.login(token);
+  lastGatewayEventAt = Date.now();
+  log("gateway re-login complete — catching up missed messages");
+  // pollOnce is the boot-time REST catch-up; it sweeps every thread + root.
+  try {
+    const me = client.user;
+    if (me) await pollOnce(parent, me);
+  } catch (err) {
+    log(`post-relogin catch-up error: ${errText(err)}`);
+  }
+}
+
 /** Gateway path: a live message in the parent channel or any of its threads.
  *  Webhooks never trigger (B6); own posts are canary-scanned (B5), not run. */
 async function handleLiveMessage(m: Message, parent: TextChannel | NewsChannel, botUser: User): Promise<void> {
   lastPollAt = Date.now();
+  lastGatewayEventAt = Date.now();
   if (m.webhookId) return; // B6: webhook spoof class never triggers
   if (m.author.id === botUser.id) {
     // B5 tripwire: our own posts must never contain an active canary.
