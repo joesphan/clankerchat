@@ -1061,10 +1061,14 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
   // the root). Same cursor, first-sight-skip, and trigger rules as threads.
   let rootCursor = state.cursors[parent.id];
   const rootLatest = parent.lastMessageId;
-  if (rootCursor === undefined) {
+  if (rootCursor === undefined || (rootCursor === "0" && rootLatest)) {
+    // The root always has history — never replay it; a "0" cursor would crawl
+    // 50 messages per poll while live tags pile up behind ancient messages.
     state.cursors[parent.id] = rootLatest ?? "0";
     saveState();
-  } else if (rootLatest && BigInt(rootCursor) < BigInt(rootLatest)) {
+  }
+  if (rootLatest && BigInt(state.cursors[parent.id] ?? "0") < BigInt(rootLatest)) {
+    rootCursor = state.cursors[parent.id] ?? "0"; // re-sync after any jump
     const fetched = await parent.messages.fetch({ limit: FETCH_LIMIT, after: rootCursor, cache: false });
     const rootMessages = [...fetched.values()].sort(byIdAscending);
     for (const m of rootMessages) {
