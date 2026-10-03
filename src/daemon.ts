@@ -120,6 +120,9 @@ interface DaemonConfig {
   /** Thread name (project slug) -> repo path. A HINT map: unmapped threads
    *  are routed by inference, and successful inferences land here. */
   threads: Record<string, string>;
+  /** Thread names whose triggers are refused outright — circuit breaker for
+   *  work that crashes the machine (e.g. unsafe driver stacks). */
+  pausedThreads: string[];
 }
 
 interface DaemonState {
@@ -226,6 +229,11 @@ function loadConfig(): DaemonConfig {
         ? path.resolve(parsed.sandbox)
         : null,
     threads: threads as Record<string, string>,
+    pausedThreads: Array.isArray(parsed.pausedThreads)
+      ? (parsed.pausedThreads as unknown[]).filter(
+          (n): n is string => typeof n === "string" && n.length > 0,
+        )
+      : [],
   };
 }
 
@@ -381,6 +389,10 @@ function mentionsTarget(m: Message, botUser: User): boolean {
 function isTrigger(m: Message, botUser: User): boolean {
   if (m.author.id === botUser.id) return false;
   if (!mentionsTarget(m, botUser)) return false;
+  const channelName = m.channel && "name" in m.channel ? String(m.channel.name) : "";
+  if (config.pausedThreads.some((n) => n.toLowerCase() === channelName.toLowerCase())) {
+    return false; // circuit-breaked thread: triggers refused until unpaused
+  }
   if (m.author.bot) {
     return config.allowBots && (config.botAllow.length === 0 || config.botAllow.includes(m.author.id));
   }
