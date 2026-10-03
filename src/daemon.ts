@@ -51,6 +51,7 @@ import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 
 const READY_TIMEOUT_MS = 20_000;
+const DAEMON_START_MS = Date.now();
 const START_ISO = new Date().toISOString();
 /** Meta tag: a trigger starting with one of these addresses the overseer
  *  itself (status/config/questions), never the task router. */
@@ -997,9 +998,12 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
     const latest = thread.lastMessageId;
     let cursor = state.cursors[thread.id];
     if (cursor === undefined) {
-      // First sight: skip backlog for threads with history, but seed "0" for
-      // EMPTY threads so the first message ever posted is not swallowed.
-      state.cursors[thread.id] = latest ?? "0";
+      // First sight. Threads created AFTER this daemon started replay from
+      // the beginning (their opening tagged message is live traffic, not
+      // backlog — a new thread's first tag was once swallowed this way).
+      // Pre-existing threads skip backlog; empty threads seed "0".
+      const isNewThread = (thread.createdAt?.getTime() ?? 0) > DAEMON_START_MS;
+      state.cursors[thread.id] = isNewThread || !latest ? "0" : latest;
       saveState();
       continue;
     }
