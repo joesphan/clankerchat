@@ -393,6 +393,7 @@ function isTrigger(m: Message, botUser: User): boolean {
   if (config.pausedThreads.some((n) => n.toLowerCase() === channelName.toLowerCase())) {
     return false; // circuit-breaked thread: triggers refused until unpaused
   }
+
   if (m.author.bot) {
     return config.allowBots && (config.botAllow.length === 0 || config.botAllow.includes(m.author.id));
   }
@@ -985,7 +986,20 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
     const messages = [...fetched.values()].sort(byIdAscending);
     for (const m of messages) {
       cursor = m.id;
-      if (!isTrigger(m, botUser)) continue;
+      if (!isTrigger(m, botUser)) {
+        // Circuit-broken thread: refuse LOUDLY — silence reads as death.
+        if (
+          mentionsTarget(m, botUser) &&
+          config.pausedThreads.some((n) => n.toLowerCase() === thread.name.toLowerCase()) &&
+          !m.author.bot
+        ) {
+          await sendToThread(
+            thread.id,
+            `circuit breaker: this thread is paused (machine-safety). Triggers refused until unpaused.`,
+          );
+        }
+        continue;
+      }
       const prompt = stripMention(m.content, botUser.id);
       if (!prompt) {
         log(`skip: trigger from ${m.author.username} in "${thread.name}" had no text`);
