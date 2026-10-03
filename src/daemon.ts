@@ -271,7 +271,13 @@ let state: DaemonState = { cursors: {}, sessions: {} };
 // participants' messages — see the note in index.ts), REST below.
 // ---------------------------------------------------------------------------
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.MessageContent] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages, // gates the messageCreate EVENTS themselves
+    GatewayIntentBits.MessageContent, // gates message text/attachments content
+  ],
+});
 
 let resolveReady!: (c: Client<true>) => void;
 const ready = new Promise<Client<true>>((res) => {
@@ -1221,24 +1227,35 @@ async function main(): Promise<void> {
 async function checkGatewayHealth(parent: TextChannel | NewsChannel): Promise<void> {
   const staleFor = Date.now() - lastGatewayEventAt;
   if (staleFor < 90_000) return;
-  const fresh = (await client.channels.fetch(parent.id, { cache: false })) as TextChannel;
-  const latest = fresh.lastMessageId;
-  const cursor = state.cursors[parent.id] ?? "0";
-  if (!latest || BigInt(cursor) >= BigInt(latest)) return; // channel truly quiet
-  log(
-    `GATEWAY STALE: root has ${latest} past cursor ${cursor}, no gateway events for ${Math.round(staleFor / 1000)}s — re-logging in`,
-  );
-  const token = process.env.DISCORD_TOKEN!;
-  await client.destroy();
-  await client.login(token);
-  lastGatewayEventAt = Date.now();
-  log("gateway re-login complete — catching up missed messages");
-  // pollOnce is the boot-time REST catch-up; it sweeps every thread + root.
-  try {
-    const me = client.user;
-    if (me) await pollOnce(parent, me);
-  } catch (err) {
-    log(`post-relogin catch-up error: ${errText(err)}`);
+  // Check EVERY surface we hold a cursor for (root + all threads) — a
+  // root-only check misses thread traffic when the root is quiet.
+  const ids = Object.keys(state.cursors);
+  if (!ids.includes(parent.id)) ids.push(parent.id);
+  for (const id of ids) {
+    try {
+      const fresh = (await client.channels.fetch(id, { cache: false })) as ThreadChannel;
+      const latest = fresh.lastMessageId ?? (fresh as unknown as TextChannel).lastMessageId;
+      const cursor = state.cursors[id] ?? "0";
+      if (latest && BigInt(cursor) < BigInt(latest)) {
+        log(
+          `GATEWAY STALE: ${id} has ${latest} past cursor ${cursor}, no gateway events for ${Math.round(staleFor / 1000)}s — re-logging in`,
+        );
+        const token = process.env.DISCORD_TOKEN!;
+        await client.destroy();
+        await client.login(token);
+        lastGatewayEventAt = Date.now();
+        log("gateway re-login complete — catching up missed messages");
+        try {
+          const me = client.user;
+          if (me) await pollOnce(parent, me);
+        } catch (err) {
+          log(`post-relogin catch-up error: ${errText(err)}`);
+        }
+        return;
+      }
+    } catch {
+      // channel deleted or unreadable — skip it
+    }
   }
 }
 
