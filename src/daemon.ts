@@ -955,15 +955,14 @@ function enqueue(job: Job): void {
 
 function drain(): void {
   while (queue.length > 0 && activeJobs.length < config.maxConcurrent) {
-    // Prefer a job that conflicts with nothing active (same thread never
-    // concurrent — resume-state races; different cwd preferred — repo races).
-    const conflicts = (j: Job) =>
-      activeJobs.some(
-        (a) => a.threadName === j.threadName || (a.cwd != null && a.cwd === j.cwd),
-      );
+    // Only hard rule: one job per thread at a time (resume-state safety).
+    // Same-repo parallel workers are allowed — threads map to shared repos
+    // (shim/echo-dot/fire-tv → shim-xcompile) and serializing them starved
+    // threads behind whichever job happened to start first.
+    const conflicts = (j: Job) => activeJobs.some((a) => a.threadName === j.threadName);
     let idx = queue.findIndex((j) => !conflicts(j));
     if (idx < 0 && activeJobs.length === 0) idx = 0; // idle: head of queue always runs
-    if (idx < 0) break; // only conflicting jobs left and concurrency budget spent
+    if (idx < 0) break; // only same-thread jobs left and concurrency budget spent
     const job = queue.splice(idx, 1)[0];
     activeJobs.push(job);
     void dispatch(job).finally(() => {
