@@ -400,14 +400,18 @@ function isTrigger(m: Message, botUser: User): boolean {
   return config.allowAllHumans || config.allow.includes(m.author.id);
 }
 
-/** Untagged human messages in MAPPED project threads also count — the thread
- *  itself is the address (people post asks without tagging). The router
- *  filters banter via the "ignore" decision. Bots/root still need a tag. */
-function isUntaggedThreadTrigger(m: Message, botUser: User, threadName: string): boolean {
+/** Untagged human messages in MAPPED project threads (and the team channel
+ *  root) also count — the surface itself is the address (people post asks
+ *  without tagging). The router filters banter via "ignore". Bots still need
+ *  a tag. threadName null = channel root. */
+function isUntaggedThreadTrigger(m: Message, botUser: User, threadName: string | null): boolean {
   if (m.author.bot || m.author.id === botUser.id) return false;
   if (mentionsTarget(m, botUser)) return false; // handled by isTrigger
-  if (config.pausedThreads.some((n) => n.toLowerCase() === threadName.toLowerCase())) return false;
-  if (mappedCwdFor(threadName) === null) return false; // mapped threads only
+  const name = threadName ?? ""; // root: no pause/mapping gate, it IS the workspace
+  if (threadName !== null) {
+    if (config.pausedThreads.some((n) => n.toLowerCase() === name.toLowerCase())) return false;
+    if (mappedCwdFor(name) === null) return false; // mapped threads only
+  }
   return config.allowAllHumans || config.allow.includes(m.author.id);
 }
 
@@ -858,7 +862,7 @@ async function dispatch(job: Job): Promise<void> {
     let cwd = job.cwd;
     let woke: string | null = null;
     let routeConfidence: "high" | "low" = "high"; // explicit mapping is always trusted
-    if (!job.skipWake && !job.rootChannel && (!cwd || config.wake || job.untagged)) {
+    if (!job.skipWake && (!cwd || config.wake || job.untagged)) {
       const decision = await runRouter(job, cwd);
       if (decision?.ignore) {
         log(`router: ignored untagged message in "${job.threadName}" (${decision.reason})`);
@@ -1058,7 +1062,9 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
     const rootMessages = [...fetched.values()].sort(byIdAscending);
     for (const m of rootMessages) {
       rootCursor = m.id;
-      if (!isTrigger(m, botUser)) continue;
+      const tagged = isTrigger(m, botUser);
+      const untagged = !tagged && isUntaggedThreadTrigger(m, botUser, null);
+      if (!tagged && !untagged) continue;
       const prompt = stripMention(m.content, botUser.id);
       if (!prompt) {
         log(`skip: root trigger from ${m.author.username} had no text`);
@@ -1073,6 +1079,7 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
         from: m.author.username,
         fromId: m.author.id,
         fromBot: m.author.bot,
+        untagged: !tagged,
         triggerId: m.id,
       });
     }
@@ -1086,6 +1093,18 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+// Freeze watchdog: a stalled event loop (observed once — 13 min of silence,
+// triggers queued minutes late) is worse than dead. If a poll cycle doesn't
+// complete within 2 minutes, exit so the revive path (health loop / logon
+// task) brings the daemon back instead of it sitting frozen.
+let lastPollAt = Date.now();
+setInterval(() => {
+  if (Date.now() - lastPollAt > 120_000) {
+    log(`FREEZE WATCHDOG: no completed poll for ${Math.round((Date.now() - lastPollAt) / 1000)}s — exiting for revival`);
+    process.exit(1);
+  }
+}, 60_000).unref();
 
 async function main(): Promise<void> {
   loadEnvFile();
@@ -1111,6 +1130,7 @@ async function main(): Promise<void> {
   );
 
   for (;;) {
+    lastPollAt = Date.now();
     try {
       await pollOnce(parent, me.user);
     } catch (err) {
