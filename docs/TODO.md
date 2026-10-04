@@ -280,3 +280,23 @@ Limit rides a ref so the poll effect isn't re-armed; machine flip resets.
 journal-verify CLI also landed this round-block (human-facing chain proof;
 see commit 879056f). 187/187; watch+companion+botlink restarted; first
 digest verified live in the registry (seq 3).
+
+## Round — audit watch on the LIVE watcher host (2026-10-04, round 10)
+
+The S-tier #5 audit watch existed only in the daemon flavor; the host that
+actually runs here (~/tools/clankerchat-watch.mjs) had NO audit-log watch.
+Now it does — same pure classifier (dist/audit.js), same contract: fetch
+since cursor, classify to our blast radius, critical → one human-eyes
+channel post (ids-only, users-parse owner mention) + warn notice, notify →
+card alert line. Differences from the daemon flavor, on purpose:
+- cursor persists in watcher-state.json (audit_cursor key, restored at boot
+  BEFORE laneHeartbeat's first state write can clobber it — placement law);
+- FIRST DEPLOY seeds to newest without back-alerting (days-old deletes are
+  history, not incidents); restart gaps stay covered by the persisted cursor;
+- no interaction journal on this host — notices + the Discord post are the
+  record.
+
+LIVE RESULT: fast-clank lacks View Audit Log in epicEFI → the one-time
+honest degrade fired on all three surfaces (log, card alert line, warn
+notice). The watch self-arms within 5 min of the permission being granted —
+that's a guild-settings action (Joe's guild). Asked in the lane.
