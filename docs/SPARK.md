@@ -54,6 +54,34 @@ gemini.google.com → Settings → Connected Apps → Custom apps → Add:
 Requirements on Google's side (per Google's support page): 18+, US, personal
 Google account, Activity on, English.
 
+## EGRESS LAW (owner 2026-10-04)
+
+> "make sure no request from discord from other users other than the user can
+> go out to gemini… they need to use their own. no email or anything can get out."
+
+Nothing any other Discord user writes — and no email/PII of anyone — may ride
+the WAN leg to the owner's Gemini surface. Others use their own AI; this
+surface is Tyler's. Three mechanical layers (no layer trusts the others):
+
+1. **Surface isolation**: `prompt_result` / `list_recent_prompts` surface
+   spark-originated records ONLY (`fp` prefixed `spark:`). Phone-surface and
+   peer records answer as an indistinguishable "no such prompt_id" — foreign
+   content never exists as a response, and misses don't leak that it does.
+   There is no Discord-read tool at all; `machine_status` returns projected
+   machine telemetry (counts, timestamps, lane ok) with names dropped
+   (`projectWatcherFacts`) before a payload exists.
+2. **Egress scrub**: every human-shaped string leaving a tool response passes
+   `scrubForEgress` — emails, Discord mention/channel/role tokens, and 7+
+   digit runs (snowflakes, phone-shaped numbers) become `[redacted-*]` before
+   the leak-shape scan and length cap (`safeExcerpt`).
+3. **Run-side framing**: the watcher's spark-prompt branch instructs the run
+   that its answer excerpt travels to Google's servers — compose from machine
+   facts and its own words only, never quoting other users' messages or PII.
+
+Direction of note: Google → us only. No code on this machine ever calls
+Google; the server answers requests, it never originates traffic. What
+Google's side learns is exactly what these tool responses contain.
+
 ## Rotating the capability
 
 Append new `SPARK_MCP_PATH`/`SPARK_MCP_TOKEN` to `.env`, restart

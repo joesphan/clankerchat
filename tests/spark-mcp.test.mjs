@@ -11,6 +11,9 @@ import {
   sparkFp,
   rateAllow,
   safeExcerpt,
+  scrubForEgress,
+  isSparkRecord,
+  projectWatcherFacts,
   createSparkListener,
 } from "../dist/spark-mcp.js";
 
@@ -155,5 +158,114 @@ test("listener: ask_clanker refuses leak-shaped and mass-mention text at the doo
     const clean = await call({ text: "status check please" });
     assert.equal(clean.body.result.isError, undefined);
     assert.match(clean.body.result.content[0].text, /prompt_id/);
+  });
+});
+
+// --- EGRESS LAW (owner 2026-10-04): no other-user content, no email/PII out ---
+
+test("scrubForEgress: emails, mention tokens, 7+ digit runs blanked; plain text intact", () => {
+  const out = scrubForEgress("mail someone@example.com or <@123456789012345678> re: order 4821 within 7 days");
+  assert.ok(!out.includes("someone@example.com"));
+  assert.ok(!out.includes("<@123456789012345678>"));
+  assert.match(out, /\[redacted-email\]/);
+  assert.match(out, /\[redacted-mention\]/);
+  assert.ok(out.includes("4821")); // short digit groups survive
+  assert.equal(scrubForEgress("plain text, 123 456 fine"), "plain text, 123 456 fine");
+  assert.ok(!scrubForEgress("user 9988776655 called").includes("9988776655")); // phone/snowflake-shaped
+  assert.ok(!scrubForEgress("channel <#1555103465179455488>").includes("1555103465179455488"));
+});
+
+test("safeExcerpt: clean text carrying an email rides scrubbed, never raw", () => {
+  const out = safeExcerpt("a teammate wrote tyler@fastmail.example about the build");
+  assert.ok(out.includes("[redacted-email]"));
+  assert.ok(!out.includes("tyler@fastmail.example"));
+});
+
+test("isSparkRecord: spark fp yes; phone fp, missing fp, null all no", () => {
+  assert.equal(isSparkRecord({ fp: "spark:6964a8fcba93dea7" }), true);
+  assert.equal(isSparkRecord({ fp: "phone:abc" }), false);
+  assert.equal(isSparkRecord({}), false);
+  assert.equal(isSparkRecord(null), false);
+});
+
+test("projectWatcherFacts: numbers/timestamps/lane-ok survive; names and unknowns dropped", () => {
+  const out = projectWatcherFacts({
+    active: 1,
+    queued_human: 0,
+    queued_bot: 2,
+    max_concurrent: 2,
+    last_run_at: "2026-10-04T18:21:23.456Z",
+    updated: "2026-10-04T18:22:00.000Z",
+    lane: { ok: true, pending: 0, injects: 41, bot: "joesp-desktop", peerLastRunAt: "2026-10-04T18:00:00.000Z" },
+    junk: { deep: "stuff" },
+  });
+  assert.equal(out.activeRuns, 1);
+  assert.equal(out.queuedBot, 2);
+  assert.equal(out.laneUp, true);
+  assert.equal(out.lastRunAt, "2026-10-04T18:21:23.456Z");
+  assert.equal(out.stale, false);
+  const s = JSON.stringify(out);
+  assert.ok(!s.includes("joesp-desktop")); // identities never ride the WAN leg
+  assert.ok(!s.includes("junk"));
+  // garbage in → honest stale marker, no throw
+  assert.equal(projectWatcherFacts(null).stale, true);
+});
+
+test("listener: prompt_result and list_recent_prompts see spark records ONLY, scrubbed", async () => {
+  await withServer(async ({ base, cap, token, tmp }) => {
+    // Plant two records in the shared prompt registry: one phone-surface
+    // (foreign — must be invisible here), one spark-surface whose excerpt
+    // carries other-user content + PII shapes (must ride scrubbed).
+    const dir = path.join(tmp, "pending-prompts");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "pmphone0001.json"),
+      JSON.stringify({
+        promptId: "pmphone0001",
+        text: "phone prompt text",
+        fp: "phone: enrolled-device",
+        status: "answered",
+        exit: 0,
+        createdAt: Date.now(),
+        answerExcerpt: "quoted ggurov saying tyler@fastmail.example",
+      }),
+    );
+    fs.writeFileSync(
+      path.join(dir, "pmspark0002.json"),
+      JSON.stringify({
+        promptId: "pmspark0002",
+        text: "spark prompt text",
+        fp: "spark:test",
+        status: "answered",
+        exit: 0,
+        createdAt: Date.now(),
+        answerExcerpt: "done — cc someone@example.com and <@210949752617959424> per 4821",
+      }),
+    );
+    const call = (name, args, id) =>
+      fetch(`${base}/${cap}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }),
+      }).then((r) => rpcBody(r));
+    // foreign record: indistinguishable miss
+    const foreign = await call("prompt_result", { prompt_id: "pmphone0001" }, 21);
+    assert.equal(foreign.result.isError, true);
+    assert.match(foreign.result.content[0].text, /no such prompt_id/);
+    // spark record: visible, excerpt scrubbed — no raw email/mention/snowflake
+    const own = await call("prompt_result", { prompt_id: "pmspark0002" }, 22);
+    assert.equal(own.result.isError, undefined);
+    const ownText = own.result.content[0].text;
+    assert.ok(!ownText.includes("someone@example.com"));
+    assert.ok(!ownText.includes("<@210949752617959424>"));
+    assert.match(ownText, /\[redacted-email\]/);
+    assert.match(ownText, /\[redacted-mention\]/);
+    assert.ok(ownText.includes("4821"));
+    // list: spark only
+    const list = await call("list_recent_prompts", {}, 23);
+    const listText = list.result.content[0].text;
+    assert.ok(listText.includes("pmspark0002"));
+    assert.ok(!listText.includes("pmphone0001"));
+    assert.ok(!listText.includes("phone prompt text"));
   });
 });

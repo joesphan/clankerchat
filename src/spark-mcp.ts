@@ -27,12 +27,20 @@
  *     data exactly like a phone prompt — the run-side framing owns that.
  *   - Everything returned to Gemini passes the leak-shape scan: no secret-
  *     shaped content ever rides the WAN leg.
+ *   - EGRESS LAW (owner 2026-10-04): no other users' Discord data — and no
+ *     email/PII of any kind — ever rides the WAN leg. Three layers: tools
+ *     surface spark-originated records ONLY (phone-surface and peer records
+ *     are indistinguishable misses); every human-shaped string is scrubbed
+ *     (emails, mention tokens, 7+ digit runs) at the egress point; machine
+ *     telemetry is projected numbers/timestamps-first, names dropped before
+ *     a payload exists.
  *
  * Secrets live in .env (SPARK_MCP_TOKEN, SPARK_MCP_PATH) — values are
  * never logged; the fp provenance string carries only a hash head.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import http from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -44,6 +52,7 @@ import {
   listPhonePrompts,
   PROMPT_ID_RE,
   MAX_PROMPT_CHARS,
+  type PromptRecord,
 } from "./prompts.js";
 import { findLeakSignals, findMassMentions, massMentionRefusal } from "./leaks.js";
 
@@ -93,11 +102,42 @@ export function rateAllow(gate: RateGate, now = Date.now()): boolean {
   return true;
 }
 
-/** Excerpt hygiene at the WAN leg: blank anything leak-shaped, cap length. */
+/**
+ * EGRESS LAW (owner 2026-10-04): no other users' Discord data — and no
+ * email/PII of any kind — may ride the WAN leg to the owner's Gemini
+ * surface. Mechanical backstop applied to every human-shaped string that
+ * leaves through a tool response: emails, Discord mention/channel/role
+ * tokens, and 7+ digit runs (snowflakes, phone-shaped numbers) are blanked
+ * before the leak-shape scan and length cap.
+ */
+const EGRESS_PATTERNS: Array<[RegExp, string]> = [
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted-email]"],
+  [/<@!?&?\d+>|<#\d+>/g, "[redacted-mention]"],
+  [/\d{7,}/g, "[redacted-digits]"],
+];
+
+export function scrubForEgress(text: string): string {
+  let t = String(text ?? "");
+  for (const [re, sub] of EGRESS_PATTERNS) t = t.replace(re, sub);
+  return t;
+}
+
+/** Excerpt hygiene at the WAN leg: leak-scan, egress scrub, cap length. */
 export function safeExcerpt(text: string | undefined, max = 800): string {
   const t = String(text ?? "");
   if (!t || findLeakSignals(t).length > 0) return "";
-  return t.slice(0, max);
+  return scrubForEgress(t).slice(0, max);
+}
+
+/**
+ * Spark tools may only surface THIS surface's records: an fp prefixed
+ * "spark:" proves the record entered through this gateway. Phone-surface
+ * records (and anything else) are indistinguishable misses — other
+ * surfaces' content never rides out to Gemini, and miss vs foreign looks
+ * identical so existence isn't leaked either.
+ */
+export function isSparkRecord(rec: PromptRecord | null): rec is PromptRecord {
+  return Boolean(rec && typeof rec.fp === "string" && rec.fp.startsWith("spark:"));
 }
 
 export interface SparkDeps {
@@ -107,14 +147,47 @@ export interface SparkDeps {
   statusFacts?: () => Record<string, unknown>;
 }
 
+/**
+ * EGRESS LAW projection of watcher-state.json: machine telemetry ONLY —
+ * counts, concurrency, timestamps, lane ok/pending. Names (bot usernames,
+ * peer identities) and anything human-shaped are dropped before the fact
+ * ever exists as a response payload.
+ */
+export function projectWatcherFacts(raw: unknown): Record<string, unknown> {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const lane = (r.lane ?? {}) as Record<string, unknown>;
+  const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const iso = (v: unknown): string | null =>
+    typeof v === "string" && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(v) ? v : null;
+  return {
+    service: "clankerchat-spark",
+    activeRuns: num(r.active),
+    queuedHuman: num(r.queued_human),
+    queuedBot: num(r.queued_bot),
+    maxConcurrent: num(r.max_concurrent),
+    lastRunAt: iso(r.last_run_at),
+    laneUp: lane.ok === true,
+    lanePending: num(lane.pending),
+    watcherStateAt: iso(r.updated),
+    stale: iso(r.updated) === null, // no/bad snapshot → caller notes staleness
+  };
+}
+
 function registerSparkTools(server: McpServer, deps: SparkDeps): void {
   const { spoolDir, fp } = deps;
   const statusFacts =
     deps.statusFacts ??
-    (() => ({
-      service: "clankerchat-spark",
-      note: "watcher-state.json not read in this build — status via the ask path if needed",
-    }));
+    (() => {
+      // Machine-local snapshot from the watcher (atomic tmp+rename writer);
+      // fresh for 180s, same window the dispatching peer serves it for.
+      try {
+        const raw = JSON.parse(readFileSync(`${spoolDir}/watcher-state.json`, "utf8"));
+        const age = Date.now() - (statSync(`${spoolDir}/watcher-state.json`).mtimeMs ?? 0);
+        return { ...projectWatcherFacts(raw), snapshotAgeSec: Math.max(0, Math.round(age / 1000)) };
+      } catch {
+        return { service: "clankerchat-spark", stale: true, note: "no watcher snapshot — status via ask_clanker if needed" };
+      }
+    });
 
   server.registerTool(
     "machine_status",
@@ -181,14 +254,18 @@ function registerSparkTools(server: McpServer, deps: SparkDeps): void {
     {
       title: "Poll a prompt's result",
       description:
-        "Read back a prompt submitted via ask_clanker: status (pending/enqueued/answered/failed) plus the answer excerpt when terminal. Excerpts are leak-scanned before leaving this machine.",
+        "Read back a prompt submitted via ask_clanker: status (pending/enqueued/answered/failed) plus the answer excerpt when terminal. Only prompts submitted through this surface exist here; excerpts are leak-scanned and PII-scrubbed before leaving this machine.",
       inputSchema: {
         prompt_id: z.string().regex(PROMPT_ID_RE).describe("The prompt_id returned by ask_clanker."),
       },
     },
     async ({ prompt_id }) => {
       const rec = getPrompt(spoolDir, String(prompt_id));
-      if (!rec) return { isError: true, content: [{ type: "text", text: "no such prompt_id" }] };
+      // EGRESS LAW: only THIS surface's records are ever visible here. A
+      // foreign record (phone surface, peer echo, anything else) answers
+      // exactly like a miss — other surfaces' content never rides to Gemini,
+      // and miss vs foreign is indistinguishable.
+      if (!isSparkRecord(rec)) return { isError: true, content: [{ type: "text", text: "no such prompt_id" }] };
       return {
         content: [
           {
@@ -214,13 +291,14 @@ function registerSparkTools(server: McpServer, deps: SparkDeps): void {
     {
       title: "Recent prompts on this surface",
       description:
-        "The last few prompt records (newest first): id, status, excerpt when answered. Useful to pick up where a previous conversation left off.",
+        "The last few prompts submitted through this surface (newest first): id, status, excerpt when answered. Useful to pick up where a previous conversation left off. Other surfaces' prompts are not visible here.",
       inputSchema: {
         limit: z.number().int().min(1).max(10).optional().describe("How many (default 5, max 10)."),
       },
     },
     async ({ limit }) => {
       const rows = listPhonePrompts(spoolDir)
+        .filter(isSparkRecord) // egress law: this surface's records only
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, Math.min(10, Number(limit ?? 5)))
         .map((r) => ({
