@@ -66,6 +66,8 @@ import { shouldHaveStatusLine, statusLine, nextStatusDelayMs } from "./run-progr
 import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
 import { findLeakSignals, findMassMentions, leakRefusal, massMentionRefusal, scanTextOfPost } from "./leaks.js";
+import { appendJournal } from "./journal.js";
+import { classifyAudit, filterAuditSince, type AuditLike } from "./audit.js";
 import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
 import {
   askClockLine,
@@ -180,6 +182,9 @@ interface DaemonState {
   cursors: Record<string, string>;
   /** thread name -> claude session id for --resume continuity */
   sessions: Record<string, string>;
+  /** Highest audit-log entry id the audit watch has classified (S-tier #5) —
+   *  the sweep's resume cursor, so a restart never re-journals old events. */
+  auditCursor?: string;
 }
 
 function errText(err: unknown): string {
@@ -312,6 +317,7 @@ function loadState(): DaemonState {
     return {
       cursors: parsed.cursors ?? {},
       sessions: parsed.sessions ?? {},
+      ...(typeof parsed.auditCursor === "string" ? { auditCursor: parsed.auditCursor } : {}),
     };
   } catch {
     return { cursors: {}, sessions: {} };
@@ -1665,6 +1671,100 @@ async function probeLane(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Audit-log watch (S-tier #5, owner round 2026-10-04) — the guild's own
+// record of moderation/admin actions, swept periodically for the classes
+// that touch THIS machine's blast radius: deletions of the bot's posts,
+// surgery on the watched channel/threads, webhook spawns inside them, the
+// bot's membership/roles. Classification is audit.ts (pure); this side
+// owns normalization, the resume cursor, the alert ring, and the ONE
+// human-eyes escalation per critical event (sendToThread = the same
+// tripwired post path as every other daemon notice).
+// ---------------------------------------------------------------------------
+
+/** Live alert ring for the phone card — bounded, 24h TTL, oldest dropped. */
+const auditAlerts: { ts: number; text: string }[] = [];
+let auditDeniedLogged = false; // 403s log ONCE, not every sweep
+
+function pushAuditAlert(text: string): void {
+  const now = Date.now();
+  auditAlerts.push({ ts: now, text });
+  while (auditAlerts.length > 0 && (now - auditAlerts[0].ts > 24 * 60 * 60 * 1000 || auditAlerts.length > 5)) {
+    auditAlerts.shift();
+  }
+}
+
+/** Fetch + classify + journal the guild audit log since the cursor. Idempotent
+ *  across restarts: every fetched entry id (classified or not) advances
+ *  state.auditCursor, so nothing is ever processed twice. */
+async function sweepAuditLogs(): Promise<void> {
+  const parent = parentChannel;
+  const botId = daemonBotUser?.id;
+  if (!parent || !botId) return;
+  try {
+    const guild = await client.guilds.fetch(parent.guildId);
+    const logs = await guild.fetchAuditLogs({ limit: 50 });
+    const raw: AuditLike[] = logs.entries.map((e) => {
+      const target = e.target as { id?: string } | null;
+      const extra = e.extra as { channel?: { id?: string } | null } | null;
+      return {
+        id: e.id,
+        action: Number(e.action),
+        executorId: e.executor?.id ?? null,
+        targetId: target?.id ?? null,
+        channelId: extra?.channel?.id ?? null,
+      };
+    });
+    const channelIds = [parent.id, ...Object.keys(state.cursors)];
+    for (const a of filterAuditSince(raw, state.auditCursor ?? "0")) {
+      const verdict = classifyAudit(a, { botId, channelIds });
+      if (!verdict) continue; // everything else is guild noise by design
+      appendJournal(askSpool(), {
+        ts: Date.now(),
+        kind: "audit",
+        detail: oneLine(verdict.label),
+        action: String(a.action),
+        severity: verdict.severity,
+        actor: a.executorId ?? undefined,
+        target: a.targetId ?? a.channelId ?? undefined,
+      });
+      log(`audit-watch: [${verdict.severity}] ${verdict.label}`);
+      pushAuditAlert(verdict.label);
+      if (verdict.severity === "critical") {
+        // One human-eyes line per event (ids only — labels carry no display
+        // names, and sendToThread re-runs the mass-mention/venue tripwires).
+        // Owner tag = first allowlist entry, users-parse only.
+        const owner = config.allow.length > 0 ? ` <@${config.allow[0]}>` : "";
+        void sendToThread(parent.id, `⚠ audit-watch: ${verdict.label}${owner}`);
+      }
+    }
+    writeWatcherState(); // audit_alerts may have changed
+    const maxId = raw.reduce<string | null>((acc, a) => {
+      try {
+        return acc === null || BigInt(a.id) > BigInt(acc) ? a.id : acc;
+      } catch {
+        return acc;
+      }
+    }, null);
+    if (maxId && maxId !== state.auditCursor) {
+      state.auditCursor = maxId;
+      saveState();
+    }
+  } catch (err) {
+    const text = errText(err);
+    if (/403|50013|Missing Permissions/i.test(text)) {
+      if (!auditDeniedLogged) {
+        auditDeniedLogged = true;
+        log(`audit-watch: bot lacks View Audit Log — watch degraded (alerts will say so), not retrying loudly`);
+        pushAuditAlert("audit watch degraded — bot lacks View Audit Log permission");
+        writeWatcherState();
+      }
+    } else {
+      log(`audit-watch sweep error: ${text}`);
+    }
+  }
+}
+
 /** Publish the watcher's facts into the botlink spool: pool, queues, lane
  * verdict, last-run, updated. Written atomically (tmp+rename) — botlink's
  * status verb and companion's /machine read this file live and must never
@@ -1679,6 +1779,7 @@ function writeWatcherState(): void {
   };
   if (laneFacts) snapshot.lane = laneFacts;
   if (lastRunAt) snapshot.last_run_at = lastRunAt;
+  if (auditAlerts.length > 0) snapshot.audit_alerts = auditAlerts.map((a) => a.text);
   const file = path.join(askSpool(), "watcher-state.json");
   try {
     atomicWrite(file, JSON.stringify(snapshot, null, 2));
@@ -1803,6 +1904,15 @@ async function main(): Promise<void> {
   setInterval(() => {
     void probeLane().finally(() => writeWatcherState());
   }, 120_000).unref();
+
+  // Audit-log watch (S-tier #5): one sweep at boot (post-catch-up, so the
+  // boot fetch is not starved), then every 5 minutes. Idempotent via
+  // state.auditCursor; a permission denial degrades to one log + one card
+  // alert instead of an error line every sweep.
+  void sweepAuditLogs().catch((err) => log(`audit-watch boot sweep failed: ${errText(err)}`));
+  setInterval(() => {
+    void sweepAuditLogs().catch((err) => log(`audit-watch sweep failed: ${errText(err)}`));
+  }, 300_000).unref();
 
   // CLANKER SPEC A3/A5 heartbeat: follow-ups + queue drain + watchdog feed.
   for (;;) {
@@ -1970,15 +2080,44 @@ async function retireAskButtons(interaction: ButtonInteraction, askId: string, n
   }
 }
 
+/** One structured journal line per interaction outcome (S-tier #4,
+ *  2026-10-04) — the chain-verified record behind the daemon.log prose.
+ *  Journal failures never break the interaction path itself. */
+function journalInteraction(
+  interaction: Interaction,
+  fields: { type: string; name: string; outcome: string; detail: string },
+): void {
+  try {
+    appendJournal(askSpool(), {
+      ts: Date.now(),
+      kind: "interaction",
+      detail: oneLine(fields.detail),
+      type: fields.type,
+      name: fields.name,
+      actor: interaction.user?.id,
+      outcome: fields.outcome,
+    });
+  } catch (err) {
+    log(`journal append failed: ${errText(err)}`);
+  }
+}
+
 async function handleAskInteraction(interaction: Interaction): Promise<void> {
   // Any delivered interaction proves the gateway is live — feed both watchdogs.
   lastGatewayEventAt = Date.now();
   lastPollAt = Date.now();
   // Slash (/clankerchat status|ask, fork 3e8c6ab) — classed BEFORE buttons:
   // a chat-input interaction is the other interaction class we own, and the
-  // button path below must never see one.
+  // button path below must never see one. handleSlashCommand returns the
+  // outcome code for the journal (S-tier #4) — refusals are signal too.
   if (interaction.isChatInputCommand()) {
-    await handleSlashCommand(interaction);
+    const outcome = await handleSlashCommand(interaction);
+    journalInteraction(interaction, {
+      type: "chat_input",
+      name: `/${interaction.commandName}`,
+      outcome,
+      detail: `/${interaction.commandName} by ${interaction.user.username} (${interaction.user.id}) — ${outcome}`,
+    });
     return;
   }
   if (!interaction.isButton()) return;
@@ -1989,21 +2128,40 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
   const rec = getAsk(spool, askId);
   if (!rec) {
     await retireAskButtons(interaction, askId, "_(ask record missing — buttons retired)_");
+    journalInteraction(interaction, {
+      type: "button",
+      name: interaction.customId,
+      outcome: "dangling",
+      detail: `click on missing ask ${askId} — buttons retired`,
+    });
     return;
   }
   if (rec.status !== "pending") {
     await interaction
       .reply({ content: `This ask was already ${rec.status}.`, ephemeral: true })
       .catch((err) => log(`ask ${askId}: already-${rec.status} ephemeral failed: ${errText(err)}`));
+    journalInteraction(interaction, {
+      type: "button",
+      name: interaction.customId,
+      outcome: "already-decided",
+      detail: `late click on ${rec.status} ask ${askId} by user ${interaction.user.id}`,
+    });
     return;
   }
   // Approver check — API identity ONLY. Non-approvers get an ephemeral
-  // refusal; the attempt is logged.
+  // refusal; the attempt is logged AND journaled (a probed button is a
+  // security signal the phone card surfaces as a refusal count).
   if (!rec.approvers.includes(interaction.user.id)) {
     log(`ask ${askId}: click from non-approver ${interaction.user.username} (${interaction.user.id}) — refused`);
     await interaction
       .reply({ content: "You are not an approver for this ask.", ephemeral: true })
       .catch((err) => log(`ask ${askId}: refusal ephemeral failed: ${errText(err)}`));
+    journalInteraction(interaction, {
+      type: "button",
+      name: interaction.customId,
+      outcome: "refused",
+      detail: `non-approver click on ask ${askId}: user ${interaction.user.id}`,
+    });
     return;
   }
   const decided = decideAsk(spool, askId, action === "approve" ? "approved" : "denied", interaction.user.id);
@@ -2011,6 +2169,12 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
     // Registry file vanished between getAsk and decideAsk — same treatment
     // as a dangling ask.
     await retireAskButtons(interaction, askId, "_(ask record missing — buttons retired)_");
+    journalInteraction(interaction, {
+      type: "button",
+      name: interaction.customId,
+      outcome: "dangling",
+      detail: `registry vanished mid-click on ask ${askId}`,
+    });
     return;
   }
   if (decided.decidedBy !== interaction.user.id) {
@@ -2020,6 +2184,12 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
     await interaction
       .reply({ content: `Already decided — ${decided.status} won the click race.`, ephemeral: true })
       .catch((err) => log(`ask ${askId}: race ephemeral failed: ${errText(err)}`));
+    journalInteraction(interaction, {
+      type: "button",
+      name: interaction.customId,
+      outcome: "race-lost",
+      detail: `click race on ask ${askId} lost to another approver — user ${interaction.user.id}`,
+    });
     return;
   }
   log(`ask ${askId}: ${decided.status} by ${interaction.user.username} (${interaction.user.id})`);
@@ -2041,6 +2211,12 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
     log(`ask ${askId}: decision edit failed: ${errText(err)}`);
   }
   await enqueueAskDecision(decided, interaction.user.username);
+  journalInteraction(interaction, {
+    type: "button",
+    name: interaction.customId,
+    outcome: decided.status,
+    detail: `ask ${askId} ${decided.status} by user ${interaction.user.id}`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2073,8 +2249,10 @@ function statusFacts(): StatusFacts {
   };
 }
 
-async function handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  if (interaction.commandName !== "clankerchat") return; // not our tree — silence
+/** Returns the outcome code for the interaction journal (S-tier #4) —
+ *  "queued"/"status" on success, the refusal class otherwise. */
+async function handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<string> {
+  if (interaction.commandName !== "clankerchat") return "not-ours"; // not our tree — silence
   // Venue quarantine FIRST, and ABSOLUTE: no ephemeral either — a reply into a
   // blocked venue would defeat the quarantine exactly like a notice post.
   if (venueBlocked(interaction.channelId)) {
@@ -2082,10 +2260,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       `quarantine: refused slash /${interaction.commandName} from ${interaction.user.username} ` +
         `(${interaction.user.id}) in blocked venue ${interaction.channelId}`,
     );
-    return;
+    return "venue-blocked";
   }
   const parent = parentChannel;
-  if (!parent) return; // pre-boot stray — nothing is watched yet
+  if (!parent) return "pre-boot"; // pre-boot stray — nothing is watched yet
   // Same perimeter as live messages: the team channel + its threads only.
   const inRoot = interaction.channelId === parent.id;
   let threadName: string | null = null;
@@ -2096,7 +2274,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       await interaction
         .reply({ content: "This channel isn't watched by the daemon — use the team channel or one of its threads.", ephemeral: true })
         .catch((err) => log(`slash venue ephemeral failed: ${errText(err)}`));
-      return;
+      return "foreign-channel";
     }
     threadName = ch.name;
     threadId = ch.id;
@@ -2107,7 +2285,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
     await interaction
       .reply({ content: renderStatusCard(statusFacts()), ephemeral: true })
       .catch((err) => log(`slash status ephemeral failed: ${errText(err)}`));
-    return;
+    return "status";
   }
   if (sub === "ask") {
     // Trigger allowlist — API identity only, the same classes isTrigger uses.
@@ -2116,13 +2294,13 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       await interaction
         .reply({ content: "You're not on this daemon's trigger allowlist.", ephemeral: true })
         .catch((err) => log(`slash ask refusal ephemeral failed: ${errText(err)}`));
-      return;
+      return "refused";
     }
     if (threadName && config.pausedThreads.some((n) => n.toLowerCase() === threadName!.toLowerCase())) {
       await interaction
         .reply({ content: "circuit breaker: this thread is paused (machine-safety). Triggers refused until unpaused.", ephemeral: true })
         .catch((err) => log(`slash ask circuit-breaker ephemeral failed: ${errText(err)}`));
-      return;
+      return "paused";
     }
     const text = interaction.options.getString("text", true).trim();
     // Door tripwires: leak-shape and mass-mention text refuses HERE, never
@@ -2133,7 +2311,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       await interaction
         .reply({ content: leakRefusal(leakKinds), ephemeral: true })
         .catch((err) => log(`slash ask leak-refusal ephemeral failed: ${errText(err)}`));
-      return;
+      return "leak-refused";
     }
     const mass = findMassMentions(text);
     if (mass.length > 0) {
@@ -2141,13 +2319,13 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
       await interaction
         .reply({ content: massMentionRefusal(), ephemeral: true })
         .catch((err) => log(`slash ask mass-mention refusal ephemeral failed: ${errText(err)}`));
-      return;
+      return "mass-mention-refused";
     }
     if (queue.length >= MAX_QUEUE) {
       await interaction
         .reply({ content: "Queue is full — try again once the current backlog drains.", ephemeral: true })
         .catch((err) => log(`slash ask queue-full ephemeral failed: ${errText(err)}`));
-      return;
+      return "queue-full";
     }
     // Ask-class trigger: the interaction identity is API-verified human, so it
     // carries human provenance and never coalesces (two deliberate asks are
@@ -2173,9 +2351,10 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction): Pro
         ephemeral: true,
       })
       .catch((err) => log(`slash ask ack ephemeral failed: ${errText(err)}`));
-    return;
+    return "queued";
   }
   log(`slash: unknown subcommand "${sub}" — ignored`);
+  return "unknown-subcommand";
 }
 
 /** A decided ask becomes a HUMAN-priority trigger: the clicker passed the

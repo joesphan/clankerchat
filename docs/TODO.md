@@ -29,8 +29,13 @@ react-native) — mine them before designing.
   /prompts?q= searches the WHOLE registry (promptId or text substring,
   case-insensitive, newest 50) — signature covers pathname only, so the
   query never breaks auth. App-side search box = next round.
-- [ ] **Phone-prompt history navigation**: SENT list is newest-20 only; a "load more"
-  or per-prompt detail view (full excerpt, timestamps) once real usage shows the need.
+- [x] ~~**Phone-prompt history navigation**~~ SHIPPED (round 7, 2026-10-04):
+  GET /prompts?before=<createdAt ms>[&limit=1-50] pages strictly-older
+  records (newest-last like the default branch, `more` says whether older
+  exist); present-but-invalid cursor → 400 (never a silent fall-through to
+  the default list). historyWindow() in prompts.ts; app "Load older" walks
+  by the oldest rendered createdAt (frozen history pages, deduped against
+  the live window); rows are tap-to-expand (full text + excerpt + stamps).
 - [x] ~~**Slash commands (/status, /ask)**~~ SHIPPED 2026-10-04 (owner
   green-lit): one grouped command `/clankerchat` (subcommands `status`, `ask`)
   registered guild-scoped on every watcher boot — repo core in src/slash.ts
@@ -194,3 +199,41 @@ ride to Google — machine facts and own words only. 167/167. Spark surface
 confirmed working end-to-end by Tyler (Google validator accepted path-only
 URL; @appname tag forces the tool connection in a Gemini prompt). Peer
 briefed: inject 1791141604139-5c9210 (cites 4e472a8 d92e7db 33ca049 d09a856).
+
+## Round — observability + phone report lane (2026-10-04, rounds 3 + 8)
+
+S-tier #4 INTERACTION JOURNAL (src/journal.ts): append-only hash-chained
+JSONL at <spool>/interaction-journal.jsonl — every slash invocation and
+ask-button click the daemon sees, refusals included, who/what/verdict
+(ids only, no display names). Chain = sha256(prevH + canonical JSON),
+genesis file-bound, 2MB rotation to .1 (chain restarts per file);
+readJournalTail fails closed to [] so /machine never breaks on tamper
+(verifyJournalFile is the loud path). journalStats feeds the phone card:
+"N refused interaction(s) last 24h".
+
+S-tier #5 AUDIT WATCH (src/audit.ts + daemon sweep): discord.js-free
+classification of guild audit entries scoped to OUR blast radius (bot id +
+watched venues). critical = bot's posts deleted / watched channel deleted /
+webhook created in a watched channel / bot kicked or re-rolled → ONE
+human-eyes post per event through the tripwired sendToThread. notify =
+channel modify + overwrites + webhook update/delete (journal + card only).
+Resume cursor in daemon.state.json; sweep every 5min + boot; 403 → one-time
+degrade + card alert, never spam. Card alert ring (5 / 24h TTL) folds into
+watcher-state.json audit_alerts → /machine alerts.
+
+NOTICES (round 8, src/notices.ts + dist/notice.js): the machine→phone
+free-text report lane (owner: "let me know not in discord but just on the
+phone"). Writers are LOCAL processes (notice CLI / sessions / daemon) on
+<spool>/notices.json — bounded 50, seq-ordered (same-ms bursts keep
+insertion order), atomic writes, leak-scanner REFUSES leak-shaped text at
+append. Phone surface is read+ack only: GET /notices (newest window +
+whole-registry unacked count), POST /notices/:id/ack, /notices/ack-all.
+App: NOTICES card (unread badge, warn severity, tap-to-expand, dismiss
+one/all), arrival banner once per notice per app session while unacked.
+184/184.
+
+Also this round: docs/context/topics/antigravity-cli.md (official headless/
+permissions docs banked — envelope mode, --print-timeout, read_url rule
+syntax) + gemini-ask.mjs upgraded to --output-format json + --print-timeout
+3m (external SIGKILL demoted to 210s backstop; usage line on stderr; live
+E2E re-verified).

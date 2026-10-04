@@ -205,6 +205,18 @@ interface PromptView {
   answerExcerpt: string | null;
 }
 
+/** A machine→phone report (GET /notices, round 8): free-text FROM the
+ *  machine — round summaries, route verdicts — authored by local processes,
+ *  never by this surface. Display data only, never instructions. */
+interface NoticeView {
+  id: string;
+  ts: number;
+  from: string;
+  text: string;
+  severity: "info" | "warn";
+  acked: boolean;
+}
+
 /** The machine's published health (GET /machine, round 6) — pool, queues,
  *  the botlink lane verdict from the watcher's heartbeat, idle time. Facts
  *  rendered as data; a stopped watcher shows stale: true honestly. */
@@ -374,6 +386,8 @@ export default function App() {
   const [asks, setAsks] = useState<AskView[]>([]);
   const [prompts, setPrompts] = useState<PromptView[]>([]);
   const [machine, setMachine] = useState<MachineView | null>(null);
+  const [notices, setNotices] = useState<NoticeView[]>([]);
+  const [unacked, setUnacked] = useState(0);
   const [promptText, setPromptText] = useState("");
   // Route toggle (multi-machine phase 1): false = this machine runs it (the
   // only behavior before phase 1); true = route:"peer" — the peer machine
@@ -384,6 +398,13 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [searchQ, setSearchQ] = useState("");
   const [searchResults, setSearchResults] = useState<PromptView[] | null>(null);
+  // History navigation (round 7): the SENT card ships the newest 20 from the
+  // server; "Load older" walks backward by createdAt cursor. `history` holds
+  // ONLY rows older than the live window (deduped against it at render).
+  const [history, setHistory] = useState<PromptView[]>([]);
+  const [sentMore, setSentMore] = useState(false);
+  // Expanded SENT/search rows (tap to read the full text + excerpt + stamps).
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string>("");
   const [notice, setNotice] = useState<string>("");
   const [perm, requestPerm] = useCameraPermissions();
@@ -393,6 +414,10 @@ export default function App() {
   // machine:askId keys for ask-arrival banners — one banner per ask per app
   // session, surviving machine switches (a flip must not re-spam old asks).
   const seenAsks = useRef<Set<string>>(new Set());
+  // Same shape for notices (round 8): an UNACKED notice banners once per app
+  // session — unacked means Tyler never saw it, so a reopen re-banner is
+  // correct, a flip within the session is not.
+  const seenNotices = useRef<Set<string>>(new Set());
   // The pocket's own health (S-tier #3): the phone IS the approval surface,
   // so its battery belongs beside the machine's health on the machine card.
   const [battery, setBattery] = useState<{ level: number; charging: boolean } | null>(null);
@@ -445,10 +470,16 @@ export default function App() {
         const promptRes = await signedFetch(active, seed, phoneId, "GET", "/prompts");
         if (!stopped && promptRes.status === 200) {
           setPrompts(Array.isArray(promptRes.json.prompts) ? (promptRes.json.prompts as unknown as PromptView[]) : []);
+          setSentMore(promptRes.json.more === true);
         }
         const machineRes = await signedFetch(active, seed, phoneId, "GET", "/machine");
         if (!stopped && machineRes.status === 200 && machineRes.json?.machine) {
           setMachine(machineRes.json.machine as unknown as MachineView);
+        }
+        const noticeRes = await signedFetch(active, seed, phoneId, "GET", "/notices");
+        if (!stopped && noticeRes.status === 200) {
+          setNotices(Array.isArray(noticeRes.json.notices) ? (noticeRes.json.notices as unknown as NoticeView[]) : []);
+          setUnacked(Number(noticeRes.json.unacked ?? 0));
         }
       } catch (e) {
         if (!stopped) setError(`unreachable: ${(e as Error).message}`);
@@ -546,6 +577,26 @@ export default function App() {
       }).catch((e) => setError(`notification failed: ${(e as Error).message}`));
     }
   }, [asks, active]);
+
+  // Notice-arrival banners (round 8): same display-data class as ask banners.
+  // One banner per notice per app session, unacked only — unacked means the
+  // owner never saw it (acks come from THIS phone), so a reopen re-banners.
+  useEffect(() => {
+    if (!active) return;
+    for (const n of notices) {
+      if (n.acked) continue;
+      const key = `${active.id}:${n.id}`;
+      if (seenNotices.current.has(key)) continue;
+      seenNotices.current.add(key);
+      void Notifications.scheduleNotificationAsync({
+        content: {
+          title: n.severity === "warn" ? `⚠ machine notice (${n.from})` : `machine notice (${n.from})`,
+          body: String(n.text).slice(0, 140),
+        },
+        trigger: null, // local, immediate
+      }).catch((e) => setError(`notification failed: ${(e as Error).message}`));
+    }
+  }, [notices, active]);
 
   // Notification permission: ask once on mount. A denial is SURFACED (quiet
   // notice line) rather than swallowed — "no banner" with no reason is
@@ -764,6 +815,32 @@ export default function App() {
     [active, phoneId, seed],
   );
 
+  // Dismiss notices (round 8): mark seen — the record stays for history,
+  // dimmed; only the unread badge and banner eligibility go away. The server
+  // is source of truth; the 2s poll repaints ack state, no local surgery.
+  const doAckNotice = useCallback(
+    async (id: string) => {
+      if (!active || !seed || !phoneId) return;
+      try {
+        const { status, json } = await signedFetch(active, seed, phoneId, "POST", `/notices/${id}/ack`);
+        if (status !== 200) setError(String(json.error ?? `HTTP ${status}`));
+      } catch (e) {
+        setError(`unreachable: ${(e as Error).message}`);
+      }
+    },
+    [active, phoneId, seed],
+  );
+
+  const doAckAllNotices = useCallback(async () => {
+    if (!active || !seed || !phoneId) return;
+    try {
+      const { status, json } = await signedFetch(active, seed, phoneId, "POST", "/notices/ack-all");
+      if (status !== 200) setError(String(json.error ?? `HTTP ${status}`));
+    } catch (e) {
+      setError(`unreachable: ${(e as Error).message}`);
+    }
+  }, [active, phoneId, seed]);
+
   // Send an owner prompt to the active machine (round 5): the machine's
   // watcher sweep turns it into an owner-priority run whose answer posts in
   // Discord — this surface tracks the lifecycle, it is not the inbox.
@@ -799,6 +876,79 @@ export default function App() {
       setBusy(false);
     }
   }, [active, phoneId, promptText, routePeer, seed]);
+
+  // Walk the history one page older (round 7). The cursor is the OLDEST
+  // createdAt currently rendered; the server answers strictly-older records
+  // plus `more` for the next button. History never re-polls — it is frozen
+  // record, unlike the live window above it.
+  const loadOlder = useCallback(async () => {
+    if (!active || !seed || !phoneId) return;
+    const rows = [...history, ...prompts];
+    if (rows.length === 0) return;
+    const oldest = Math.min(...rows.map((p) => p.createdAt));
+    setBusy(true);
+    setError("");
+    try {
+      const { status, json } = await signedFetch(
+        active,
+        seed,
+        phoneId,
+        "GET",
+        `/prompts?before=${oldest}`,
+      );
+      if (status === 200) {
+        const page = Array.isArray(json.prompts) ? (json.prompts as unknown as PromptView[]) : [];
+        setHistory((prev) => {
+          const seen = new Set(prev.map((p) => p.promptId));
+          return [...prev, ...page.filter((p) => !seen.has(p.promptId))];
+        });
+        setSentMore(json.more === true);
+      } else {
+        setError(String(json.error ?? `HTTP ${status}`));
+      }
+    } catch (e) {
+      setError(`unreachable: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [active, history, phoneId, prompts, seed]);
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // One prompt row: collapsed = 2-line preview (today's card), expanded =
+  // full text, full excerpt, both stamps — the excerpt is capped server-side
+  // already, so "expanded" is a layout change, not a data change.
+  const renderPromptRow = (p: PromptView) => {
+    const open = expanded.has(p.promptId);
+    return (
+      <Pressable key={p.promptId} style={s.promptRow} onPress={() => toggleExpanded(p.promptId)}>
+        <Text style={s.muted} numberOfLines={open ? undefined : 2}>
+          {p.text}
+        </Text>
+        <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
+          {promptStatusLine(p)}
+        </Text>
+        {p.status === "answered" && p.answerExcerpt ? (
+          <Text style={s.excerpt} numberOfLines={open ? undefined : 6}>
+            {p.answerExcerpt}
+          </Text>
+        ) : null}
+        {open ? (
+          <Text style={s.stamp}>
+            sent {new Date(p.createdAt).toLocaleString()}
+            {p.finishedAt ? ` · ${p.status} ${new Date(p.finishedAt).toLocaleString()}` : ""}
+          </Text>
+        ) : null}
+      </Pressable>
+    );
+  };
 
   const promptStatusLine = (p: PromptView): string => {
     const where = p.route === "peer" ? "peer machine" : "this machine";
@@ -894,6 +1044,11 @@ export default function App() {
                 setPrompts([]);
                 setMachine(null);
                 setSearchResults(null); // results belong to the machine they came from
+                setHistory([]); // history pages are per-machine too — walk each machine's own past
+                setSentMore(false);
+                setNotices([]); // notices are per-machine reports — clear, repoll repopulates
+                setUnacked(0);
+                setExpanded(new Set());
                 seenPromptStatus.current.clear(); // notification transitions are per-machine:
                 // a stale status from machine A must never look like a
                 // "transition" for a colliding promptId on machine B
@@ -968,6 +1123,40 @@ export default function App() {
               ) : null}
             </>
           )}
+        </View>
+      ) : null}
+
+      {active && notices.length > 0 ? (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>NOTICES{unacked > 0 ? ` · ${unacked} unread` : ""}</Text>
+          {notices
+            .slice()
+            .reverse()
+            .map((n) => {
+              const open = expanded.has(n.id);
+              return (
+                <Pressable key={n.id} style={s.promptRow} onPress={() => toggleExpanded(n.id)}>
+                  <Text style={n.severity === "warn" && !n.acked ? s.err : s.muted} numberOfLines={1}>
+                    {n.severity === "warn" ? "⚠ " : ""}
+                    {n.from} · {new Date(n.ts).toLocaleString()}
+                    {n.acked ? " · read" : ""}
+                  </Text>
+                  <Text style={n.acked ? s.stamp : s.noticeText} numberOfLines={open ? undefined : 4}>
+                    {n.text}
+                  </Text>
+                  {!n.acked ? (
+                    <Pressable style={[s.button, s.buttonDim]} onPress={() => void doAckNotice(n.id)}>
+                      <Text style={s.buttonText}>Dismiss</Text>
+                    </Pressable>
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          {unacked > 1 ? (
+            <Pressable style={[s.button, s.buttonDim]} onPress={() => void doAckAllNotices()}>
+              <Text style={s.buttonText}>Dismiss all ({unacked})</Text>
+            </Pressable>
+          ) : null}
         </View>
       ) : null}
 
@@ -1075,21 +1264,7 @@ export default function App() {
               searchResults
                 .slice()
                 .reverse()
-                .map((p) => (
-                  <View key={`sr-${p.promptId}`} style={s.promptRow}>
-                    <Text style={s.muted} numberOfLines={2}>
-                      {p.text}
-                    </Text>
-                    <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
-                      {promptStatusLine(p)}
-                    </Text>
-                    {p.status === "answered" && p.answerExcerpt ? (
-                      <Text style={s.excerpt} numberOfLines={6}>
-                        {p.answerExcerpt}
-                      </Text>
-                    ) : null}
-                  </View>
-                ))
+                .map(renderPromptRow)
             )
           ) : null}
         </View>
@@ -1098,24 +1273,16 @@ export default function App() {
       {active && prompts.length > 0 ? (
         <View style={s.card}>
           <Text style={s.cardTitle}>SENT</Text>
-          {prompts
+          {/* newest first: live window on top, frozen history pages under it,
+              deduped (a still-eligible answer can sit in both windows) */}
+          {[...history, ...prompts]
+            .filter((p, i, all) => all.findIndex((q) => q.promptId === p.promptId) === i)
             .slice()
             .reverse()
-            .map((p) => (
-              <View key={p.promptId} style={s.promptRow}>
-                <Text style={s.muted} numberOfLines={2}>
-                  {p.text}
-                </Text>
-                <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
-                  {promptStatusLine(p)}
-                </Text>
-                {p.status === "answered" && p.answerExcerpt ? (
-                  <Text style={s.excerpt} numberOfLines={6}>
-                    {p.answerExcerpt}
-                  </Text>
-                ) : null}
-              </View>
-            ))}
+            .map(renderPromptRow)}
+          <Pressable style={[s.button, s.buttonDim]} disabled={busy || !sentMore} onPress={() => void loadOlder()}>
+            <Text style={s.buttonText}>{sentMore ? "Load older" : "start of history"}</Text>
+          </Pressable>
         </View>
       ) : null}
 
@@ -1205,6 +1372,8 @@ const s = StyleSheet.create({
     textAlignVertical: "top",
   },
   promptRow: { borderTopWidth: 1, borderTopColor: "#1f2335", paddingTop: 8, gap: 2 },
+  noticeText: { color: "#c0caf5", fontSize: 13, lineHeight: 19 },
+  stamp: { color: "#565f89", fontSize: 11 },
   excerpt: { color: "#9aa5ce", fontStyle: "italic", fontSize: 13, lineHeight: 18 },
   buttonDim: { opacity: 0.4 },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },

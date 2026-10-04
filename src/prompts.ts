@@ -140,6 +140,21 @@ export function listPhonePrompts(spoolDir: string): PromptRecord[] {
   }
 }
 
+/** History window for the phone's "load older" (round 7): the newest
+ *  `limit` records strictly OLDER than `before` (a createdAt cursor), plus
+ *  whether anything older still exists — the caller renders the button or
+ *  the end-of-history line. List must be the registry order (asc). */
+export function historyWindow(
+  list: PromptRecord[],
+  before: number,
+  limit = 20,
+): { records: PromptRecord[]; more: boolean } {
+  const older = list.filter((r) => r.createdAt < before);
+  const clamped = Math.max(1, Math.min(50, limit));
+  const records = older.slice(-clamped);
+  return { records, more: older.length > records.length };
+}
+
 /** A record's rot deadline: routed prompts carry the 30-min lane round-trip
  *  budget, local ones the 15-min claim window. */
 function rotDeadline(rec: PromptRecord): number {

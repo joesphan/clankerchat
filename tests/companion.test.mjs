@@ -546,6 +546,128 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     );
     res = await signed("GET", "/machine");
     assert.equal((await res.json()).machine.stale, true);
+
+    // S-tier #5 (LAST — it leaves card state behind): the audit watch's
+    // live alert lines ride the card from the watcher's state (bounded by
+    // the writer, strings only)
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({
+        active: 0,
+        queued_human: 0,
+        queued_bot: 0,
+        max_concurrent: 2,
+        audit_alerts: ["webhook created in watched channel 1555103465179455488 by user 210949752617959424 (audit 999)", 42],
+        updated: new Date().toISOString(),
+      }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const m2 = (await res.json()).machine;
+    assert.equal(m2.alerts.length, 1, "only the string alert rides, non-strings dropped");
+    assert.match(m2.alerts[0], /webhook created/);
+
+    // S-tier #4: refused interactions in the journal surface as a card alert.
+    // (Written through appendJournal — a hand-forged h makes the chain check
+    // refuse the file, which is exactly what should happen to a forgery.)
+    const { appendJournal } = await import("../dist/journal.js");
+    appendJournal(spool, { ts: Date.now(), kind: "interaction", outcome: "refused", detail: "non-approver click on ask x: user 123" });
+    res = await signed("GET", "/machine");
+    const m3 = (await res.json()).machine;
+    assert.ok(m3.alerts.some((a) => /1 refused interaction/.test(a)), "journal refusal stat rides the card");
+  } finally {
+    listener.close();
+  }
+});
+
+// --- round 8: notices — the machine→phone report lane. The phone surface
+// READS and ACKS only (writers are local processes on the spool file); the
+// wire carries the newest window plus a whole-registry unacked count so the
+// badge never lies when the window is all-read.
+test("notices routes: newest window + honest unacked count, ack one/all, auth", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(path.join(spool), { recursive: true });
+  const listener = startCompanionServer({
+    bind: "127.0.0.1",
+    port: 0,
+    paths: p,
+    spoolDir: spool,
+    store,
+    log: () => {},
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+
+  try {
+    const { appendNotice } = await import("../dist/notices.js");
+
+    // unsigned → 401 (same gate as every signed route)
+    let res = await fetch(base + "/notices");
+    assert.equal(res.status, 401);
+
+    // empty lane → honest empty
+    res = await signed("GET", "/notices");
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { notices: [], unacked: 0 });
+
+    // three reports land (one is a warn)
+    const n1 = appendNotice(spool, { from: "gateway", text: "round 3 landed" });
+    const n2 = appendNotice(spool, { from: "agy-runner", text: "web route used for mectric follow-up" });
+    const n3 = appendNotice(spool, { from: "daemon", text: "audit watch degraded (403)", severity: "warn" });
+
+    // default window: all three, registry order (oldest-first — the app
+    // reverses), unacked counts the WHOLE registry
+    res = await signed("GET", "/notices");
+    let body = await res.json();
+    assert.deepEqual(body.notices.map((n) => n.id), [n1.id, n2.id, n3.id]);
+    assert.equal(body.unacked, 3);
+    assert.equal(body.notices[2].severity, "warn");
+    assert.equal(body.notices[0].acked, false);
+    // minimum wire shape — nothing else rides out
+    assert.deepEqual(Object.keys(body.notices[0]).sort(), ["acked", "from", "id", "severity", "text", "ts"]);
+
+    // limit=2 windows to the newest two; unacked stays 3 (registry-wide)
+    res = await signed("GET", "/notices?limit=2");
+    body = await res.json();
+    assert.deepEqual(body.notices.map((n) => n.id), [n2.id, n3.id]);
+    assert.equal(body.unacked, 3, "badge counts the whole registry, not the window");
+
+    // ack one: 200, idempotent on re-tap, unknown → 404
+    res = await signed("POST", `/notices/${n1.id}/ack`);
+    assert.equal(res.status, 200);
+    res = await signed("POST", `/notices/${n1.id}/ack`);
+    assert.equal(res.status, 200, "re-ack is idempotent");
+    res = await signed("POST", "/notices/ntcdeadbeef/ack");
+    assert.equal(res.status, 404);
+
+    res = await signed("GET", "/notices");
+    body = await res.json();
+    assert.equal(body.unacked, 2);
+    assert.equal(body.notices.find((n) => n.id === n1.id).acked, true);
+    assert.equal(body.notices.find((n) => n.id === n2.id).acked, false);
+
+    // ack-all: only the remaining two
+    res = await signed("POST", "/notices/ack-all");
+    assert.deepEqual(await res.json(), { acked: 2 });
+    res = await signed("GET", "/notices");
+    assert.equal((await res.json()).unacked, 0);
   } finally {
     listener.close();
   }
@@ -806,6 +928,45 @@ test("prompt routes (round 5): send from the phone, list lifecycle, caps and aut
     assert.equal(((await res.json()).prompts).length, 1, "promptId match, case-insensitive");
     res = await signed("GET", "/prompts?q=no-such-thing");
     assert.deepEqual(((await res.json()).prompts), []);
+
+    // ?before=<createdAt> pages OLDER history (round 7): strictly older than
+    // the cursor, newest-last, `more` true until the registry runs out. The
+    // 3-day-old record above is the oldest thing here, so the final page
+    // says more:false.
+    const nowMs = Date.now();
+    for (let i = 0; i < 3; i++) {
+      fs.writeFileSync(
+        path.join(spool, "pending-prompts", `pmthist${i}.json`),
+        JSON.stringify({
+          promptId: `pmthist${i}`,
+          text: `history ${i}`,
+          fp: phone.fingerprint,
+          createdAt: nowMs - (10 + i) * 60_000, // 1, 2, ... minutes ago (i=0 newest)
+          status: "answered",
+          finishedAt: nowMs - (10 + i) * 60_000,
+          exit: 0,
+        }),
+      );
+    }
+    // cursor = pmthist0's createdAt (10 min ago) → strictly older = tuesday,
+    // pmthist2, pmthist1 (registry order is oldest-first, same as the
+    // default branch), more:false (end of registry)
+    res = await signed("GET", `/prompts?before=${nowMs - 10 * 60_000}`);
+    let page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtuesday1", "pmthist2", "pmthist1"]);
+    assert.equal(page.more, false, "no older records exist");
+    // cursor above all of history (8 min ago) → the whole older tail (4
+    // records), and limit=1 windows to the newest of those alone, more:true
+    res = await signed("GET", `/prompts?before=${nowMs - 8 * 60_000}`);
+    page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtuesday1", "pmthist2", "pmthist1", "pmthist0"]);
+    res = await signed("GET", `/prompts?before=${nowMs - 8 * 60_000}&limit=1`);
+    page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmthist0"]);
+    assert.equal(page.more, true, "older records remain under limit");
+    // junk cursor → 400, never a silent fall-through to the default list
+    res = await signed("GET", "/prompts?before=not-a-number");
+    assert.equal(res.status, 400);
   } finally {
     listener.close();
   }
