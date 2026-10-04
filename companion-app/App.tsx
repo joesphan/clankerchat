@@ -195,6 +195,9 @@ interface PromptView {
   promptId: string;
   text: string;
   status: "pending" | "enqueued" | "answered" | "failed" | "expired";
+  /** "peer" = routed (phase 1): the peer machine ran it, the preview echoed
+   *  back over the lane. null/absent = local run (the pre-phase-1 shape). */
+  route?: "peer" | null;
   createdAt: number;
   finishedAt: number | null;
   answerExcerpt: string | null;
@@ -370,6 +373,11 @@ export default function App() {
   const [prompts, setPrompts] = useState<PromptView[]>([]);
   const [machine, setMachine] = useState<MachineView | null>(null);
   const [promptText, setPromptText] = useState("");
+  // Route toggle (multi-machine phase 1): false = this machine runs it (the
+  // only behavior before phase 1); true = route:"peer" — the peer machine
+  // runs it, the outcome echoes back over the lane, and this surface
+  // previews the excerpt like a local answer.
+  const [routePeer, setRoutePeer] = useState(false);
   const [sasInput, setSasInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [searchQ, setSearchQ] = useState("");
@@ -671,6 +679,9 @@ export default function App() {
   // Send an owner prompt to the active machine (round 5): the machine's
   // watcher sweep turns it into an owner-priority run whose answer posts in
   // Discord — this surface tracks the lifecycle, it is not the inbox.
+  // routePeer (phase 1) asks the ACTIVE machine to forward the prompt to its
+  // peer over the lane instead of running it locally; the peer's venue gets
+  // the answer and this surface previews the echoed excerpt.
   const doSendPrompt = useCallback(async () => {
     if (!active || !seed || !phoneId) return;
     const text = promptText.trim();
@@ -679,10 +690,18 @@ export default function App() {
     setError("");
     setNotice("");
     try {
-      const { status, json } = await signedFetch(active, seed, phoneId, "POST", "/prompt", { text });
+      const { status, json } = await signedFetch(active, seed, phoneId, "POST", "/prompt", {
+        text,
+        ...(routePeer ? { route: "peer" as const } : {}),
+      });
       if (status === 200) {
-        setNotice("Sent — the machine picks it up within ~15s; the answer posts in Discord.");
+        setNotice(
+          routePeer
+            ? "Sent to the peer machine — it runs there (30-min window) and the preview lands here."
+            : "Sent — the machine picks it up within ~15s; the answer posts in Discord.",
+        );
         setPromptText("");
+        setRoutePeer(false); // deliberate per-send: casual asks stay local by default
       } else {
         setError(String(json.error ?? `HTTP ${status}`));
       }
@@ -691,18 +710,23 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [active, phoneId, promptText, seed]);
+  }, [active, phoneId, promptText, routePeer, seed]);
 
   const promptStatusLine = (p: PromptView): string => {
+    const where = p.route === "peer" ? "peer machine" : "this machine";
     switch (p.status) {
       case "pending":
-        return "queued — waiting for the machine's sweep";
+        return `queued — waiting for the machine's sweep`;
       case "enqueued":
-        return "running — answer posts in Discord when done";
+        return p.route === "peer"
+          ? `routed — running on the peer (30-min window); preview lands here`
+          : "running — answer posts in Discord when done";
       case "answered":
-        return p.answerExcerpt ? "answered — preview below, full answer in Discord" : "answered — check Discord";
+        return p.answerExcerpt
+          ? `answered on ${where} — preview below; full answer in Discord`
+          : `answered on ${where} — check Discord`;
       case "failed":
-        return "run failed — ask again or from Discord";
+        return `run failed on ${where} — ask again or from Discord`;
       case "expired":
         return "never picked up — machine's delivery sweep was down";
     }
@@ -892,6 +916,21 @@ export default function App() {
             placeholder="What should the machine work on?"
             placeholderTextColor="#565f89"
           />
+          <View style={s.row}>
+            <Text style={s.muted}>run on:</Text>
+            <Pressable
+              style={[s.routeChip, !routePeer ? s.routeChipOn : null]}
+              onPress={() => setRoutePeer(false)}
+            >
+              <Text style={[s.routeChipText, !routePeer ? s.routeChipTextOn : null]}>this machine</Text>
+            </Pressable>
+            <Pressable
+              style={[s.routeChip, routePeer ? s.routeChipOn : null]}
+              onPress={() => setRoutePeer(true)}
+            >
+              <Text style={[s.routeChipText, routePeer ? s.routeChipTextOn : null]}>peer machine</Text>
+            </Pressable>
+          </View>
           <Pressable
             style={[s.button, (!promptText.trim() || busy) ? s.buttonDim : null]}
             disabled={!promptText.trim() || busy}
@@ -900,8 +939,9 @@ export default function App() {
             <Text style={s.buttonText}>Send</Text>
           </Pressable>
           <Text style={s.muted}>
-            Same trust as Approve up there — the machine runs it as an owner request and answers
-            in Discord (your app pings you).
+            {routePeer
+              ? "Routed (phase 1): the peer machine runs it and answers in its own venue; the preview echoes back here within 30 min."
+              : "Same trust as Approve up there — the machine runs it as an owner request and answers in Discord (your app pings you)."}
           </Text>
         </View>
       ) : null}
@@ -1081,6 +1121,13 @@ const s = StyleSheet.create({
   chip: { backgroundColor: "#24283b", borderRadius: 999, paddingHorizontal: 14, paddingVertical: 8 },
   chipActive: { backgroundColor: "#7aa2f7" },
   chipAdd: { borderWidth: 1, borderColor: "#414868" },
+  // Route toggle (phase 1): cyan-outline idle, cyan-filled active — visually
+  // distinct from the machine-select chips (blue) so "WHERE it runs" never
+  // reads as "WHICH machine you're talking to".
+  routeChip: { borderWidth: 1, borderColor: "#414868", borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
+  routeChipOn: { borderColor: "#2ac0de", backgroundColor: "#2ac0de" },
+  routeChipText: { color: "#c0caf5", fontSize: 12 },
+  routeChipTextOn: { color: "#1a1b26", fontWeight: "600" },
   chipText: { color: "#c0caf5", fontSize: 13 },
   ghost: { padding: 8 },
   ghostText: { color: "#7aa2f7", fontSize: 14 },

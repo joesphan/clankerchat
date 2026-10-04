@@ -1,14 +1,14 @@
 ---
-title: Multi-machine prompt routing (design draft)
+title: Multi-machine prompt routing (design + phase 1 shipped our side)
 tags: [prompts, phone, botlink, cross-machine, design]
 updated: 2026-10-04
 owner: tjbtiller
 ---
 
 Cross-referencing and ROUTING phone prompts across the two machines (owner
-green-lit 2026-10-04, design-first per TODO). This is a DRAFT for bilateral
-review — joesp-desktop's input wanted before any code: both sides must ship
-halves for any phase past 0.
+green-lit 2026-10-04, design-first per TODO). Phase 1 is DECIDED (owner
+delegated the three picks, 2026-10-04 — channel post 1556355104607707247)
+and shipped our half (0e5c4ea); the peer ports their half per the fork law.
 
 ## Problem
 
@@ -28,7 +28,17 @@ never learns what happened anywhere else. Two distinct gaps:
 run 12m ago`. App-side display change only; no registry shape, no new verbs.
 SHIP INDEPENDENTLY of the rest.
 
-## Phase 1 (the registry shape): optional route hint + outcome echo
+## Phase 1 (the registry shape): optional route hint + outcome echo — DECIDED + SHIPPED OUR SIDE (0e5c4ea)
+
+Decisions (owner-delegated 2026-10-04, channel post 1556355104607707247):
+(a) `prompt-outcome` verb ACCEPTED, applied by the existing 15s delivery
+sweep — no new loop, no new listener; (b) routed answers EXCERPT-ONLY: the
+answer posts in the ANSWERING machine's venue, the asking phone previews
+it, no cross-post; (c) routed-expiry 30 MINUTES — one whole-lifecycle
+budget (pending expiry AND stuck-enqueued rot both key off it, so a
+slow-but-healthy peer survives while a dead one fails honestly).
+
+As shipped (0e5c4ea + machine-local watcher wiring):
 
 PromptRecord gains an optional field:
 
@@ -49,8 +59,19 @@ PromptRecord gains an optional field:
 Trust: the echo arrives over the mutual-key SSH lane from the pinned peer —
 same channel as injects today. The excerpt is DISPLAY DATA on the phone
 exactly like local excerpts (never instructions), leak-shape-checked at
-finishPrompt's boundary as usual. promptIds are caller-chosen; the echo only
-ever touches a record WE created (registry miss = drop + journal).
+THREE boundaries (the sending run's exit hook, the lane door, apply).
+promptIds are caller-chosen; the echo only ever touches a record WE created
+AS ROUTED — `applyPeerPromptOutcome` refuses local records outright (class
+separation: a local prompt's outcome is unreachable from the lane, a
+stronger property than peer authentication alone). Registry miss or wrong
+class = drop + journal; the landed outcome file is archived, never unlinked.
+
+Peer's port (rides the merge as always): their watcher's inject consumer
+treats `task.kind === "question" && task.correlation` as a routed run and
+sends `prompt-outcome` on exit; their delivery sweep grows the same route
+branch + outcome intake; their companion surface passes `canRouteToPeer`.
+The verb handler itself is shared code — their daemon speaks it the moment
+they merge.
 
 ## Phase 2 (maybe): cross-reference without routing
 
@@ -59,17 +80,14 @@ store (rejected — registries are deliberately local files) or a lane-served
 peer index (`GET`-class verb returning their newest N prompt outcomes).
 Defer until routing (phase 1) shows real use.
 
-## Open questions for joesp-desktop
+## Open questions for joesp-desktop — ANSWERED 2026-10-04 (owner delegated the picks)
 
-1. `prompt-outcome` verb: agree the daemon accepts it (their side must add
-   the send), and WHERE it lands in their flow (daemon → their watcher's
-   stamp? or direct into our spool as a consumed-style file?).
-2. Should the peer's answer ALSO post into OUR channel root (visible ping
-   for the owner) or only their venue + phone excerpt? Venue law says
-   Discord posts are human-eyes; a cross-post doubles the audience —
-   owner call, leaning excerpt-only.
-3. Expiry semantics when routed: the 15-min pending TTL assumes a local
-  watcher claim; a lane round-trip needs a wider window (30m?).
+1. `prompt-outcome` verb: ACCEPTED. Lands as a daemon-validated file under
+   prompt-outcomes/; the watcher's existing 15s sweep applies it (the
+   decision: same exactly-once claim class as delivery — no new loop).
+2. Peer's answer venue: EXCERPT-ONLY (the leaning won). Their venue keeps
+   the post; our phone previews the excerpt; no cross-post to our root.
+3. Routed expiry: 30 MINUTES — one whole-lifecycle budget, decided above.
 
 ## Non-goals
 
