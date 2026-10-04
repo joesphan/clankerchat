@@ -488,7 +488,14 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
         queued_human: 0,
         queued_bot: 2,
         max_concurrent: 2,
-        lane: { ok: true, bot: "joesp-desktop", pending: 1, injects: 109, probedAt: new Date().toISOString() },
+        lane: {
+          ok: true,
+          bot: "joesp-desktop",
+          pending: 1,
+          injects: 109,
+          probedAt: new Date().toISOString(),
+          peerLastRunAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+        },
         last_run_at: new Date().toISOString(),
         updated: new Date().toISOString(),
       }) + "\n",
@@ -501,11 +508,12 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     assert.equal(m.laneOk, true);
     assert.equal(m.lanePeer, "joesp-desktop");
     assert.equal(m.lanePending, 1);
+    assert.ok(m.lanePeerLastRunAt, "peer last-run rides the heartbeat facts (phase 0)");
     assert.ok(m.lastRunAt);
     // wire shape is fixed — nothing else rides out
     assert.deepEqual(
       Object.keys(m).sort(),
-      ["active", "alerts", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
+      ["active", "alerts", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePeerLastRunAt", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
     );
     assert.deepEqual(m.alerts, [], "healthy spool → no alerts");
 

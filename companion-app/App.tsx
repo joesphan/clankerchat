@@ -211,6 +211,10 @@ interface MachineView {
   laneOk: boolean | null;
   lanePeer: string | null;
   lanePending: number;
+  /** The PEER machine's last-run time (their watcher's state, relayed by our
+   *  lane heartbeat) — cross-machine visibility, phase 0 of the multi-machine
+   *  prompts design. Null when the lane is down or they never ran. */
+  lanePeerLastRunAt: string | null;
   lastRunAt: string | null;
   updated: string | null;
   stale: boolean;
@@ -832,6 +836,11 @@ export default function App() {
                       machine.lanePending > 0 ? ` · ${machine.lanePending} queued on peer` : ""
                     }`}
               </Text>
+              {machine.lanePeerLastRunAt && machine.laneOk ? (
+                <Text style={s.muted}>
+                  peer ran {Math.max(0, Math.round((Date.now() - Date.parse(machine.lanePeerLastRunAt)) / 60000))}m ago
+                </Text>
+              ) : null}
             </>
           )}
         </View>
