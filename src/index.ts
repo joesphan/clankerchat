@@ -1104,6 +1104,9 @@ function registerTools(server: McpServer): void {
           components: buildAskComponents(askId),
         });
         const rec = createPendingAsk(ASK_SPOOL, {
+          askId, // the id baked into the buttons' custom_ids — one mint, or
+          // every click misses the registry ("ask not found"). Live probe
+          // caught the two-mint version 2026-10-04; tests saw only halves.
           question: message,
           channelId: channel.id,
           messageId: sent.id,
