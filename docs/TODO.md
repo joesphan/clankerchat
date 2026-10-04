@@ -29,34 +29,23 @@ react-native) — mine them before designing.
 
 ## Next (design first)
 
-- [ ] **daemon.ts audit findings (fork-1 audit 2026-10-04, PEER-OWNED file —
-  their trigger layer, fixes land via their port or a coordinated PR)**:
-  (2) MED-HIGH no quarantine gate on the trigger path — tagged message in a
-  forbidden channel spawns a fullAuto worker (index.ts tools enforce
-  CLANKER_BLOCKED_IDS/blocked file; daemon.ts has zero refs — the one
-  enforcement layer with no gate); (4) router decisions embed untrusted
-  job.prompt verbatim and the cwd is existsSync-validated only — crafted
-  `{"cwd":"...\\.ssh"}` steers a worker anywhere existing; (5) handleLiveMessage
-  jumps cursors to newest unconditionally — triggers missed during a gateway
-  resume gap are permanently silent (partial gaps undetectable by
-  construction); (6) pollOnce overwrites cursors after its await — a live
-  write regresses → false GATEWAY STALE → re-login → double dispatch; (9)
-  daemon.json written non-atomically + loadConfig fatals on parse failure at
-  boot — one torn write bricks the daemon at start.
-- [ ] **daemon.ts audit findings (fork-1 audit 2026-10-04, PEER-OWNED file —
-  their trigger layer, fixes land via their port or a coordinated PR)**:
-  (2) MED-HIGH no quarantine gate on the trigger path — tagged message in a
-  forbidden channel spawns a fullAuto worker (index.ts tools enforce
-  CLANKER_BLOCKED_IDS/blocked file; daemon.ts has zero refs — the one
-  enforcement layer with no gate); (4) router decisions embed untrusted
-  job.prompt verbatim and the cwd is existsSync-validated only — crafted
-  `{"cwd":"...\\.ssh"}` steers a worker anywhere existing; (5) handleLiveMessage
-  jumps cursors to newest unconditionally — triggers missed during a gateway
-  resume gap are permanently silent (partial gaps undetectable by
-  construction); (6) pollOnce overwrites cursors after its await — a live
-  write regresses → false GATEWAY STALE → re-login → double dispatch; (9)
-  daemon.json written non-atomically + loadConfig fatals on parse failure at
-  boot — one torn write bricks the daemon at start.
+- [x] **daemon.ts audit findings (fork-1 audit 2026-10-04) — ALL FIVE fixed
+  in the joesp-desktop port (audit round 2, 2026-10-04)**: (2) quarantine
+  gate — ChannelBlocklist (src/daemon-guard.ts) mirrors index.ts's
+  CLANKER_BLOCKED_IDS/FILE contract on the trigger path (isTrigger) AND the
+  daemon's own outbound posts (sendToThread); (4) router prompt frames
+  job.prompt as UNTRUSTED data + router-inferred cwds must resolve inside
+  reposRoot (isUnderRoot — existsSync alone was the hole); (5) handleLiveMessage
+  never jumps a cursor past unseen messages — behind-cursor live messages
+  sweep the missed REST range (sweepMissedRange, one sweep per channel,
+  bounded rounds), resume/identify each backstop-sweep every held cursor,
+  redeliveries at/below cursor are skipped (exactly-once); (6) advanceCursor
+  is monotonic everywhere a cursor is written — stale poll positions can no
+  longer regress live writes; (9) daemon.json/daemon.state.json writes are
+  tmp+rename atomic (atomicWrite) + a corrupt daemon.json at boot quarantines
+  a copy and boots DEAF (alive, loud) instead of bricking. Guard logic lives
+  in src/daemon-guard.ts (daemon.ts is an unimportable composition root) —
+  tests in tests/daemon-guard.test.mjs, suite 116/116.
 - [ ] **Components V2 ask cards** (Discord): reference `developers/components/reference.mdx`
   — Container/Section/Text Display (types 9/10/17) would give ask cards real structure
   (question as text display, buttons as section accessory). VERIFY discord.js/raw-REST
