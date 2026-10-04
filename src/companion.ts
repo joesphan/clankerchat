@@ -491,6 +491,47 @@ export function startCompanionServer(opts: {
           } catch {
             /* absent or chain-broken log — the card renders "no paired events" */
           }
+          // Doctor-subset escalations (TODO round): the FAIL lines a pocket
+          // owner can act on — stuck pending prompts + undelivered
+          // phone-decided asks, the same file scans the CLI doctor runs,
+          // inlined so the card turns red the moment delivery health breaks.
+          // Metro/bundle freshness stays CLI-only: a 2s poll must not curl
+          // the dev server.
+          const alerts: string[] = [];
+          try {
+            const pDir = path.join(spoolDir, "pending-prompts");
+            if (fs.existsSync(pDir)) {
+              const stuck = fs.readdirSync(pDir).filter((f) => {
+                if (!f.endsWith(".json")) return false;
+                try {
+                  const rec = JSON.parse(fs.readFileSync(path.join(pDir, f), "utf8"));
+                  return rec.status === "pending" && Date.now() - rec.createdAt > 60_000;
+                } catch {
+                  return false;
+                }
+              });
+              if (stuck.length > 0) alerts.push(`${stuck.length} prompt(s) pending >60s — watcher sweep down?`);
+            }
+          } catch {
+            /* scan failure is not itself an alert */
+          }
+          try {
+            const aDir = path.join(spoolDir, "pending-asks");
+            if (fs.existsSync(aDir)) {
+              const undelivered = fs.readdirSync(aDir).filter((f) => {
+                if (!f.endsWith(".json")) return false;
+                try {
+                  const rec = JSON.parse(fs.readFileSync(path.join(aDir, f), "utf8"));
+                  return rec.status && rec.status !== "pending" && !rec.enqueuedAt && String(rec.decidedBy ?? "").startsWith("companion:");
+                } catch {
+                  return false;
+                }
+              });
+              if (undelivered.length > 0) alerts.push(`${undelivered.length} phone-decided ask(s) undelivered — sweep down?`);
+            }
+          } catch {
+            /* same */
+          }
           // Round 6 (pocket lane dashboard): the watcher's published state —
           // pool, queues, lane verdict, idle time. Facts only, no secrets, no
           // channel ids. An absent or stale file is HONEST on the wire
@@ -514,10 +555,11 @@ export function startCompanionServer(opts: {
                 stale: !(ageMs === ageMs && ageMs < 300_000), // NaN (no timestamp) or >5min → stale
                 laneHealthMs,
                 lanePaired,
+                alerts,
               },
             });
           } catch {
-            return json(res, 200, { machine: { stale: true, laneHealthMs, lanePaired } });
+            return json(res, 200, { machine: { stale: true, laneHealthMs, lanePaired, alerts } });
           }
         }
 

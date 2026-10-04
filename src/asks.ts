@@ -132,12 +132,13 @@ export function buildAskCountdownEdit(
   rec: Pick<AskRecord, "status" | "expiresAt">,
   now = Date.now(),
 ): { content: string; minutesLeft: number } | null {
-  if (rec.status !== "pending" || rec.expiresAt <= now) return null;
+  const clock = askClockLine(rec, now); // shared clock math (also feeds the V2 slot)
+  if (clock === null) return null;
   const minutesLeft = Math.max(1, Math.ceil((rec.expiresAt - now) / 60_000));
   const lines = String(content ?? "")
     .split("\n")
     .filter((l) => !l.startsWith(ASK_COUNTDOWN_PREFIX));
-  lines.push(`${ASK_COUNTDOWN_PREFIX} ${minutesLeft}m left`);
+  lines.push(clock);
   return { content: lines.join("\n"), minutesLeft };
 }
 
@@ -147,6 +148,112 @@ export function buildAskCountdownEdit(
 export function parseAskCustomId(customId: string): { askId: string; action: "approve" | "deny" } | null {
   const m = customId.match(/^ask:([a-z0-9-]+):(approve|deny)$/);
   return m ? { askId: m[1], action: m[2] as "approve" | "deny" } : null;
+}
+
+// ---------------------------------------------------------------------------
+// Components V2 ask cards (TODO round 2026-10-04)
+// ---------------------------------------------------------------------------
+// Under the IS_COMPONENTS_V2 flag the `content` field is DISABLED — all text
+// lives in TextDisplay components — and the flag is permanent per-message, so
+// the two shapes coexist during the transition: asks posted before the switch
+// are legacy (content + action row) and stay legacy forever. Every edit site
+// detects the shape via isAskV2Message and forks; the custom_id contract is
+// IDENTICAL in both shapes, so the click handler never cares.
+
+/** MessageFlags.IsComponentsV2 (1 << 15) — the flag that enables the tree. */
+export const ASK_V2_FLAG = 32_768;
+
+/** Fixed component ids inside the ask container so edits PATCH in place:
+ *  1 = question text display, 2 = clock/decision line, 3 = button row. */
+const ASK_V2_Q_ID = 1;
+const ASK_V2_CLOCK_ID = 2;
+const ASK_V2_ROW_ID = 3;
+
+const ASK_ACCENT = 0x7aa2f7; // the stack's blue — matches the companion app theme
+
+function askV2Row(askId: string, disabled: boolean) {
+  return {
+    type: 1 as const,
+    id: ASK_V2_ROW_ID,
+    components: [
+      { type: 2 as const, style: 3 as const, label: "Approve", custom_id: askCustomId(askId, "approve"), disabled },
+      { type: 2 as const, style: 4 as const, label: "Deny", custom_id: askCustomId(askId, "deny"), disabled },
+    ],
+  };
+}
+
+/** The pending ask as one Container tree: question, clock line, button row.
+ *  text = the ALREADY-COMPOSED display text (sender prefix + lazy note) —
+ *  callers run the same leak/mass-mention tripwires on it they ran on legacy
+ *  content; nothing here re-derives policy. */
+export function buildAskV2Components(
+  askId: string,
+  text: string,
+  opts: { clockLine: string; disabled?: boolean },
+): { type: 17; id: number; accent_color: number; components: unknown[] }[] {
+  return [
+    {
+      type: 17,
+      id: 0,
+      accent_color: ASK_ACCENT,
+      components: [
+        { type: 10, id: ASK_V2_Q_ID, content: String(text ?? "") },
+        { type: 10, id: ASK_V2_CLOCK_ID, content: opts.clockLine },
+        askV2Row(askId, opts.disabled ?? false),
+      ],
+    },
+  ];
+}
+
+/** The "⏳ Xm left" line for a pending ask, or null when terminal (decided /
+ *  past expiry) — shared by the legacy content edit and the V2 clock slot. */
+export function askClockLine(rec: Pick<AskRecord, "status" | "expiresAt">, now = Date.now()): string | null {
+  if (rec.status !== "pending" || rec.expiresAt <= now) return null;
+  return `${ASK_COUNTDOWN_PREFIX} ${Math.max(1, Math.ceil((rec.expiresAt - now) / 60_000))}m left`;
+}
+
+/** True when a message's components are a V2 container tree (edit sites fork
+ *  on this; legacy asks can never gain the flag retroactively). */
+export function isAskV2Message(components: unknown): boolean {
+  return Array.isArray(components) && (components[0] as { type?: number } | undefined)?.type === 17;
+}
+
+/** Tree surgery for V2 ask edits: replace the clock line (id 2) and, when
+ *  `disabled` is set (terminal edits), set the buttons' disabled flag —
+ *  undefined leaves clickability UNTOUCHED, so a countdown tick racing a
+ *  decision edit can never re-enable buttons. The question (id 1) and
+ *  container styling pass through untouched: the posted message stays the
+ *  source of truth for what was asked; only the fuse/status line and
+ *  clickability ever change. Accepts raw JSON (tests) or discord.js
+ *  component classes (watcher): class instances normalize via their own
+ *  toJSON before surgery. */
+export function rebuildAskV2ForEdit(
+  components: unknown[],
+  clockLine: string,
+  opts: { disabled?: boolean },
+): unknown[] {
+  const plain = (node: unknown): Record<string, unknown> => {
+    const n = node as { toJSON?: () => Record<string, unknown> };
+    return typeof n?.toJSON === "function" ? n.toJSON() : { ...(n as Record<string, unknown>) };
+  };
+  return components.map((top) => {
+    const c = plain(top);
+    if (c.type !== 17 || !Array.isArray(c.components)) return c;
+    return {
+      ...c,
+      components: c.components.map((child) => {
+        const ch = plain(child);
+        if (ch.type === 10 && ch.id === ASK_V2_CLOCK_ID) return { ...ch, content: clockLine };
+        if (ch.type === 1 && Array.isArray(ch.components)) {
+          return {
+            ...ch,
+            components: ch.components.map((b) => ({ ...plain(b), ...(opts.disabled === undefined ? {} : { disabled: opts.disabled }) })),
+          };
+        }
+        return ch;
+      }),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------

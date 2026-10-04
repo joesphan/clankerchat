@@ -478,7 +478,7 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     // audit-log truth and rides along (no inject.log here → null/0)
     res = await signed("GET", "/machine");
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { machine: { stale: true, laneHealthMs: null, lanePaired: 0 } });
+    assert.deepEqual(await res.json(), { machine: { stale: true, laneHealthMs: null, lanePaired: 0, alerts: [] } });
 
     // fresh state with lane facts → facts on the wire, minimum shape
     fs.writeFileSync(
@@ -505,8 +505,21 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     // wire shape is fixed — nothing else rides out
     assert.deepEqual(
       Object.keys(m).sort(),
-      ["active", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
+      ["active", "alerts", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
     );
+    assert.deepEqual(m.alerts, [], "healthy spool → no alerts");
+
+    // doctor-subset escalation: a prompt pending >60s turns the card red
+    fs.mkdirSync(path.join(spool, "pending-prompts"), { recursive: true });
+    fs.writeFileSync(
+      path.join(spool, "pending-prompts", "pmstuck99.json"),
+      JSON.stringify({ promptId: "pmstuck99", text: "stuck", fp: phone.fingerprint, createdAt: Date.now() - 120_000, status: "pending" }),
+    );
+    res = await signed("GET", "/machine");
+    const ma = (await res.json()).machine;
+    assert.equal(ma.alerts.length, 1);
+    assert.match(ma.alerts[0], /1 prompt\(s\) pending >60s/);
+    fs.rmSync(path.join(spool, "pending-prompts", "pmstuck99.json"));
 
     // lane health from the audit log: one received→consumed pair → median
     // lands on the wire (injects: Xs median · 1 paired)

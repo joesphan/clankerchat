@@ -51,22 +51,29 @@ react-native) — mine them before designing.
   a copy and boots DEAF (alive, loud) instead of bricking. Guard logic lives
   in src/daemon-guard.ts (daemon.ts is an unimportable composition root) —
   tests in tests/daemon-guard.test.mjs, suite 116/116.
-- [ ] **Components V2 ask cards** (Discord): reference `developers/components/reference.mdx`
-  — Container/Section/Text Display (types 9/10/17) would give ask cards real structure
-  (question as text display, buttons as section accessory). VERIFY discord.js/raw-REST
-  support for the IS_COMPONENTS_V2 message flag in our pinned versions before designing.
-- [ ] **Prompt search on the phone** (app-side): search box wired to GET
-  /prompts?q= (server half shipped — see Now section). Fork shipped theirs
-  (9f5af5a, incl. signedFetch pathname-only) — awaiting lane cite to port.
+- [x] ~~**Components V2 ask cards**~~ SHIPPED: ask posts ride
+  IS_COMPONENTS_V2 (flag 32768, verified in discord.js 14.27 raw-REST) as one
+  Container tree — question (id 1 TextDisplay), fuse (id 2 clock slot), button
+  row (id 3), custom_id contract unchanged. Edit sites fork on shape via
+  isAskV2Message (the flag is permanent per-message, so legacy asks stay
+  legacy forever); rebuildAskV2ForEdit does the tree surgery with
+  disabled-undefined = never re-enable (countdown/decision race closed).
+  Decision edits now DISABLE the row (was: remove) — both shapes render the
+  same decided card. 123/123.
+- [x] ~~**Prompt search on the phone** (app-side)~~ SHIPPED: FIND card —
+  one-shot search (submit/button, not per-keystroke), results newest-first
+  with status + excerpt; signedFetch signs pathname-only so ?q= rides free.
 - [x] ~~**Ask expiry countdown edit**~~ SHIPPED: buildAskCountdownEdit in
   asks.ts (sentinel-idempotent "⏳ Xm left" line, ceil minutes min 1, null once
   decided/expired) + the watcher's 60s loop PATCHes each pending ask's message
   once a minute with the button row passed back unchanged; the expiry sweep
   owns terminal state, the countdown only decorates it.
   (cherry-picked from fork 19144eb.)
-- [ ] **Doctor → phone**: the doctor's FAIL lines (sweep down, stale bundle) are exactly
-  what the MACHINE card should escalate in red, not just journal text.
-  Fork shipped theirs (7e2305a, /machine `alerts`) — awaiting lane cite to port.
+- [x] ~~**Doctor → phone**~~ SHIPPED: /machine serves `alerts` — the two
+  FAIL lines a pocket owner can act on (stuck pending prompts >60s,
+  phone-decided asks undelivered), same file scans as the CLI doctor,
+  inlined per-poll and rendered red as ⚠ lines. Metro/bundle freshness
+  stays CLI-doctor-only (a 2s poll must not curl the dev server).
 
 ## Ideas (parked — owner decision or bigger design)
 

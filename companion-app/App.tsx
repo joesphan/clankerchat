@@ -214,6 +214,8 @@ interface MachineView {
    *  audit log (chain-verified server-side). Null = no paired events. */
   laneHealthMs: number | null;
   lanePaired: number;
+  /** Doctor-subset FAIL lines (delivery health) — rendered in red. */
+  alerts: string[];
 }
 
 const K_SEED = "cc.seed";
@@ -260,10 +262,12 @@ async function signedFetch(
   await gate;
 
   const body: Bytes = method === "GET" ? new Uint8Array(0) : utf8(JSON.stringify(bodyObj ?? {}));
+  // The server signs the PATHNAME only — a query string (GET /prompts?q=…)
+  // must never enter the signed message.
   const msg = lenDelim(
     "clanker-companion-v1",
     method,
-    path,
+    path.split("?")[0],
     await sha256hex(body),
     String(counter),
   );
@@ -340,6 +344,8 @@ export default function App() {
   const [promptText, setPromptText] = useState("");
   const [sasInput, setSasInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [searchQ, setSearchQ] = useState("");
+  const [searchResults, setSearchResults] = useState<PromptView[] | null>(null);
   const [error, setError] = useState<string>("");
   const [notice, setNotice] = useState<string>("");
   const [perm, requestPerm] = useCameraPermissions();
@@ -531,6 +537,38 @@ export default function App() {
 
   // Approve/deny a pending ask from the pocket — same signed transport, and
   // the machine's registry records provenance (companion:<phone fp>).
+  const doSearch = useCallback(
+    async () => {
+      if (!active || !seed || !phoneId) return;
+      const q = searchQ.trim();
+      if (!q) {
+        setSearchResults(null);
+        return;
+      }
+      setBusy(true);
+      setError("");
+      try {
+        const { status, json } = await signedFetch(
+          active,
+          seed,
+          phoneId,
+          "GET",
+          `/prompts?q=${encodeURIComponent(q)}`,
+        );
+        if (status === 200) {
+          setSearchResults(Array.isArray(json.prompts) ? (json.prompts as unknown as PromptView[]) : []);
+        } else {
+          setError(String(json.error ?? `HTTP ${status}`));
+        }
+      } catch (e) {
+        setError(`unreachable: ${(e as Error).message}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [active, seed, phoneId, searchQ],
+  );
+
   const doAskDecision = useCallback(
     async (askId: string, verb: "approve" | "deny") => {
       if (!active || !seed || !phoneId) return;
@@ -703,6 +741,13 @@ export default function App() {
       {active && machine ? (
         <View style={s.card}>
           <Text style={s.cardTitle}>MACHINE</Text>
+          {machine.alerts?.length
+            ? machine.alerts.map((a, i) => (
+                <Text key={`alert-${i}`} style={s.err}>
+                  ⚠ {a}
+                </Text>
+              ))
+            : null}
           {machine.lanePaired > 0 && machine.laneHealthMs !== null ? (
             <Text style={s.muted}>
               injects: {(machine.laneHealthMs / 1000).toFixed(1)}s median · {machine.lanePaired} paired
@@ -780,6 +825,61 @@ export default function App() {
             Same trust as Approve up there — the machine runs it as an owner request and answers
             in Discord (your app pings you).
           </Text>
+        </View>
+      ) : null}
+
+      {active ? (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>FIND</Text>
+          <TextInput
+            style={s.input}
+            value={searchQ}
+            onChangeText={setSearchQ}
+            placeholder="text or promptId"
+            placeholderTextColor="#7a8a99"
+            returnKeyType="search"
+            onSubmitEditing={() => void doSearch()}
+          />
+          <View style={s.row}>
+            <Pressable style={[s.button, s.allow]} disabled={busy} onPress={() => void doSearch()}>
+              <Text style={s.buttonText}>Search</Text>
+            </Pressable>
+            {searchResults !== null ? (
+              <Pressable
+                style={[s.button, s.deny]}
+                onPress={() => {
+                  setSearchResults(null);
+                  setSearchQ("");
+                }}
+              >
+                <Text style={s.buttonText}>Clear</Text>
+              </Pressable>
+            ) : null}
+          </View>
+          {searchResults !== null ? (
+            searchResults.length === 0 ? (
+              <Text style={s.muted}>no matches</Text>
+            ) : (
+              searchResults
+                .slice()
+                .reverse()
+                .map((p) => (
+                  <View key={`sr-${p.promptId}`} style={s.promptRow}>
+                    <Text style={s.muted} numberOfLines={2}>
+                      {p.text}
+                    </Text>
+                    <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
+                      {promptStatusLine(p)}
+                    </Text>
+                    {p.status === "answered" && p.answerExcerpt ? (
+                      <Text style={s.excerpt} numberOfLines={6}>
+                        {p.answerExcerpt}
+                      </Text>
+                    ) : null}
+                  </View>
+                ))
+            )
+          ) : null}
         </View>
       ) : null}
 
