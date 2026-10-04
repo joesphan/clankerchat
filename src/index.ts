@@ -47,6 +47,7 @@ import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, buildFileTransfer, resolveBotlinkPeerFromEnv, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "./leaks.js";
 import { newAskId, buildAskComponents, createPendingAsk } from "./asks.js";
+import { listContext, readContext, searchContext } from "./context.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
 const VERSION = "0.1.0";
@@ -1256,6 +1257,86 @@ function registerTools(server: McpServer): void {
         await getOwnMessage(channel.id, message_id, "delete");
         await api().delete(Routes.channelMessage(channel.id, message_id));
         return { deleted: true, message_id };
+      }),
+  );
+
+  // -------------------------------------------------------------------------
+  // openwolf — shared portable context store (owner-asked 2026-10-04; gate
+  // APPROVED by Joe same day). Read-only by design: files change by reviewed
+  // commits, so executing sessions cannot poison shared memory. Safety LAWS
+  // never live here (always-loaded in CLAUDE.md); this is routing tables and
+  // reference detail. See docs/context/ and openwolf-context-server-design.md.
+  // -------------------------------------------------------------------------
+  const CONTEXT_BASE = process.env.CLANKER_CONTEXT_DIR ?? PROJECT_ROOT;
+
+  server.registerTool(
+    "context_list",
+    {
+      title: "List shared context topics",
+      description: [
+        "List the shared cross-machine context topics (docs/context/ in the repo,",
+        "git-synced). Returns slug + title + tags + updated — a few hundred bytes.",
+        "Fetch the one you need with context_read. Safety laws are NOT here;",
+        "they stay in CLAUDE.md.",
+      ].join(" "),
+      inputSchema: {},
+    },
+    () =>
+      guard(async () => {
+        const entries = listContext(CONTEXT_BASE);
+        return {
+          count: entries.length,
+          topics: entries,
+          hint: "context_read <topic> for one file; context_search <query> for line hits.",
+        };
+      }),
+  );
+
+  server.registerTool(
+    "context_read",
+    {
+      title: "Read one shared context topic",
+      description: [
+        "Return exactly one topic file from docs/context/ (front-matter parsed,",
+        "body verbatim). Topic = the slug from context_list. This is shared",
+        "reference detail both machines keep identical — not a place for",
+        "machine-local state.",
+      ].join(" "),
+      inputSchema: {
+        topic: z
+          .string()
+          .regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "topic slug")
+          .describe("Topic slug from context_list (e.g. 'mention-mechanics')."),
+      },
+    },
+    ({ topic }) =>
+      guard(async () => {
+        const doc = readContext(CONTEXT_BASE, topic);
+        if (!doc) {
+          const have = listContext(CONTEXT_BASE).map((e) => e.topic).join(", ") || "(none)";
+          throw new Error(`context: no topic "${topic}". Available: ${have}.`);
+        }
+        return doc;
+      }),
+  );
+
+  server.registerTool(
+    "context_search",
+    {
+      title: "Search shared context topics",
+      description: [
+        "Case-insensitive line search across docs/context/ — filename + line",
+        "number + matched line, capped at 20 hits. Grep, not a search engine:",
+        "if you need semantic recall, list and read instead.",
+      ].join(" "),
+      inputSchema: {
+        query: z.string().min(2).max(200).describe("Substring to find (2+ chars)."),
+      },
+    },
+    ({ query }) =>
+      guard(async () => {
+        const hits = searchContext(CONTEXT_BASE, query);
+        return { query, count: hits.length, hits, ...(hits.length === 0 ? { hint: "No hits — context_list to browse titles/tags." } : {}) };
       }),
   );
 }
