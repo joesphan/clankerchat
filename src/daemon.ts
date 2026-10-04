@@ -70,6 +70,8 @@ import {
   listClaimablePrompts,
   stampPromptEnqueued,
   sweepExpiredPrompts,
+  STUCK_ENQUEUED_MS,
+  sweepStuckEnqueued,
   type PromptRecord,
 } from "./prompts.js";
 
@@ -534,6 +536,11 @@ async function runClaude(
     });
     child.on("error", (err) => {
       log(`spawn error: ${errText(err)} — is claude on PATH for this daemon?`);
+      // Fork audit fix 4: 'error' can fire with no following 'close'
+      // (ENOENT/EACCES — shell itself unspawnable). Settle now instead of
+      // waiting out the hardFail net; settle-once finish() keeps a later
+      // 'close' harmless. Null codes stamp as failure (code ?? 1).
+      finish(null);
     });
     const finish = (code: number | null) => {
       if (settled) return;
@@ -1824,9 +1831,16 @@ async function enqueuePhonePrompt(rec: PromptRecord, parent: TextChannel | NewsC
  *  any async work (the anchor fetch inside enqueuePhonePrompt): a crash after
  *  the claim can lose the run but never double-fire it. Rot first: a pending
  *  record past its TTL means the delivery machinery was down, and the phone
- *  should see "expired", not a spinner. */
+ *  should see "expired", not a spinner — and (fork audit fix 1) an ENQUEUED
+ *  record whose run never stamped its exit rotates to failed, loud, so the
+ *  chip never hangs on "running" forever. */
 async function sweepPhonePrompts(parent: TextChannel | NewsChannel): Promise<void> {
   sweepExpiredPrompts(askSpool());
+  for (const stuck of sweepStuckEnqueued(askSpool())) {
+    log(
+      `phone prompt ${stuck.promptId} STUCK ENQUEUED past ${Math.round(STUCK_ENQUEUED_MS / 60_000)}min — its run never stamped an exit (queue drop / crash between claim and exit / spawn failure); rotated to failed (exit -1)`,
+    );
+  }
   for (const rec of listClaimablePrompts(askSpool())) {
     const claimed = stampPromptEnqueued(askSpool(), rec.promptId);
     if (!claimed) continue; // raced another sweep (or record gone) — not ours
