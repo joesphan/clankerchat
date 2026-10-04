@@ -9,7 +9,8 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSCameraUsageDescription": "Scans the one-time enrollment QR printed on your machine's terminal."
+        "NSCameraUsageDescription": "Scans the one-time enrollment QR printed on your machine's terminal.",
+        "NSFaceIDUsageDescription": "Confirms it's really you before allowing key rotations and ask decisions."
       }
     },
     "android": {
@@ -22,7 +23,15 @@
       "predictiveBackGestureEnabled": false,
       "permissions": ["android.permission.CAMERA"]
     },
-    "plugins": ["expo-camera"],
+    "plugins": [
+      "expo-camera",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Allow $(PRODUCT_NAME) to use Face ID."
+        }
+      ]
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
     }
