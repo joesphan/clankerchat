@@ -613,7 +613,11 @@ function registerTools(server: McpServer): void {
         // Outbound exfil tripwire (OWASP output monitoring): secret SHAPES
         // never leave through the post channel, no matter what the sending
         // session was talked into. Applies to the caption and the attachment.
-        const captionLeaks = findLeakSignals(message);
+        // The caption scan runs on the COMPOSED wire string (withSender'd,
+        // below) — scanning raw `message` here would miss a shape smuggled in
+        // the sender param. Composition order: attachments are scanned first
+        // (cheap early exit), the composed scan runs after withSender.
+        const captionLeaks = findLeakSignals(withSender(sender ?? process.env.CLANKER_NAME, message));
         if (captionLeaks.length > 0) throw new Error(leakRefusal(captionLeaks));
         let attachment: { attachment: string; name: string } | undefined;
         if (file_path) {
@@ -761,6 +765,18 @@ function registerTools(server: McpServer): void {
     ({ name, channel_id, message }) =>
       guard(async () => {
         assertNotProjectMode("create_thread");
+        // Both outbound tripwires on the opening message BEFORE any API work
+        // (2026-10-04 audit: this path had only the mass-mention scan — a
+        // secret shape could ride out as a thread's opening message; and a
+        // late refusal would have already paid for channel fetches or minted
+        // an empty thread). Scan composed.
+        const opening = message ? withSender(process.env.CLANKER_NAME, message) : null;
+        if (opening !== null) {
+          const threadLeaks = findLeakSignals(opening);
+          if (threadLeaks.length > 0) throw new Error(leakRefusal(threadLeaks));
+          const massMentions = findMassMentions(opening);
+          if (massMentions.length > 0) throw new Error(massMentionRefusal());
+        }
         const parentId = resolveChannelId(channel_id, "CLANKER_CHANNEL_ID", "channel_id");
         assertNotBlocked(parentId);
         const parent = await getChatChannel(parentId);
@@ -796,12 +812,9 @@ function registerTools(server: McpServer): void {
               "The bot likely lacks the Create Public Threads permission — see SETUP.md Step 3 (re-invite with the full permissions URL).",
           );
         }
-        if (message) {
-          const content = withSender(process.env.CLANKER_NAME, message);
-          const massMentions = findMassMentions(content);
-          if (massMentions.length > 0) throw new Error(massMentionRefusal());
+        if (opening !== null) {
           // sendMessage pins users-only parsing itself — nothing to pass here.
-          await created.send({ content });
+          await created.send({ content: opening });
         }
         return { thread_id: created.id, name: created.name, existed: false };
       }),

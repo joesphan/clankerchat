@@ -299,3 +299,37 @@ test("unlocked instance: list_channels is not canned-disabled", async () => {
 test.after(() => {
   open.stop();
 });
+
+// --- outbound tripwires on the COMPOSED wire string (2026-10-04 audit) -------
+// The leak scan must cover withSender's output: a shape hidden in the sender
+// param (send) or a thread's opening message (create_thread — previously
+// mass-mention-only) is an exfil path the raw-message scans missed.
+
+test("send: leak shape in the SENDER param is refused (composed-string scan)", async () => {
+  const s = startServer({});
+  await ready(s);
+  const r = await s.call("send", {
+    channel_id: ALLOWED,
+    message: "clean body, the identity is the problem",
+    sender: "stolen-key sk-" + "z".repeat(32),
+  });
+  s.stop();
+  assert.ok(r.isError, "must refuse");
+  assert.match(r.body.error, /^REFUSED:.*secret-shape/);
+});
+
+test("create_thread: leak-shaped opening message refused BEFORE the thread is minted", async () => {
+  const s = startServer({});
+  await ready(s);
+  const r = await s.call("create_thread", {
+    name: "t",
+    channel_id: ALLOWED,
+    message: "here is a github token ghp_" + "a".repeat(36),
+  });
+  s.stop();
+  // REFUSED = the local tripwire fired; any other error means the request got
+  // as far as Discord (dummy token) — i.e. the scan ran too late or not at all.
+  assert.ok(r.isError, "must refuse");
+  assert.match(r.body.error, /^REFUSED:.*secret-shape/);
+  assert.doesNotMatch(r.body.error, /Could not create thread/);
+});
