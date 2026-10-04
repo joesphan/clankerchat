@@ -51,7 +51,7 @@ export interface ContextDoc {
 
 /** Minimal front-matter reader: `---` fenced key: value pairs at byte 0. */
 function parseFrontMatter(raw: string): { meta: Record<string, string>; body: string } {
-  if (!raw.startsWith("---\n")) return { meta: {}, body: raw };
+  if (!raw.startsWith("---\n")) return { meta: {}, body: raw }; // see readStoreText: raw is LF-normalized
   const end = raw.indexOf("\n---\n", 4);
   if (end < 0) return { meta: {}, body: raw };
   const meta: Record<string, string> = {};
@@ -64,6 +64,15 @@ function parseFrontMatter(raw: string): { meta: Record<string, string>; body: st
 
 function storeRoot(baseDir: string): string {
   return path.join(baseDir, "docs", "context");
+}
+
+/** Read one store file as LF-normalized text. Windows checkouts with
+ *  core.autocrlf=true materialize these files CRLF, which would defeat
+ *  the `---\n` front-matter fence (titles fall back to slugs, meta rides
+ *  the body) and drift search line numbers. One normalization point for
+ *  all three surfaces. */
+function readStoreText(file: string): string {
+  return fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
 }
 
 /** All entries across topics/ (and state/, listed for completeness —
@@ -84,7 +93,7 @@ export function listContext(baseDir: string): ContextEntry[] {
       if (!SLUG.test(topic)) continue;
       const file = path.join(root, section, name);
       try {
-        const raw = fs.readFileSync(file, "utf8");
+        const raw = readStoreText(file);
         const { meta } = parseFrontMatter(raw);
         out.push({
           topic,
@@ -109,7 +118,7 @@ export function readContext(baseDir: string, topic: string): ContextDoc | null {
   for (const section of ["topics", "state"] as const) {
     const file = safeFileForSection(baseDir, section, topic);
     if (!file || !fs.existsSync(file)) continue;
-    const raw = fs.readFileSync(file, "utf8");
+    const raw = readStoreText(file);
     const { meta, body } = parseFrontMatter(raw);
     return {
       topic,
@@ -143,7 +152,7 @@ export function searchContext(
     const file = path.join(storeRoot(baseDir), entry.section, `${entry.topic}.md`);
     let raw: string;
     try {
-      raw = fs.readFileSync(file, "utf8");
+      raw = readStoreText(file);
     } catch {
       continue;
     }

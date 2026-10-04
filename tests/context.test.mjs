@@ -8,9 +8,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { listContext, readContext, searchContext } from "../dist/context.js";
 
-const REPO = path.resolve(new URL(".", import.meta.url).pathname, "..");
+// Windows: URL.pathname is "/C:/..." which win32 resolve mangles — fileURLToPath
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function tmpStore() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "cc-ctx-"));
