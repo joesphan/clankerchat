@@ -417,3 +417,46 @@ cursor: a tag landing in the gap never triggered, and nobody knew.
   advanced to the probe id exactly.
 - Peer note: same class on their daemon host — ports as-is (cursor file +
   fetch-after on ready + emit into the same handler; same fetchActive trap).
+
+## Round 15 — repo-side dist-drift guard: serve + companion self-restart on rebuild (2026-10-04)
+
+Class: rounds 13–14 closed the drift/dead-window hole for the WATCHER host
+only — but `botlink-server` serves from `dist/` too, and both repo-side
+services (lane serve + companion surface) were running stale code after every
+rebuild until a human restarted them. The lane hub and the phone surface had
+no self-update path at all.
+
+- `armDistDriftGuard(label)` in src/botlink-server.ts, wired into BOTH serve
+  flavors (`serve` and `companion --serve`): fingerprints the directory the
+  entry script lives in (`name:mtimeMs:size` per *.js, sorted, joined — same
+  shape as the round-13 watcher guard), and when it changes from boot AND is
+  stable across polls (tsc writes files incrementally), exits 0 for the
+  service manager to revive on the new code. Guard is inert on unreadable
+  dirs (never exits), whole body fail-quiet, and disabled via
+  `CLANKER_BOTLINK_DRIFT_GUARD=0`; poll/stability windows env-tunable
+  (`_DRIFT_POLL_MS`/`_DRIFT_STABLE_MS`) so tests run it at 150ms/400ms.
+- Restart=always drop-ins for both units (the round-13 trap: the base
+  Restart=on-failure leaves a deliberate exit(0) DEAD). companion RestartSec=3
+  (stateless surface, phone re-polls at 2s), botlink RestartSec=5 (lane
+  injects queue in the spool behind it).
+- Tests: tests/drift.test.mjs — offline, pointed at a COPY of dist/
+  (`dist-drifttest/`, now gitignored) so fingerprint touches never bounce the
+  production services. Serves bind `127.0.0.1:0` (ephemeral). Covers:
+  serve drift-exits clean with both log lines; guard=0 stays up on the same
+  touch; companion flavor carries the same labeled guard.
+- parsePort bug class, caught live by those tests: the old
+  `Number(x) || default` sent an explicit ":0" (ephemeral request) to the
+  DEFAULT port — a test server on ":0" tried to take the production lane port
+  47421 and died EADDRINUSE against the live listener. parsePort() now honors
+  explicit valid ports at all 6 listen sites (serve, pair --arm x2, companion
+  x2, arm-rotate dial).
+- Live-proven full-stack (one build, three guards): rebuild 17:20:37 → both
+  repo guards detect at 17:20:38 → both exit at the 45s mark 17:21:23 →
+  botlink revived (NRestarts 1), companion auto-revival journaled
+  ("Scheduled restart job, restart counter is at 1") at 17:21:26 — a manual
+  restart 2s later reset its counter to 0, which is cosmetic. 190/190.
+- Peer note: repo-side code this time (not watcher-side) — plain merge +
+  rebuild + restart carries the guard on their Windows box, but their units
+  need the SAME Restart=always drop-ins (Task Scheduler or SCM equivalent)
+  or the clean drift exit stays dead. parsePort applies to their tree as-is
+  (same falsy-|| shape at the listen sites).
