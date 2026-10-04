@@ -43,30 +43,33 @@ const APPROVER = "187396435283542016"; // 18-digit snowflake shape
 
 // --- payload shape -----------------------------------------------------------
 
-test("buildAskComponents: one action row, Approve green + Deny red, custom_ids follow the contract", () => {
+test("buildAskComponents: one action row, Approve green + Deny red + YOLO blurple, custom_ids follow the contract", () => {
   const askId = newAskId();
   const rows = buildAskComponents(askId);
   assert.equal(rows.length, 1);
   const row = rows[0];
   assert.equal(row.type, 1); // ACTION_ROW
-  assert.equal(row.components.length, 2);
-  const [approve, deny] = row.components;
+  assert.equal(row.components.length, 3);
+  const [approve, deny, yolo] = row.components;
   assert.equal(approve.type, 2); // BUTTON
   assert.equal(approve.style, 3); // Success (green)
   assert.equal(approve.label, "Approve");
   assert.equal(deny.style, 4); // Danger (red)
   assert.equal(deny.label, "Deny");
+  assert.equal(yolo.style, 1); // Primary (blurple)
+  assert.equal(yolo.label, "YOLO");
   // custom_id contract: ask:<id>:<action>, ≤100 chars (Discord's cap)
   assert.equal(approve.custom_id, `ask:${askId}:approve`);
   assert.equal(deny.custom_id, `ask:${askId}:deny`);
-  assert.ok(approve.custom_id.length <= 100 && deny.custom_id.length <= 100);
-  assert.ok(!("disabled" in approve) && !("disabled" in deny), "live buttons are not disabled");
+  assert.equal(yolo.custom_id, `ask:${askId}:yolo`);
+  assert.ok(approve.custom_id.length <= 100 && yolo.custom_id.length <= 100);
+  assert.ok(!("disabled" in approve) && !("disabled" in deny) && !("disabled" in yolo), "live buttons are not disabled");
 });
 
-test("buildDisabledAskComponents: same row, both buttons disabled, custom_ids intact", () => {
+test("buildDisabledAskComponents: same row, all buttons disabled, custom_ids intact", () => {
   const askId = newAskId();
   const [row] = buildDisabledAskComponents(askId);
-  assert.equal(row.components.length, 2);
+  assert.equal(row.components.length, 3);
   for (const b of row.components) {
     assert.equal(b.disabled, true);
     assert.ok(parseAskCustomId(b.custom_id), "disabled custom_id still parses");
@@ -75,10 +78,11 @@ test("buildDisabledAskComponents: same row, both buttons disabled, custom_ids in
 
 // --- custom_id gate ----------------------------------------------------------
 
-test("askCustomId ↔ parseAskCustomId round-trips both actions", () => {
+test("askCustomId ↔ parseAskCustomId round-trips all three actions", () => {
   const askId = newAskId();
   assert.deepEqual(parseAskCustomId(askCustomId(askId, "approve")), { askId, action: "approve" });
   assert.deepEqual(parseAskCustomId(askCustomId(askId, "deny")), { askId, action: "deny" });
+  assert.deepEqual(parseAskCustomId(askCustomId(askId, "yolo")), { askId, action: "yolo" });
 });
 
 test("parseAskCustomId: foreign custom_ids parse to null (never throw, never match)", () => {
@@ -200,11 +204,27 @@ test("listPendingAsks lists every record file (registry view, all statuses)", ()
   assert.deepEqual(ids, [a.askId, b.askId].sort());
 });
 
-test("askDecisionLine renders Approved/Denied with the decider's display name", () => {
+test("askDecisionLine renders Approved/Denied/YOLO'd with the decider's display name", () => {
   const approved = { status: "approved", decidedAt: Date.UTC(2026, 9, 4, 12, 34, 56) };
   const line = askDecisionLine(approved, "fast335xi");
   assert.match(line, /^Approved by fast335xi · 12:34:56Z$/);
   assert.equal(askDecisionLine({ status: "denied", decidedAt: 0 }, "x"), "Denied by x · 00:00:00Z");
+  assert.equal(askDecisionLine({ status: "yolo", decidedAt: 0 }, "x"), "YOLO'd by x · 00:00:00Z");
+});
+
+// --- yolo third verb (owner-approved ask muucxgb9, 2026-10-04) ---------------
+
+test("decideAsk records yolo as a distinct terminal status with the clicker's provenance", () => {
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, { question: "merge now?", channelId: "1", messageId: null, approvers: [APPROVER] });
+  const decided = decideAsk(spool, rec.askId, "yolo", APPROVER);
+  assert.equal(decided.status, "yolo"); // the distinct verb, recorded in the outcome
+  assert.equal(decided.decidedBy, APPROVER);
+  assert.equal(getAsk(spool, rec.askId).status, "yolo");
+  // yolo is decided → not sweepable, clock dead, stampable (delivery contract unchanged)
+  assert.ok(!sweepExpiredAsks(spool, Date.now() + 10_000).some((r) => r.askId === rec.askId));
+  assert.equal(askClockLine(getAsk(spool, rec.askId)), null);
+  assert.ok(stampAskEnqueued(spool, rec.askId).enqueuedAt > 0);
 });
 
 // --- lazy consensus (round 3, owner 2026-10-04: "auto approve and set the duration") ---
@@ -358,6 +378,7 @@ test("ask V2: container tree shape, custom_id law, shape gate", () => {
     [
       ["Approve", "ask:abc123:approve", false],
       ["Deny", "ask:abc123:deny", false],
+      ["YOLO", "ask:abc123:yolo", false],
     ],
     "custom_id contract IDENTICAL to the legacy row — clicks never know the shape",
   );
@@ -386,7 +407,7 @@ test("ask V2: edit surgery — clock swapped, question verbatim, buttons never r
   assert.equal(tc[0].content, "the QUESTION stays byte-exact");
   assert.equal(tc[1].content, "Approved by tyler · 12:00:00Z");
   assert.ok(tc[2].components.every((b) => b.disabled === true));
-  assert.deepEqual(tc[2].components.map((b) => b.custom_id), ["ask:abc123:approve", "ask:abc123:deny"]);
+  assert.deepEqual(tc[2].components.map((b) => b.custom_id), ["ask:abc123:approve", "ask:abc123:deny", "ask:abc123:yolo"]);
   // countdown edit: disabled UNDEFINED must not touch clickability — a tick
   // racing the decision edit can never re-enable buttons
   const disabledTree = rebuildAskV2ForEdit(tree, "x", { disabled: true });

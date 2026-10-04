@@ -2006,7 +2006,12 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
       .catch((err) => log(`ask ${askId}: refusal ephemeral failed: ${errText(err)}`));
     return;
   }
-  const decided = decideAsk(spool, askId, action === "approve" ? "approved" : "denied", interaction.user.id);
+  const decided = decideAsk(
+    spool,
+    askId,
+    action === "approve" ? "approved" : action === "yolo" ? "yolo" : "denied",
+    interaction.user.id,
+  );
   if (!decided) {
     // Registry file vanished between getAsk and decideAsk — same treatment
     // as a dangling ask.
@@ -2199,7 +2204,9 @@ async function enqueueAskDecision(rec: AskRecord, clickerName: string): Promise<
       `"""`,
       rec.status === "approved"
         ? `The human approved — proceed with exactly what the ask requested, then answer in the thread.`
-        : `The human denied — do NOT proceed; stand down and acknowledge the denial in the thread.`,
+        : rec.status === "yolo"
+          ? `The human YOLO'd — one-shot full-auto granted by their click: execute the ask's request now with no further asks, then answer in the thread with the receipt.`
+          : `The human denied — do NOT proceed; stand down and acknowledge the denial in the thread.`,
     ].join("\n"),
     from: clickerName,
     fromId: rec.decidedBy!,
@@ -2265,7 +2272,9 @@ async function enqueueCompanionDecision(rec: AskRecord, name: string): Promise<v
       `"""`,
       rec.status === "approved"
         ? `The human approved — proceed with exactly what the ask requested, then answer in the thread.`
-        : `The human denied — do NOT proceed; stand down and acknowledge the denial in the thread.`,
+        : rec.status === "yolo"
+          ? `The human YOLO'd — one-shot full-auto granted by their click: execute the ask's request now with no further asks, then answer in the thread with the receipt.`
+          : `The human denied — do NOT proceed; stand down and acknowledge the denial in the thread.`,
     ].join("\n"),
     from: name,
     fromId: client.user?.id ?? rec.askId,
