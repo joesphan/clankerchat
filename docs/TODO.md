@@ -47,7 +47,11 @@ react-native) — mine them before designing.
   anywhere (owner call): local-only means the app process must be alive
   (foreground or Android's brief background window); iOS suspension =
   silence until reopen. Header law updated: the no-notifications clause is
-  now scoped to pairing/SAS material.
+  now scoped to pairing/SAS material. VERIFIED ON-DEVICE 2026-10-04 ~17:00Z
+  (owner phone, app foregrounded): enqueued→answered transition → banner.
+  Debugging artifact worth remembering: a status flip that only ADDS terminal
+  fields without changing the status value is a non-transition — the map
+  diffing keys on the status string.
 
 ## Next (design first)
 
