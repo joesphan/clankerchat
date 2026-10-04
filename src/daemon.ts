@@ -54,6 +54,15 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
+import {
+  ATTACHMENT_MAX_BYTES,
+  imageDescriptionLines,
+  imagesCarryTrigger,
+  pickImageAttachments,
+  visionPassPrompt,
+  type PickedAttachment,
+} from "./attachments.js";
+import { shouldHaveStatusLine, statusLine, nextStatusDelayMs } from "./run-progress.js";
 import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
 import { findLeakSignals, findMassMentions, leakRefusal, massMentionRefusal, scanTextOfPost } from "./leaks.js";
@@ -486,6 +495,70 @@ function stopTypingRef(threadId: string): void {
   typing.delete(threadId);
 }
 
+// ---------------------------------------------------------------------------
+// Long-run status line (fork 1a15636, per-machine half): past 4 minutes of a
+// live run, ONE editable "still working — Nm elapsed" message exists; it is
+// edited in place every 5 min and DELETED by the finish path so the answer
+// supersedes it. Fast runs never produce one. Pure thresholds/shape come from
+// run-progress.ts so both machines render identical lines.
+// ---------------------------------------------------------------------------
+
+/** Wrap a long await: call start() before, finish() after. The loop wakes
+ *  exactly on appearance/edit boundaries (nextStatusDelayMs races the
+ *  runDone flag); a send racing the finish-delete loses silently — the
+ *  posting latch lets finish() wait out an in-flight post so an orphan
+ *  "still working" line can never outlive the run. */
+function beginStatusLine(threadId: string, label: string): { start: () => void; finish: () => Promise<void> } {
+  const started = Date.now();
+  let runDone = false;
+  let posting = false;
+  let msgId: string | null = null;
+  const runLoop = async () => {
+    while (!runDone) {
+      await sleep(nextStatusDelayMs(Date.now() - started));
+      if (runDone || !shouldHaveStatusLine(Date.now() - started)) continue;
+      posting = true;
+      try {
+        const line = statusLine(label, Date.now() - started);
+        if (msgId === null) msgId = await sendToThread(threadId, line);
+        else await editThreadMessage(threadId, msgId, line);
+      } catch {
+        // raced the finish-delete (or Discord hiccup) — next boundary retries
+      } finally {
+        posting = false;
+      }
+    }
+  };
+  return {
+    start: () => void runLoop(),
+    finish: async () => {
+      runDone = true;
+      for (let i = 0; i < 100 && posting; i++) await sleep(20); // <=2s latch wait
+      if (msgId !== null) await deleteThreadMessage(threadId, msgId).catch(() => {});
+    },
+  };
+}
+
+/** In-place edit of one of the daemon's own messages (status line only —
+ *  asks own their edits). Registers nothing: the id is already in
+ *  daemonMessageIds from the send. */
+async function editThreadMessage(threadId: string, msgId: string, content: string): Promise<void> {
+  const channel = await client.channels.fetch(threadId, { cache: false });
+  const msg = channel?.isTextBased()
+    ? await channel.messages.fetch({ message: msgId, cache: false })
+    : null;
+  if (!msg) throw new Error("status line message gone");
+  await msg.edit({ content: withSender(process.env.CLANKER_NAME, content) });
+}
+
+async function deleteThreadMessage(threadId: string, msgId: string): Promise<void> {
+  const channel = await client.channels.fetch(threadId, { cache: false });
+  const msg = channel?.isTextBased()
+    ? await channel.messages.fetch({ message: msgId, cache: false })
+    : null;
+  await msg?.delete();
+}
+
 /** Message ids the daemon itself posted (acks, notices). A wake counts as
  *  answered only when a SESSION replies — never the daemon's own messages. */
 const daemonMessageIds = new Set<string>();
@@ -721,6 +794,7 @@ interface Job {
   noCoalesce?: boolean; // a distinct event (ask decision) — never superseded by a same-author re-send
   phonePrompt?: { id: string; anchorId: string }; // round 5: promptId riding to the exit stamp; anchor = newest root message at claim time, the posted-check reference
   canary?: string; // round 6: this run's leak tripwire, kept past runClaude for the exit-hook excerpt recheck
+  images?: PickedAttachment[]; // fork 8dfb5c1: trigger carried pickable image attachments — descriptions ride, files never do
 }
 
 interface RouteDecision {
@@ -892,7 +966,13 @@ async function checkFollowups(): Promise<void> {
   }
 }
 
-function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean, canary: string): string {
+function buildWorkerPrompt(
+  job: Job,
+  cwd: string,
+  sandboxed: boolean,
+  canary: string,
+  imageLines: string[] = [],
+): string {
   const name = process.env.CLANKER_NAME ?? "clankerchat";
   const replyTarget = job.rootChannel
     ? `channel_id "${job.threadId}" (the channel ROOT — not a thread)`
@@ -914,7 +994,129 @@ function buildWorkerPrompt(job: Job, cwd: string, sandboxed: boolean, canary: st
     ``,
     `--- task from Discord user ${job.from} ---`,
     job.prompt,
+    ...(imageLines.length > 0 ? ["", ...imageLines] : []),
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Image intake (fork 8dfb5c1, per-machine half): trigger attachments download
+// into the spool under sanitized names; a scoped one-shot vision pre-pass
+// (claude -p --strict-mcp-config --allowedTools Read, describe-only framing)
+// turns them into DESCRIPTIONS — only descriptions ride into the worker
+// prompt, framed machine-generated untrusted-derived. The worker itself never
+// gets file access; a failed pre-pass leaves an honest placeholder and the run
+// still happens. 2h TTL on the spool — descriptions already rode.
+// ---------------------------------------------------------------------------
+
+const ATTACHMENT_TTL_MS = 2 * 60 * 60_000;
+
+function attachmentSpoolDir(): string {
+  return path.join(askSpool(), "attachments");
+}
+
+/** discord.js Collection → the plain {url,filename,size} array shape the
+ *  attachments helpers read (v14 calls it `name`; older shapes `filename`). */
+function plainAttachments(m: Message): unknown[] {
+  return [...m.attachments.values()].map((a) => ({
+    url: a.url,
+    filename: a.name ?? (a as { filename?: string }).filename ?? "",
+    size: a.size,
+  }));
+}
+
+/** Download picked attachments into the spool. Never fatal: a failed or
+ *  post-download-oversized image drops with a log line; the run proceeds
+ *  with whatever landed (safeAttachmentName already forced the path shape). */
+async function downloadAttachments(picked: PickedAttachment[]): Promise<string[]> {
+  const dir = attachmentSpoolDir();
+  const paths: string[] = [];
+  for (const p of picked) {
+    try {
+      const res = await fetch(p.url, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.byteLength > ATTACHMENT_MAX_BYTES) {
+        throw new Error(`${buf.byteLength} bytes on the wire — over cap`);
+      }
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, p.name), buf);
+      paths.push(path.join(dir, p.name));
+    } catch (err) {
+      log(`attachment ${p.name} dropped: ${errText(err)}`);
+    }
+  }
+  return paths;
+}
+
+/** Split the pre-pass stdout into one chunk per file: a basename on a line of
+ *  its own opens its entry; everything until the next basename line is that
+ *  file's description. Deterministic exact-line match — a name echoed inside
+ *  a paragraph never re-splits. */
+function splitVisionOutput(stdout: string, basenames: string[]): string[] {
+  const out = basenames.map(() => "");
+  let idx = -1;
+  for (const line of stdout.split(/\r?\n/)) {
+    const hit = basenames.indexOf(line.trim());
+    if (hit >= 0) {
+      idx = hit;
+      continue;
+    }
+    if (idx >= 0) out[idx] += (out[idx] ? "\n" : "") + line;
+  }
+  return out;
+}
+
+/** One-shot vision pre-pass over the downloaded files — cwd pinned to the
+ *  attachments dir, Read the only tool, MCP config off (--strict-mcp-config).
+ *  Failures and missing entries become honest placeholders, never silent
+ *  omissions: the worker always sees the true count. */
+async function describeImages(paths: string[]): Promise<string[]> {
+  if (paths.length === 0) return [];
+  const basenames = paths.map((p) => path.basename(p));
+  const placeholders = basenames.map((b) => `(vision pre-pass produced no entry for ${b})`);
+  try {
+    const run = await runClaude(
+      ["-p", "--strict-mcp-config", "--allowedTools", "Read"],
+      attachmentSpoolDir(),
+      visionPassPrompt(paths),
+      90_000,
+    );
+    if (run.code !== 0) {
+      log(`vision pre-pass exit ${run.code} — honest placeholders ride instead`);
+      return placeholders;
+    }
+    const chunks = splitVisionOutput(run.stdout, basenames);
+    return chunks.map((c, i) => c.trim() || placeholders[i]);
+  } catch (err) {
+    log(`vision pre-pass failed: ${errText(err)}`);
+    return placeholders;
+  }
+}
+
+/** The full intake for one triggered job: download → describe → framed lines. */
+async function prepareImageBlock(picked: PickedAttachment[]): Promise<string[]> {
+  const paths = await downloadAttachments(picked);
+  return imageDescriptionLines(await describeImages(paths));
+}
+
+/** 2h TTL sweep for the attachment spool — the descriptions already rode into
+ *  their run; the files are dead weight past that. */
+function sweepAttachmentSpool(): void {
+  const dir = attachmentSpoolDir();
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return; // no dir → nothing downloaded yet
+  }
+  const cutoff = Date.now() - ATTACHMENT_TTL_MS;
+  for (const f of files) {
+    try {
+      if (fs.statSync(path.join(dir, f)).mtimeMs < cutoff) fs.unlinkSync(path.join(dir, f));
+    } catch {
+      // raced another sweep — next pass
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,7 +1343,21 @@ async function dispatch(job: Job): Promise<void> {
     const canary = `cnry-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     activeCanaries.add(canary);
     job.canary = canary; // settlePhonePrompt rechecks the excerpt against it after the run
-    const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd, sandboxed, canary), config.timeoutMs);
+    // Fork 8dfb5c1: trigger images → spool + vision pre-pass BEFORE the run,
+    // so descriptions (never files, never paths) ride inside the prompt.
+    const imageLines =
+      job.images && job.images.length > 0 ? await prepareImageBlock(job.images) : [];
+    // Fork 1a15636: past 4 minutes the run grows ONE editable still-working
+    // line; the finish path deletes it so the answer supersedes it.
+    const status = beginStatusLine(job.threadId, job.threadName);
+    status.start();
+    const run = await runClaude(
+      args,
+      cwd,
+      buildWorkerPrompt(job, cwd, sandboxed, canary, imageLines),
+      config.timeoutMs,
+    );
+    await status.finish();
     activeCanaries.delete(canary);
     const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
     if (sessionIdOut) {
@@ -1247,8 +1463,18 @@ function considerFetched(m: Message, botUser: User, threadName: string | null): 
     return;
   }
   const prompt = stripMention(m.content, botUser.id);
-  if (!prompt) {
+  // Fork 8dfb5c1: an otherwise-eligible trigger with images but no text still
+  // counts (owner ask: "read the image and determine if you need to step
+  // in") — the sender gates above are unchanged, untagged randos stay silent.
+  const plain = plainAttachments(m);
+  const carriesImages = imagesCarryTrigger({ attachments: plain });
+  if (!prompt && !carriesImages) {
     log(`skip: trigger from ${m.author.username} in "${threadName ?? "(channel root)"}" had no text`);
+    return;
+  }
+  const images = pickImageAttachments({ attachments: plain }, m.id);
+  if (!prompt && images.length === 0) {
+    log(`skip: image-only trigger from ${m.author.username} but nothing survived the whitelist/caps`);
     return;
   }
   enqueue({
@@ -1256,12 +1482,15 @@ function considerFetched(m: Message, botUser: User, threadName: string | null): 
     threadId: m.channelId,
     rootChannel: threadName === null,
     cwd: threadName ? mappedCwdFor(threadName) : null,
-    prompt,
+    prompt:
+      prompt ||
+      `(image-only trigger — ${images.length} attached image(s); machine-generated descriptions ride in the task block)`,
     from: m.author.username,
     fromId: m.author.id,
     fromBot: m.author.bot,
     untagged: !tagged,
     triggerId: m.id,
+    images: images.length > 0 ? images : undefined,
   });
 }
 
@@ -1540,6 +1769,7 @@ async function main(): Promise<void> {
   // pending/enqueued prompts are never removed (the sweeps' own invariants).
   setInterval(() => {
     void sweepExpiredAskMessages().catch((err) => log(`ask sweep error: ${errText(err)}`));
+    sweepAttachmentSpool(); // fork 8dfb5c1: 2h TTL on the image attachment spool
     const gc = sweepTerminalAsks(askSpool());
     if (gc.length > 0) log(`ask registry GC: ${gc.length} terminal record(s) older than 7d removed`);
     const promptGc = sweepTerminalPrompts(askSpool());
@@ -2260,7 +2490,11 @@ async function routePromptToPeer(rec: PromptRecord): Promise<void> {
   if (!peer) {
     // The companion refuses route:"peer" at creation when the lane is gone;
     // landing here means it dropped between creation and claim.
-    finishPrompt(askSpool(), rec.promptId, { exit: 1, posted: false });
+    finishPrompt(askSpool(), rec.promptId, {
+      exit: 1,
+      posted: false,
+      excerpt: "route to peer failed: lane unconfigured at claim time", // fork nit (a): the phone preview shows WHY
+    });
     log(`routed prompt ${rec.promptId} FAILED — lane unconfigured at claim time; stamped failed honestly`);
     return;
   }
@@ -2283,7 +2517,11 @@ async function routePromptToPeer(rec: PromptRecord): Promise<void> {
     });
     log(`routed prompt ${rec.promptId} → peer inject accepted (${out.trim().slice(0, 120)}) — outcome echo pending, 30-min budget`);
   } catch (err) {
-    finishPrompt(askSpool(), rec.promptId, { exit: 1, posted: false });
+    finishPrompt(askSpool(), rec.promptId, {
+      exit: 1,
+      posted: false,
+      excerpt: `route to peer failed: ${errText(err)}`, // fork nit (a): the phone preview shows WHY
+    });
     log(`routed prompt ${rec.promptId} send FAILED — stamped failed honestly: ${errText(err)}`);
   }
 }
@@ -2317,7 +2555,9 @@ function sweepPeerOutcomes(): void {
       log(`peer outcome file ${f} unparseable/apply error: ${errText(err)}`);
     } finally {
       try {
-        const archive = path.join(askSpool(), "archive");
+        // Fork nit (b): nest under prompt-outcomes/archive/ — bilateral grep
+        // shape with the peer's live layout. Old flat archive/ files stay.
+        const archive = path.join(dir, "archive");
         fs.mkdirSync(archive, { recursive: true });
         fs.renameSync(p, path.join(archive, f));
       } catch (err) {
