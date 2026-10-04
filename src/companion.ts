@@ -74,6 +74,11 @@ export function defaultCompanionStore(keydir: string): CompanionStore {
   return companionStore(path.join(keydir, "companion-keys"));
 }
 
+/** Filesystem-safe form of a fingerprint id (SHA256:+/ chars break Windows paths). */
+function fsSafeId(id: string): string {
+  return id.replace(/[:+/]/g, "_");
+}
+
 function writePrivate(file: string, data: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, data, { mode: 0o600 });
@@ -132,7 +137,7 @@ export function validatePhonePub(line: string): string {
 export function enrollPhone(store: CompanionStore, phonePubLine: string): string {
   const line = validatePhonePub(phonePubLine);
   const id = fingerprintOfPublicKey(line);
-  writePrivate(path.join(store.dir, `${id}.pub`), line + "\n");
+  writePrivate(path.join(store.dir, `${fsSafeId(id)}.pub`), line + "\n");
   return id;
 }
 
@@ -175,7 +180,7 @@ export function verifyCompanionRequest(
   if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(id)) return { ok: false, status: 401, error: "bad X-Companion-Id" };
   let pin: string;
   try {
-    pin = fs.readFileSync(path.join(store.dir, `${id}.pub`), "utf8");
+    pin = fs.readFileSync(path.join(store.dir, `${fsSafeId(id)}.pub`), "utf8");
   } catch {
     return { ok: false, status: 401, error: "unknown phone" };
   }
