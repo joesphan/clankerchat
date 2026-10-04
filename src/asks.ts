@@ -395,6 +395,34 @@ export function stampAskEnqueued(spoolDir: string, askId: string): AskRecord | n
   return next;
 }
 
+/** Hygiene sweep (2026-10-04 self-audit): delete TERMINAL ask records older
+ *  than keepMs (default 7 days). The registry is file-per-ask and a terminal
+ *  record has no further readers — the Discord message is the human record.
+ *  Never touches pending records, and never deletes an UNDELIVERED companion
+ *  decision (status terminal, decidedBy companion:*, no enqueuedAt): that
+ *  record is still owed a delivery stamp. Returns the ids removed. */
+export function sweepTerminalAsks(
+  spoolDir: string,
+  now = Date.now(),
+  keepMs = 7 * 24 * 60 * 60 * 1000,
+): string[] {
+  const removed: string[] = [];
+  const weekAgo = now - keepMs;
+  for (const rec of listPendingAsks(spoolDir)) {
+    if (rec.status === "pending") continue;
+    if (!rec.enqueuedAt && typeof rec.decidedBy === "string" && rec.decidedBy.startsWith("companion:")) continue;
+    const ageFrom = rec.decidedAt ?? rec.createdAt;
+    if (ageFrom >= weekAgo) continue;
+    try {
+      fs.rmSync(askFile(spoolDir, rec.askId), { force: true });
+      removed.push(rec.askId);
+    } catch {
+      /* unreadable/locked — next sweep retries */
+    }
+  }
+  return removed;
+}
+
 /** Terminal asks decided from the companion (phone) surface that the watcher
  *  has not yet delivered. decidedBy provenance: "companion:<phone fp>". */
 export function listCompanionDecisions(spoolDir: string): AskRecord[] {

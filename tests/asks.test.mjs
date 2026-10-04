@@ -410,3 +410,30 @@ test("ask V2: edit surgery — clock swapped, question verbatim, buttons never r
   assert.equal(norm[0].components[0].content, "q");
   assert.ok(!("toJSON" in norm[0]), "output is plain data");
 });
+
+test("ask registry hygiene: terminal records GC at 7d; undelivered companion decisions kept", async () => {
+  const { sweepTerminalAsks, asksDir } = await import("../dist/asks.js");
+  const spool = tmpSpool();
+  const dir = asksDir(spool);
+  fs.mkdirSync(dir, { recursive: true });
+  const old = Date.now() - 8 * 24 * 3600_000;
+  const write = (rec) => fs.writeFileSync(path.join(dir, `${rec.askId}.json`), JSON.stringify(rec));
+  // a live pending ask — untouchable
+  const live = createPendingAsk(spool, { question: "live?", channelId: "1", messageId: null, approvers: [APPROVER] });
+  // terminal + delivered + old → gone
+  write({ askId: "gone-approved", question: "q", channelId: "1", messageId: null, approvers: [], createdAt: old - 1000, expiresAt: old, status: "approved", decidedBy: APPROVER, decidedAt: old, enqueuedAt: old });
+  // terminal (plain expiry, no decision run) + old → gone
+  write({ askId: "gone-expired", question: "q", channelId: "1", messageId: null, approvers: [], createdAt: old, expiresAt: old, status: "expired" });
+  // terminal + UNDELIVERED companion decision + old → KEPT (still owed a delivery stamp)
+  write({ askId: "kept-undelivered", question: "q", channelId: "1", messageId: null, approvers: [], createdAt: old - 1000, expiresAt: old, status: "approved", decidedBy: "companion:SHA256:" + "a".repeat(43), decidedAt: old });
+  // terminal but DECIDED RECENTLY (old creation) → kept
+  write({ askId: "kept-recent", question: "q", channelId: "1", messageId: null, approvers: [], createdAt: old, expiresAt: old, status: "denied", decidedBy: APPROVER, decidedAt: Date.now() - 1000 });
+  const removed = sweepTerminalAsks(spool).sort();
+  assert.deepEqual(removed, ["gone-approved", "gone-expired"]);
+  for (const id of ["gone-approved", "gone-expired"]) {
+    assert.ok(!fs.existsSync(path.join(dir, `${id}.json`)), `${id} removed`);
+  }
+  for (const id of [live.askId, "kept-undelivered", "kept-recent"]) {
+    assert.ok(fs.existsSync(path.join(dir, `${id}.json`)), `${id} kept`);
+  }
+});
