@@ -33,6 +33,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { appendInjectEvent, fingerprintOfPublicKey, parseKey } from "./botlink.js";
+import { decideAsk, getAsk, listPendingAsks, renderAskForApp } from "./asks.js";
 import {
   attemptIdOfState,
   buildConfirmPlan,
@@ -386,6 +387,41 @@ export function startCompanionServer(opts: {
           const s = loadPairingState(paths);
           const attempt = s && stateIsLive(s) ? renderAttempt(s) : null;
           return json(res, 200, attempt ?? {});
+        }
+
+        // --- asks on the phone (owner 2026-10-04 round 4): the enrolled
+        // --- phone can SEE pending asks and DECIDE them. It is the same
+        // --- gesture class as allowAttempt — and strictly lower stakes (a
+        // --- phone can already commit key rotations). Decisions write the
+        // --- shared registry with provenance "companion:<fp>"; the gateway
+        // --- watcher delivers (message edit + trigger run) and stamps
+        // --- enqueuedAt — this surface never delivers, so no double path.
+        // --- decideAsk's pending-guard is the only gate: a tap racing the
+        // --- expiry sweep simply loses or wins cleanly, never both.
+        if (method === "GET" && url.pathname === "/asks") {
+          const now = Date.now();
+          const asks = listPendingAsks(spoolDir)
+            .filter((r) => r.status === "pending" && r.expiresAt > now)
+            .sort((a, b) => a.createdAt - b.createdAt || (a.askId < b.askId ? -1 : 1)) // same-ms ties break on id — deterministic
+            .map(renderAskForApp);
+          return json(res, 200, { asks });
+        }
+
+        const askM = url.pathname.match(/^\/asks\/([a-z0-9-]+)\/(approve|deny)$/);
+        if (method === "POST" && askM) {
+          const existing = getAsk(spoolDir, askM[1]);
+          if (!existing) return json(res, 404, { error: "no such ask" });
+          if (existing.status !== "pending") {
+            // Already decided (Discord click won, an earlier tap, or expiry
+            // sweep) — the honest answer is the current status, never a
+            // second decision. Covers a same-phone re-tap too.
+            log(`companion: ask ${askM[1]} tap arrived after ${existing.status} (${existing.decidedBy ?? "?"}) — nothing changed`);
+            return json(res, 409, { error: `already ${existing.status}`, status: existing.status, decidedBy: existing.decidedBy ?? null });
+          }
+          const rec = decideAsk(spoolDir, askM[1], askM[2] === "approve" ? "approved" : "denied", `companion:${v.phone.id}`);
+          if (!rec || rec.status === "pending") return json(res, 500, { error: "decision failed to record" });
+          log(`companion: ask ${askM[1]} ${rec.status} by ${v.phone.id} — delivery pending watcher sweep`);
+          return json(res, 200, { status: rec.status, askId: rec.askId });
         }
 
         const allowM = url.pathname.match(/^\/attempts\/([0-9a-f]{1,64})\/allow$/);

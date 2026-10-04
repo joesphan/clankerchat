@@ -22,6 +22,9 @@ import {
   listPendingAsks,
   decideAsk,
   sweepExpiredAsks,
+  stampAskEnqueued,
+  listCompanionDecisions,
+  renderAskForApp,
   askDecisionLine,
 } from "../dist/asks.js";
 
@@ -218,4 +221,54 @@ test("sweepExpiredAsks: lazy ask flips to approved (decidedBy auto-expiry); defa
 test("askDecisionLine: auto-expiry renders its own honest line (no clicker to name)", () => {
   const rec = { status: "approved", decidedBy: "auto-expiry", decidedAt: Date.UTC(2026, 9, 4, 8, 29, 10) };
   assert.equal(askDecisionLine(rec, "irrelevant-name"), "Auto-approved (no Deny before expiry) · 08:29:10Z");
+});
+
+// --- round 4: companion (phone) decisions + exactly-once delivery ----------
+
+test("stampAskEnqueued: stamps a decided ask exactly once; pending/missing/null-safe", () => {
+  const spool = tmpSpool();
+  const pending = createPendingAsk(spool, {
+    question: "still open", channelId: "1", messageId: null, approvers: [APPROVER],
+  });
+  assert.equal(stampAskEnqueued(spool, pending.askId), null, "pending ask is never deliverable");
+  const decided = createPendingAsk(spool, {
+    question: "decided", channelId: "1", messageId: null, approvers: [APPROVER],
+  });
+  decideAsk(spool, decided.askId, "approved", `companion:${APPROVER}`);
+  const first = stampAskEnqueued(spool, decided.askId);
+  assert.ok(first && first.enqueuedAt > 0, "first claim stamps and returns the record");
+  assert.equal(stampAskEnqueued(spool, decided.askId), null, "second claim is null — exactly-once");
+  assert.equal(stampAskEnqueued(spool, "no-such-ask"), null);
+  assert.ok(getAsk(spool, decided.askId).enqueuedAt > 0, "stamp persisted");
+});
+
+test("listCompanionDecisions: only terminal, companion-sourced, undelivered asks", () => {
+  const spool = tmpSpool();
+  const comp = createPendingAsk(spool, { question: "phone", channelId: "1", messageId: null, approvers: [APPROVER] });
+  decideAsk(spool, comp.askId, "approved", "companion:SHA256:abc123");
+  const click = createPendingAsk(spool, { question: "click", channelId: "1", messageId: null, approvers: [APPROVER] });
+  decideAsk(spool, click.askId, "denied", APPROVER); // Discord click — not companion's to deliver
+  const auto = createPendingAsk(spool, { question: "auto", channelId: "1", messageId: null, approvers: [APPROVER], ttlMs: 1, onExpiry: "approve" });
+  sweepExpiredAsks(spool, Date.now() + 10_000); // → approved/auto-expiry
+  const delivered = createPendingAsk(spool, { question: "done", channelId: "1", messageId: null, approvers: [APPROVER] });
+  decideAsk(spool, delivered.askId, "approved", "companion:SHA256:xyz789");
+  stampAskEnqueued(spool, delivered.askId);
+  const open = createPendingAsk(spool, { question: "open", channelId: "1", messageId: null, approvers: [APPROVER] });
+
+  const ids = listCompanionDecisions(spool).map((r) => r.askId);
+  assert.deepEqual(ids, [comp.askId], "click/auto/expired/stamped/pending all excluded");
+  assert.ok(!ids.includes(open.askId));
+});
+
+test("renderAskForApp: question + clock + lazy flag, and NOTHING else", () => {
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "ship it?", channelId: "1555103465179455488", messageId: "999", approvers: [APPROVER], onExpiry: "approve",
+  });
+  const view = renderAskForApp(rec);
+  assert.deepEqual(Object.keys(view).sort(), ["askId", "createdAt", "expiresAt", "lazy", "question"]);
+  assert.equal(view.lazy, true);
+  assert.equal(view.question, "ship it?");
+  assert.equal(view.channelId, undefined, "no channel ids on the phone surface");
+  assert.equal(view.approvers, undefined);
 });

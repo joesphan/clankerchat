@@ -173,6 +173,15 @@ interface AttemptView {
   expiresAt: number;
 }
 
+/** A pending ask (GET /asks) — approve/deny gates from the pocket. */
+interface AskView {
+  askId: string;
+  question: string;
+  createdAt: number;
+  expiresAt: number;
+  lazy: boolean;
+}
+
 const K_SEED = "cc.seed";
 const K_MACHINES = "cc.machines";
 const K_COUNTERS = "cc.counters";
@@ -249,6 +258,7 @@ export default function App() {
   const [active, setActive] = useState<Machine | null>(null);
   const [scanning, setScanning] = useState(false);
   const [attempt, setAttempt] = useState<AttemptView | null>(null);
+  const [asks, setAsks] = useState<AskView[]>([]);
   const [sasInput, setSasInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>("");
@@ -296,6 +306,10 @@ export default function App() {
           setError("");
         } else {
           setError(String(json.error ?? `HTTP ${status}`));
+        }
+        const askRes = await signedFetch(active, seed, phoneId, "GET", "/asks");
+        if (!stopped && askRes.status === 200) {
+          setAsks(Array.isArray(askRes.json.asks) ? (askRes.json.asks as unknown as AskView[]) : []);
         }
       } catch (e) {
         if (!stopped) setError(`unreachable: ${(e as Error).message}`);
@@ -411,6 +425,34 @@ export default function App() {
     }
   }, [active, attempt, phoneId, seed]);
 
+  // Approve/deny a pending ask from the pocket — same signed transport, and
+  // the machine's registry records provenance (companion:<phone fp>).
+  const doAskDecision = useCallback(
+    async (askId: string, verb: "approve" | "deny") => {
+      if (!active || !seed || !phoneId) return;
+      setBusy(true);
+      setError("");
+      setNotice("");
+      try {
+        const { status, json } = await signedFetch(active, seed, phoneId, "POST", `/asks/${askId}/${verb}`);
+        if (status === 200) {
+          setNotice(`Ask ${String(json.status ?? verb)} — recorded`);
+          setAsks((prev) => prev.filter((a) => a.askId !== askId));
+        } else if (status === 409) {
+          setNotice(`Ask already ${String(json.status ?? "decided")} — nothing changed`);
+          setAsks((prev) => prev.filter((a) => a.askId !== askId));
+        } else {
+          setError(String(json.error ?? `HTTP ${status}`));
+        }
+      } catch (e) {
+        setError(`unreachable: ${(e as Error).message}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [active, phoneId, seed],
+  );
+
   const secondsLeft = attempt ? Math.max(0, Math.floor((attempt.expiresAt - Date.now()) / 1000)) : 0;
 
   // ---- render ----
@@ -481,6 +523,7 @@ export default function App() {
               onPress={() => {
                 setActive(m);
                 setAttempt(null);
+                setAsks([]);
                 setNotice("");
                 setError("");
               }}
@@ -506,6 +549,34 @@ export default function App() {
           machine fingerprint: {active.fp}
         </Text>
       ) : null}
+
+      {active && asks.length > 0
+        ? asks.map((a) => (
+            <View key={a.askId} style={s.card}>
+              <Text style={s.cardTitle}>
+                ASK · {Math.max(0, Math.round((a.expiresAt - Date.now()) / 60000))}m left
+                {a.lazy ? " · silence = yes" : ""}
+              </Text>
+              <Text style={s.muted}>{a.question}</Text>
+              <View style={s.row}>
+                <Pressable
+                  style={[s.button, s.allow]}
+                  disabled={busy}
+                  onPress={() => void doAskDecision(a.askId, "approve")}
+                >
+                  <Text style={s.buttonText}>Approve</Text>
+                </Pressable>
+                <Pressable
+                  style={[s.button, s.deny]}
+                  disabled={busy}
+                  onPress={() => void doAskDecision(a.askId, "deny")}
+                >
+                  <Text style={s.buttonText}>Deny</Text>
+                </Pressable>
+              </View>
+            </View>
+          ))
+        : null}
 
       {active && !attempt ? (
         <View style={s.card}>
