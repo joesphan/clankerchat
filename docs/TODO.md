@@ -111,10 +111,12 @@ react-native) — mine them before designing.
   records, lane `prompt-outcome` verb, 30-min routed budget, receive-side
   echo via applyPeerPromptOutcome, app route toggle. Design decisions
   owner-delegated (channel post 1556355104607707247): 15s-sweep delivery,
-  excerpt-only answers, 30-min expiry. Remaining: PEER PORTS THEIR HALF
-  (inject-consumer outcome emit + sweep route branch + canRouteToPeer) —
-  rides their merge per the fork law; first live routed prompt
-  pmtroute0001 sent 17:34Z (inject ack 1791135289748-17f1e7). Phase 2
+  excerpt-only answers, 30-min expiry. Peer APPROVED the port 2026-10-04
+  17:46:01Z via ask card 1556361720144990306 (ask muu43jxx-2c0bd7f4,
+  decidedBy joesphan; orchestrator relay 1556362271331057765). Remaining:
+  PEER PORTS THEIR HALF (inject-consumer outcome emit + sweep route branch +
+  canRouteToPeer) — rides their merge per the fork law; first live routed
+  prompt pmtroute0001 sent 17:34Z (inject ack 1791135289748-17f1e7). Phase 2
   (peer index view) deferred until routing shows real use.
 - [ ] Watcher-side own-post noise meter: count own posts per thread per hour, journal
   a NOISE line past a threshold — enforcement visibility for the quiet-discord law.
