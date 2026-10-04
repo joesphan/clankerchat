@@ -138,6 +138,23 @@ test("verifyCompanionRequest: pin, tamper, replay", async () => {
   assert.equal(r.ok, false);
   assert.equal(r.status, 403);
 
+  // Atomic swap (audit fix 3): a consumed counter must never be observable
+  // as a torn or missing file — the write is tmp+rename, so no .tmp residue
+  // and the JSON always parses
+  r = verifyCompanionRequest(store, { id, counter: "8", sig: sign(8) }, "POST", "/attempts/x/allow", body);
+  assert.equal(r.ok, true);
+  assert.ok(!fs.existsSync(store.countersFile + ".tmp"), "no torn tmp left behind");
+  assert.equal(JSON.parse(fs.readFileSync(store.countersFile, "utf8"))[id], 8);
+
+  // Corruption (disk-level now that writes are atomic): fail-open, logged —
+  // counter bookkeeping restarts, the surface stays alive. Burn a HIGH
+  // counter after the reset so the counter-regression check below (3 <
+  // floor) keeps its meaning.
+  fs.writeFileSync(store.countersFile, "{torn");
+  r = verifyCompanionRequest(store, { id, counter: "100", sig: sign(100) }, "POST", "/attempts/x/allow", body);
+  assert.equal(r.ok, true, "fail-open keeps the surface alive on corruption");
+  assert.equal(JSON.parse(fs.readFileSync(store.countersFile, "utf8"))[id], 100);
+
   // Tampered body (sha of different bytes) → signature fails
   const otherSha = crypto.createHash("sha256").update(Buffer.from("{}")).digest("hex");
   r = verifyCompanionRequest(store, { id, counter: "8", sig: sign(8, "POST", "/attempts/x/allow", sha) }, "POST", "/attempts/x/allow", Buffer.from("{}"));

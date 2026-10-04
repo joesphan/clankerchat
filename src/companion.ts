@@ -88,12 +88,18 @@ function fsSafeId(id: string): string {
 
 function writePrivate(file: string, data: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, data, { mode: 0o600 });
+  // Atomic swap (audit finding 3): plain writeFileSync can tear — a torn
+  // counters.json makes loadCounters fail-open to {} and silently resets
+  // EVERY phone's replay protection. chmod the tmp BEFORE rename so the
+  // 0600 mode survives the swap (Windows no-ops chmod either way).
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, data, { mode: 0o600 });
   try {
-    fs.chmodSync(file, 0o600); // chmod after write (Windows no-ops it)
+    fs.chmodSync(tmp, 0o600);
   } catch {
     /* best effort */
   }
+  fs.renameSync(tmp, file);
 }
 
 /** Mint the one-time enrollment token printed in the terminal QR. */
@@ -151,7 +157,14 @@ export function enrollPhone(store: CompanionStore, phonePubLine: string): string
 function loadCounters(store: CompanionStore): Record<string, number> {
   try {
     return JSON.parse(fs.readFileSync(store.countersFile, "utf8")) as Record<string, number>;
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {}; // first boot
+    // Corruption, not first boot: fail-open resets replay protection for
+    // every previously consumed counter. Atomic writes (above) make this a
+    // disk-level event rather than a normal outcome — log it loudly.
+    console.error(
+      `companion: counters file unreadable (${(err as Error).message}) — replay window reopens for previously seen counters`,
+    );
     return {};
   }
 }

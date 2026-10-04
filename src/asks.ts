@@ -187,10 +187,14 @@ export function listPendingAsks(spoolDir: string): AskRecord[] {
   }
 }
 
-/** Record a decision (approve/deny by a validated approver) — atomic, and
- *  idempotent-ish: a second click on the same ask finds status != pending
- *  and returns the existing record unchanged (the disabled buttons make this
- *  a race edge, not a path). */
+/** Record a decision (approve/deny by a validated approver). Cross-process
+ *  claim (audit finding 12): the companion HTTP process and the watcher
+ *  process BOTH decide on this registry (phone decision vs button click) —
+ *  the old get→check→write let both racers read "pending", both write, and
+ *  both see their own decidedBy (double decision run + double message
+ *  edit). O_EXCL makes the claim kernel-atomic: exactly one winner per ask,
+ *  ever, across processes. The claim file persists beside the record as
+ *  proof a decision was in flight — fail-closed direction for asks. */
 export function decideAsk(
   spoolDir: string,
   askId: string,
@@ -200,8 +204,17 @@ export function decideAsk(
   const rec = getAsk(spoolDir, askId);
   if (!rec) return null;
   if (rec.status !== "pending") return rec;
-  const next: AskRecord = { ...rec, status: decision, decidedBy, decidedAt: Date.now() };
   const file = askFile(spoolDir, askId);
+  const claim = `${file}.claim`;
+  let claimed = false;
+  try {
+    fs.closeSync(fs.openSync(claim, "wx", 0o600));
+    claimed = true;
+  } catch {
+    /* exists — another process already decided this ask */
+  }
+  if (!claimed) return getAsk(spoolDir, askId); // winner's record (maybe still mid-write; callers' decidedBy checks handle it)
+  const next: AskRecord = { ...rec, status: decision, decidedBy, decidedAt: Date.now() };
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
   fs.renameSync(tmp, file);
