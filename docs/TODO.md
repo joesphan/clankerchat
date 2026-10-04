@@ -352,3 +352,32 @@ framing independently.
   doctor BUNDLE_MARKER bumped so pre-round-12 bundles read STALE.
 - 188/188 (+1 asks instruction test; companion yolo case inside the existing
   route test).
+
+## Round 13 — watcher dist-drift guard (deployment-side, 2026-10-04)
+
+Failure class: the live watcher (`~/tools/clankerchat-watch.mjs`) imports the
+repo's dist/ libs at boot; every rebuild needs a manual service restart, and
+forgetting it once means the live host silently runs OLD lib code (round 12's
+framing fix would have been dead locally if that step had been skipped).
+
+- Guard (watch.mjs): fingerprint every `dist/*.js` (name:mtimeMs:size); exit 0
+  when it differs from boot AND has been stable across polls ≥45s (tsc writes
+  incrementally — a mid-build read must never trigger) AND the pool is truly
+  idle (no active runs, both queues empty, ≥10s since the last pool activity
+  so a trigger mid-handler is never dropped — gateway events have no
+  persistent cursor). Drift logs loudly at first sight; a busy pool defers
+  the exit to its next idle moment instead of suppressing it.
+- systemd user drop-in `restart-always.conf`: the base unit's
+  `Restart=on-failure` leaves a clean exit(0) dead — `Restart=always` revives
+  both drift exits and real crashes (explicit stop/restart still behave
+  normally). Live-proven end-to-end: rebuild at 23:06:54Z → detected
+  23:07:02Z → `stable 45s + pool idle 75s` exit 23:07:47Z → systemd revival
+  23:07:52Z (NRestarts=1, no loop; guard inert on the new boot fingerprint).
+- Same-class drift on companion/botlink/metro: DEFERRED (their idle
+  definitions are harder — live SSH connections, in-flight signed requests,
+  connected Expo clients — a dropped phone poll round-trips in 2s but a
+  dropped pairing ceremony does not). Pattern is portable when wanted.
+- Peer note: their daemon runs `node dist/daemon.js` under systemd — same
+  drift class on Joe's machine; the fingerprint+idle+exit+Restart=always
+  pattern ports as-is (their idle = no active runs + no lane connections
+  mid-ceremony).
