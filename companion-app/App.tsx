@@ -35,6 +35,7 @@ import {
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
+import * as LocalAuthentication from "expo-local-authentication";
 import * as ed25519 from "@noble/ed25519";
 import { StatusBar } from "expo-status-bar";
 
@@ -290,6 +291,34 @@ async function signedFetch(
 }
 
 // ---------------------------------------------------------------------------
+// Presence gate (biometric — TODO round 2026-10-04)
+// ---------------------------------------------------------------------------
+// The enrolled key is the trust ROOT (possession); biometrics add PRESENCE
+// on top for owner-commit actions (rotation Allow, ask Approve/Deny).
+// Deliberate fail-open shape, decided explicitly in docs/TODO.md: no
+// hardware / nothing enrolled / API error → the action proceeds — the key
+// still authenticates, and a device with no biometrics enrolled must not
+// lose its only confirmation surface. The one hard refusal is a real prompt
+// the user FAILED or CANCELED (success:false): that is the owner declining
+// to be present, so nothing is sent. Rotation-Deny stays ungated on
+// purpose — rejecting a pairing must stay friction-free even mid-attack.
+// SDK note: FaceID on iOS needs a development build (Expo Go limitation);
+// there the API errors and we degrade to key-possession.
+async function requirePresence(reason: string): Promise<boolean> {
+  try {
+    if (!(await LocalAuthentication.hasHardwareAsync())) return true;
+    if (!(await LocalAuthentication.isEnrolledAsync())) return true;
+    const res = await LocalAuthentication.authenticateAsync({
+      promptMessage: reason,
+      cancelLabel: "Cancel",
+    });
+    return Boolean(res.success);
+  } catch {
+    return true; // best-effort presence — the key remains the trust root
+  }
+}
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 
@@ -444,6 +473,10 @@ export default function App() {
 
   const doAllow = useCallback(async () => {
     if (!active || !seed || !phoneId || !attempt) return;
+    if (!(await requirePresence("Allow this key rotation"))) {
+      setError("presence declined — nothing sent");
+      return;
+    }
     setBusy(true);
     setError("");
     setNotice("");
@@ -497,6 +530,10 @@ export default function App() {
   const doAskDecision = useCallback(
     async (askId: string, verb: "approve" | "deny") => {
       if (!active || !seed || !phoneId) return;
+      if (!(await requirePresence(verb === "approve" ? "Approve this ask" : "Deny this ask"))) {
+        setError("presence declined — nothing sent");
+        return;
+      }
       setBusy(true);
       setError("");
       setNotice("");
