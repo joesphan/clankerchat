@@ -101,7 +101,6 @@ async function sendMessage(
     content: string;
     files?: { attachment: string; name: string }[];
     reply?: { messageReference: string };
-    allowedMentions?: { parse: string[] };
   },
 ): Promise<{ id: string }> {
   const body = typeof payload === "string" ? { content: payload } : { content: payload.content };
@@ -109,15 +108,18 @@ async function sendMessage(
     ? undefined
     : payload.files.map((f) => ({ data: fs.readFileSync(f.attachment), name: f.name }));
   const ref = typeof payload === "string" || !payload.reply ? undefined : { message_id: payload.reply.messageReference };
-  const am = typeof payload === "string" ? undefined : payload.allowedMentions;
-  // Explicit allowed_mentions beats API defaults: a human-facing post that tags
-  // <@id> must actually notify (Joe's "your tags aren't tagging", 2026-10-04).
-  // replied_user stays false — the reply itself never pings, the tag does.
-  const allowedMentions = am
-    ? { parse: am.parse, ...(ref ? { replied_user: false } : {}) }
-    : ref
-      ? { replied_user: false }
-      : undefined;
+  // allowed_mentions, if PRESENT without parse/users/roles, suppresses
+  // EVERY mention in the message — Discord treats the object as the whole
+  // allowlist. Replying must silence only the replied-to user (anti
+  // ping-pong) while `<@id>` tags in the body still ping.
+  // parse stays users-ONLY, stated on every path (2026-10-04 law: bot posts
+  // never ping everyone-class or roles — a big role is functionally an
+  // everyone-tag). Parsing suppresses the PING — but clients still RENDER
+  // the raw text as a live tag, so the leaks.ts mass-mention tripwire at
+  // the send/create_thread surfaces is the second, mandatory layer.
+  const allowedMentions = ref
+    ? { parse: ["users"], replied_user: false }
+    : { parse: ["users"] };
   try {
     return (await api().post(Routes.channelMessages(channelId), {
       body: { ...body, message_reference: ref, allowed_mentions: allowedMentions },
@@ -167,7 +169,7 @@ interface ThreadShim extends RThread {
   archived: boolean;
   lastMessageId?: string | null;
   setArchived(v: boolean): Promise<void>;
-  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string }; allowedMentions?: { parse: string[] } }): Promise<{ id: string }>;
+  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } }): Promise<{ id: string }>;
   messages: { fetch(o: { limit: number; after?: string }): Promise<RMessage[]> };
 }
 type ChatChannel = ThreadShim | ({
@@ -175,7 +177,7 @@ type ChatChannel = ThreadShim | ({
   id: string;
   name?: string;
   type: number;
-  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string }; allowedMentions?: { parse: string[] } }): Promise<{ id: string }>;
+  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } }): Promise<{ id: string }>;
   messages: { fetch(o: { limit: number; after?: string }): Promise<RMessage[]> };
   threads: {
     fetchActive(): Promise<{ threads: ThreadShim[] }>;
@@ -634,17 +636,14 @@ function registerTools(server: McpServer): void {
         // failIfNotExists:false — a deleted/unknown target degrades to a
         // normal send instead of erroring the whole tool call.
         const reply = reply_to ? { messageReference: reply_to, failIfNotExists: false } : undefined;
-        // Users-only mentions, stated explicitly: tags in human-facing posts
-        // must actually notify (Joe's "your tags aren't tagging", 2026-10-04 —
-        // the discord.js relay path suppressed them by default, and the REST
-        // path here left allowed_mentions to API defaults). parse:["users"]
-        // also means a bot post can never mass-ping roles/@everyone.
-        const allowedMentions = { parse: ["users"] };
+        // Users-only mention parsing is enforced INSIDE sendMessage on every
+        // path (the 2026-10-04 "tags aren't tagging" fix) — callers can't
+        // widen or drop it, so no allowedMentions plumbing here.
         const sent = attachment
-          ? await channel.send({ content, files: [attachment], allowedMentions, ...(reply ? { reply } : {}) })
+          ? await channel.send({ content, files: [attachment], ...(reply ? { reply } : {}) })
           : reply
-            ? await channel.send({ content, reply, allowedMentions })
-            : await channel.send({ content, allowedMentions });
+            ? await channel.send({ content, reply })
+            : await channel.send({ content });
         return { sent: true, channel_id: id, message_id: sent.id, ...(note ? { note } : {}) };
       }),
   );
@@ -775,7 +774,8 @@ function registerTools(server: McpServer): void {
           const content = withSender(process.env.CLANKER_NAME, message);
           const massMentions = findMassMentions(content);
           if (massMentions.length > 0) throw new Error(massMentionRefusal());
-          await created.send({ content, allowedMentions: { parse: ["users"] } });
+          // sendMessage pins users-only parsing itself — nothing to pass here.
+          await created.send({ content });
         }
         return { thread_id: created.id, name: created.name, existed: false };
       }),

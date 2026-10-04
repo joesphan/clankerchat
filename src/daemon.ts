@@ -50,6 +50,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
+import { findMassMentions } from "./leaks.js";
 
 const READY_TIMEOUT_MS = 20_000;
 const DAEMON_START_MS = Date.now();
@@ -386,7 +387,20 @@ async function sendToThread(threadId: string, message: string): Promise<string |
     } else if (!(channel instanceof TextChannel)) {
       return null;
     }
-    const sent = await channel.send(withSender(process.env.CLANKER_NAME, message));
+    // Same mention law as sendMessage (index.ts): daemon acks/notices state
+    // their allowlist explicitly and never ping roles or everyone-class —
+    // parse users-only on every outbound post. The content tripwire is the
+    // second layer: parsing suppresses the ping but the pill still RENDERS,
+    // and daemon text has no composer to rephrase it — refuse, never post.
+    const content = withSender(process.env.CLANKER_NAME, message);
+    if (findMassMentions(content).length > 0) {
+      log(`sendToThread refused: mass-mention shape in outbound daemon text (${threadId})`);
+      return null;
+    }
+    const sent = await channel.send({
+      content,
+      allowedMentions: { parse: ["users"] },
+    });
     daemonMessageIds.add(sent.id);
     return sent.id;
   } catch (err) {
