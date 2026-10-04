@@ -81,3 +81,36 @@ export function leakRefusal(kinds: string[]): string {
     "rephrase so the literal token shape does not appear (e.g. refer to it by fingerprint or prefix)."
   );
 }
+
+/**
+ * All human-readable text of a bot post, for scans that must see the WHOLE
+ * post: content plus every TextDisplay (component type 10) child, in tree
+ * order. Components V2 ask cards carry their entire body in Text Displays
+ * and leave content empty — a scan that reads only content is blind to them
+ * (2026-10-04 peer self-audit: the own-post canary scan missed V2 cards).
+ * Structural, dependency-free: accepts raw API JSON components or discord.js
+ * component classes (normalized via toJSON, same contract as
+ * rebuildAskV2ForEdit).
+ */
+export function scanTextOfPost(post: { content?: string | null; components?: unknown }): string {
+  const parts: string[] = [post.content ?? ""];
+  const plain = (node: unknown): Record<string, unknown> => {
+    const n = node as { toJSON?: () => Record<string, unknown> };
+    return typeof n?.toJSON === "function" ? n.toJSON() : { ...(node as Record<string, unknown>) };
+  };
+  const walk = (nodes: unknown) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+      let c: Record<string, unknown>;
+      try {
+        c = plain(node);
+      } catch {
+        continue; // unreadable node — skip it, never lose the rest of the tree
+      }
+      if (c.type === 10 && typeof c.content === "string") parts.push(c.content);
+      if (Array.isArray(c.components)) walk(c.components);
+    }
+  };
+  walk(post.components);
+  return parts.filter((s) => s.length > 0).join("\n");
+}

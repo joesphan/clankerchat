@@ -55,7 +55,7 @@ import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
-import { findMassMentions } from "./leaks.js";
+import { findMassMentions, scanTextOfPost } from "./leaks.js";
 import {
   askClockLine,
   askDecisionLine,
@@ -70,6 +70,7 @@ import {
   rebuildAskV2ForEdit,
   stampAskEnqueued,
   sweepExpiredAsks,
+  sweepTerminalAsks,
   type AskRecord,
 } from "./asks.js";
 import {
@@ -1505,8 +1506,14 @@ async function main(): Promise<void> {
   });
 
   // Ask expiry sweep: disable expired asks' buttons in place, fail-closed.
+  // Registry hygiene rides the same pass (fork 1856fc1): terminal records
+  // older than 7d have no further readers — the Discord message is the
+  // human record. Pending and undelivered companion decisions are never
+  // removed (sweepTerminalAsks' own invariant).
   setInterval(() => {
     void sweepExpiredAskMessages().catch((err) => log(`ask sweep error: ${errText(err)}`));
+    const gc = sweepTerminalAsks(askSpool());
+    if (gc.length > 0) log(`ask registry GC: ${gc.length} terminal record(s) older than 7d removed`);
   }, 60_000).unref();
 
   // Ask countdown sweep: the live "⏳ Xm left" line (legacy content edit /
@@ -1607,7 +1614,10 @@ async function handleLiveMessage(m: Message, parent: TextChannel | NewsChannel, 
   if (m.webhookId) return; // B6: webhook spoof class never triggers
   if (m.author.id === botUser.id) {
     // B5 tripwire: our own posts must never contain an active canary.
-    const leaked = [...activeCanaries].find((c) => m.content.includes(c));
+    // scanTextOfPost, not m.content: V2 ask cards carry their body in
+    // TextDisplay components and leave content empty (peer self-audit —
+    // a content-only scan is blind to them).
+    const leaked = [...activeCanaries].find((c) => scanTextOfPost(m).includes(c));
     if (leaked) {
       log(`LEAK TRIPWIRE: canary ${leaked.slice(0, 8)}… appeared in our own post ${m.id}`);
       await sendToThread(m.channelId, "LEAK TRIPWIRE: an outbound post contained a run canary — investigate immediately.");
@@ -1987,7 +1997,12 @@ async function sweepAskCountdowns(): Promise<void> {
  *  decides answered/failed and `posted` rides along as record only. The
  *  posted check is the wake-followup's own-post rule read backwards: a bot
  *  message in the venue newer than the claim anchor that the daemon did not
- *  itself send (daemonMessageIds) is the worker's answer. */
+ *  itself send (daemonMessageIds) is the worker's answer — EXCEPT posts with
+ *  components: those are tool cards (ask cards), posted by SESSION processes
+ *  on the same bot token, not replies. A card must not mark the run posted,
+ *  and a legacy card's question text must not become the phone answer
+ *  excerpt (peer self-audit finding: cross-marking + excerpt poisoning).
+ *  Cards stay covered by the B5 own-post leak scan, which reads them whole. */
 async function settlePhonePrompt(job: Job, exit: number, reason?: string): Promise<void> {
   if (!job.phonePrompt) return;
   let posted = false;
@@ -1997,7 +2012,9 @@ async function settlePhonePrompt(job: Job, exit: number, reason?: string): Promi
       const ch = await client.channels.fetch(job.threadId, { cache: false });
       if (ch instanceof TextChannel || ch instanceof ThreadChannel) {
         const fetched = await ch.messages.fetch({ limit: 25, after: job.phonePrompt.anchorId, cache: false });
-        const own = [...fetched.values()].filter((m) => m.author.id === client.user?.id && !daemonMessageIds.has(m.id));
+        const own = [...fetched.values()].filter(
+          (m) => m.author.id === client.user?.id && !daemonMessageIds.has(m.id) && (m.components?.length ?? 0) === 0,
+        );
         posted = own.length > 0;
         // Round 5.1 exit-hook excerpt: the run's LAST own-post by snowflake
         // (iteration order is not a promise), leak-rechecked before it rides.

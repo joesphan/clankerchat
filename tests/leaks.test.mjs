@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "../dist/leaks.js";
+import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal, scanTextOfPost } from "../dist/leaks.js";
 
 test("findLeakSignals: every deployment secret shape is caught", () => {
   assert.deepEqual(findLeakSignals("cfut_ABCdef12345"), ["cloudflare api token"]);
@@ -93,4 +93,44 @@ test("massMentionRefusal: starts with REFUSED and names the law", () => {
   const text = massMentionRefusal();
   assert.match(text, /^REFUSED: outbound text contains @everyone\/@here or a role mention/);
   assert.match(text, /never mass-mention/);
+});
+
+test("scanTextOfPost: content plus every TextDisplay child — V2 cards are not invisible", () => {
+  // Plain prose post: content is the whole text.
+  assert.equal(scanTextOfPost({ content: "ack: rebooted", components: [] }), "ack: rebooted");
+  // V2 ask card shape: content empty, body lives in TextDisplays (type 10)
+  // nested Container(17) > Section(9) > TextDisplay, plus an ActionRow(1)
+  // with buttons(2) whose labels must NOT be collected as post text.
+  const v2card = {
+    content: "",
+    components: [
+      {
+        type: 17,
+        components: [
+          { type: 10, id: 1, content: "q: rotate the key?" },
+          { type: 9, components: [{ type: 10, id: 3, content: "approvers: joe" }], accessory: { type: 11 } },
+          { type: 1, components: [{ type: 2, label: "Approve", custom_id: "a" }, { type: 2, label: "Deny", custom_id: "d" }] },
+        ],
+      },
+    ],
+  };
+  assert.equal(scanTextOfPost(v2card), "q: rotate the key?\napprovers: joe");
+  // A canary riding ONLY in a TextDisplay is visible to an includes() scan —
+  // the exact blindness the peer self-audit fixed.
+  const canary = "CANARY-" + "k".repeat(24);
+  assert.ok(scanTextOfPost({ components: [{ type: 17, components: [{ type: 10, content: canary }] }] }).includes(canary));
+  // discord.js class shape: nodes normalize via their own toJSON.
+  const classy = {
+    content: null,
+    components: [
+      {
+        toJSON: () => ({ type: 17, components: [{ type: 10, content: "from toJSON" }] }),
+      },
+    ],
+  };
+  assert.equal(scanTextOfPost(classy), "from toJSON");
+  // Degenerate shapes never throw.
+  assert.equal(scanTextOfPost({}), "");
+  assert.equal(scanTextOfPost({ content: "x", components: null }), "x");
+  assert.equal(scanTextOfPost({ content: "x", components: [{ toJSON: () => { throw new Error("boom"); } }] }), "x");
 });
