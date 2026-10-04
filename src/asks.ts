@@ -45,8 +45,14 @@ export interface AskRecord {
   createdAt: number;
   expiresAt: number;
   status: "pending" | "approved" | "denied" | "expired";
-  decidedBy?: string; // user id of the clicker (recorded at decision)
+  decidedBy?: string; // user id of the clicker, or "auto-expiry" (below)
   decidedAt?: number;
+  // Lazy-consensus mode (owner 2026-10-04: "a way for us to auto approve and
+  // set the duration"): when set, an ask that reaches expiry UNDECIDED flips
+  // to approved instead of expired — silence counts as yes, the ask message
+  // says so up front, and any Deny click before expiry still wins. Default
+  // (unset) remains fail-closed: expiry is NEVER approval.
+  onExpiry?: "approve";
 }
 
 export function asksDir(spoolDir: string): string {
@@ -129,7 +135,11 @@ export function newAskId(): string {
 
 export function createPendingAsk(
   spoolDir: string,
-  rec: Omit<AskRecord, "askId" | "createdAt" | "expiresAt" | "status"> & { askId?: string; ttlMs?: number },
+  rec: Omit<AskRecord, "askId" | "createdAt" | "expiresAt" | "status" | "onExpiry"> & {
+    askId?: string;
+    ttlMs?: number;
+    onExpiry?: "approve";
+  },
 ): AskRecord {
   const full: AskRecord = {
     askId: rec.askId ?? newAskId(),
@@ -140,6 +150,7 @@ export function createPendingAsk(
     createdAt: Date.now(),
     expiresAt: Date.now() + (rec.ttlMs ?? ASK_TTL_MS),
     status: "pending",
+    ...(rec.onExpiry === "approve" ? { onExpiry: "approve" } : {}),
   };
   fs.mkdirSync(asksDir(spoolDir), { recursive: true });
   const file = askFile(spoolDir, full.askId);
@@ -191,32 +202,41 @@ export function decideAsk(
   return next;
 }
 
-/** Mark overdue pending asks expired. Returns the newly-expired records so
- *  the caller can edit their messages (disable buttons) — expired asks with
- *  no decision never count as approval. */
+/** Sweep overdue pending asks to their terminal state. Default (and the
+ *  security invariant): expired — no decision, no approval, buttons die.
+ *  Lazy-consensus asks (onExpiry: "approve", stated on the message itself)
+ *  flip to approved with decidedBy "auto-expiry" — any Deny before expiry
+ *  already won via decideAsk, so this only fires on true silence. Returns
+ *  every record transitioned this pass so the caller can edit its message
+ *  and (for auto-approvals) enqueue the decision run. */
 export function sweepExpiredAsks(spoolDir: string, now = Date.now()): AskRecord[] {
-  const expired: AskRecord[] = [];
+  const swept: AskRecord[] = [];
   for (const rec of listPendingAsks(spoolDir)) {
     if (rec.status === "pending" && rec.expiresAt <= now) {
-      const next = { ...rec, status: "expired" as const };
+      const next: AskRecord = rec.onExpiry === "approve"
+        ? { ...rec, status: "approved", decidedBy: "auto-expiry", decidedAt: now }
+        : { ...rec, status: "expired" };
       const file = askFile(spoolDir, rec.askId);
       try {
         const tmp = `${file}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
         fs.renameSync(tmp, file);
-        expired.push(next);
+        swept.push(next);
       } catch {
         /* unreadable/locked — next sweep retries */
       }
     }
   }
-  return expired;
+  return swept;
 }
 
 /** The one-line status suffix appended to the ask message at decision time.
  *  decidedName is the DISPLAY name of the clicker (render only — authority
- *  was the API id check, already done by the caller). */
+ *  was the API id check, already done by the caller). Auto-expiry renders
+ *  its own line — nobody clicked, and the record must say so honestly. */
 export function askDecisionLine(rec: AskRecord, decidedName: string): string {
+  const t = new Date(rec.decidedAt ?? Date.now()).toISOString().slice(11, 19);
+  if (rec.decidedBy === "auto-expiry") return `Auto-approved (no Deny before expiry) · ${t}Z`;
   const verb = rec.status === "approved" ? "Approved" : rec.status === "denied" ? "Denied" : "Expired";
-  return `${verb} by ${decidedName} · ${new Date(rec.decidedAt ?? Date.now()).toISOString().slice(11, 19)}Z`;
+  return `${verb} by ${decidedName} · ${t}Z`;
 }

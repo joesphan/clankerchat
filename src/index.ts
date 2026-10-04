@@ -1069,12 +1069,27 @@ function registerTools(server: McpServer): void {
           .describe(
             "User IDs allowed to click. Defaults to CLANKER_ASK_APPROVERS from the launch env (comma-separated).",
           ),
+        expires_minutes: z
+          .number()
+          .int()
+          .min(1)
+          .max(1440)
+          .optional()
+          .describe(
+            "Ask lifetime in minutes (default 60). At expiry the ask resolves: buttons disable, and per on_expiry it either expires (no decision) or auto-approves.",
+          ),
+        on_expiry: z
+          .enum(["expire", "approve"])
+          .optional()
+          .describe(
+            "expire (DEFAULT, fail-closed): unanswered = expired, never approval. approve (lazy consensus): unanswered = approved — the message says so up front and any Deny before expiry still wins. Use approve ONLY for asks where silence genuinely means yes; gates and secret-class asks never.",
+          ),
         channel_id: z.string().optional().describe("Channel or thread ID (snowflake). Defaults like `send`."),
         thread_name: z.string().min(1).optional().describe("Thread name to resolve, like `send`."),
         sender: z.string().min(1).optional().describe("Signing identity, like `send`."),
       },
     },
-    ({ message, approvers, channel_id, thread_name, sender }) =>
+    ({ message, approvers, expires_minutes, on_expiry, channel_id, thread_name, sender }) =>
       guard(async () => {
         const approverList = (
           approvers ??
@@ -1088,9 +1103,16 @@ function registerTools(server: McpServer): void {
             "ask: no approvers — pass `approvers` or set CLANKER_ASK_APPROVERS. An ask nobody may click is not an ask.",
           );
         }
+        const ttlMin = expires_minutes ?? 60;
+        const lazy = on_expiry === "approve";
+        // Lazy consensus must be legible ON the ask itself: a human skimming
+        // the thread has to know silence consents without reading any docs.
+        const askText = lazy
+          ? `${message}\n\n⏱ auto-approves in ${ttlMin}m unless denied — silence counts as yes.`
+          : message;
         // Same outbound tripwires as send: secret shapes never ride out, and
         // the mass-mention law is absolute regardless of surface.
-        const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        const content = withSender(sender ?? process.env.CLANKER_NAME, askText);
         const askLeaks = findLeakSignals(content);
         if (askLeaks.length > 0) throw new Error(leakRefusal(askLeaks));
         if (findMassMentions(content).length > 0) throw new Error(massMentionRefusal());
@@ -1111,8 +1133,129 @@ function registerTools(server: McpServer): void {
           channelId: channel.id,
           messageId: sent.id,
           approvers: approverList,
+          ttlMs: ttlMin * 60_000,
+          ...(lazy ? { onExpiry: "approve" as const } : {}),
         });
-        return { asked: true, ask_id: rec.askId, channel_id: channel.id, message_id: sent.id, approvers: approverList.length, expires_at: new Date(rec.expiresAt).toISOString() };
+        return {
+          asked: true,
+          ask_id: rec.askId,
+          channel_id: channel.id,
+          message_id: sent.id,
+          approvers: approverList.length,
+          on_expiry: lazy ? "approve" : "expire",
+          expires_at: new Date(rec.expiresAt).toISOString(),
+        };
+      }),
+  );
+
+  // -------------------------------------------------------------------------
+  // edit / react / delete — quiet-posture surface tools (owner 2026-10-04:
+  // "make the discord mcp part of you so it works even better"). All three
+  // operate on THIS BOT'S OWN posts only (enforced by fetch-then-act, not by
+  // caller claims) and ride the same locks as send.
+  // -------------------------------------------------------------------------
+
+  /** Fetch one message, refusing unless it is this bot's own post. */
+  async function getOwnMessage(channelId: string, messageId: string, verb: string) {
+    const me = await getBotMe();
+    const msg = (await api().get(Routes.channelMessage(channelId, messageId))) as {
+      id: string;
+      author?: { id?: string };
+    };
+    if (msg?.author?.id !== me.id) {
+      throw new Error(`${verb}: message ${messageId} is not this bot's own post — refusing (own posts only).`);
+    }
+    return msg;
+  }
+
+  server.registerTool(
+    "edit",
+    {
+      title: "Edit one of this bot's own messages",
+      description: [
+        "Edit a message THIS bot previously sent (own posts only, enforced server-side).",
+        "Content-only PATCH: buttons/components on the message are left untouched, and the",
+        "same outbound tripwires as send apply to the new text. Prefer editing a progress",
+        "post over sending a new one — one post, updated in place, is the noise law.",
+      ].join(" "),
+      inputSchema: {
+        message_id: z.string().regex(/^\d{16,20}$/, "Discord message ID (snowflake)").describe("The bot's own message to edit (from send/read/ask results)."),
+        message: z.string().min(1).max(2000).describe("The new content (replaces the old text; Discord markdown allowed)."),
+        channel_id: z.string().optional().describe("Channel or thread ID. Defaults like `send`."),
+        thread_name: z.string().min(1).optional().describe("Thread name to resolve, like `send`."),
+        sender: z.string().min(1).optional().describe("Re-sign the edit with this sender identity, like `send`."),
+      },
+    },
+    ({ message_id, message, channel_id, thread_name, sender }) =>
+      guard(async () => {
+        const channel = await resolveTargetChannel(channel_id, thread_name);
+        await getOwnMessage(channel.id, message_id, "edit");
+        const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        const editLeaks = findLeakSignals(content);
+        if (editLeaks.length > 0) throw new Error(leakRefusal(editLeaks));
+        if (findMassMentions(content).length > 0) throw new Error(massMentionRefusal());
+        // components deliberately omitted — PATCH leaves existing buttons in
+        // place, so an ask's buttons survive a content edit.
+        await api().patch(Routes.channelMessage(channel.id, message_id), {
+          body: { content, allowed_mentions: { parse: ["users"] } },
+        });
+        return { edited: true, message_id };
+      }),
+  );
+
+  const REACT_EMOJI = ["✅", "👀", "👍", "❌", "⚠️", "🔥", "🛑", "🧠", "⏳", "🎯"] as const;
+
+  server.registerTool(
+    "react",
+    {
+      title: "React to a message (emoji receipt)",
+      description: [
+        "Add this bot's reaction to a message — a zero-ping, one-emoji receipt. Use ✅ to",
+        "mark a trigger handled or a task done INSTEAD of posting an ack (typing indicator",
+        "is liveness; the checkmark is the outcome). Emoji is limited to a fixed set so a",
+        "compromised session can't use reactions as a covert channel.",
+      ].join(" "),
+      inputSchema: {
+        message_id: z.string().regex(/^\d{16,20}$/, "Discord message ID (snowflake)").describe("The message to react to (any author — reacting is public, not a write to it)."),
+        emoji: z.enum(REACT_EMOJI).describe(`Receipt emoji, one of: ${REACT_EMOJI.join(" ")}`),
+        channel_id: z.string().optional().describe("Channel or thread ID. Defaults like `send`."),
+        thread_name: z.string().min(1).optional().describe("Thread name to resolve, like `send`."),
+      },
+    },
+    ({ message_id, emoji, channel_id, thread_name }) =>
+      guard(async () => {
+        const channel = await resolveTargetChannel(channel_id, thread_name);
+        // Unicode emoji must ride the URL percent-encoded; the route builder
+        // interpolates raw, so encode here (Unknown Emoji otherwise).
+        // channelMessageOwnReaction = the /@me form (add MY reaction).
+        await api().put(
+          Routes.channelMessageOwnReaction(channel.id, message_id, encodeURIComponent(emoji)),
+        );
+        return { reacted: true, emoji, message_id };
+      }),
+  );
+
+  server.registerTool(
+    "delete",
+    {
+      title: "Delete one of this bot's own messages",
+      description: [
+        "Delete a message THIS bot previously sent (own posts only, enforced server-side;",
+        "bots may always delete their own). Cleanup tool: retire a mistaken or stale post",
+        "instead of leaving wrong text standing. The thread still shows a tombstone.",
+      ].join(" "),
+      inputSchema: {
+        message_id: z.string().regex(/^\d{16,20}$/, "Discord message ID (snowflake)").describe("The bot's own message to delete."),
+        channel_id: z.string().optional().describe("Channel or thread ID. Defaults like `send`."),
+        thread_name: z.string().min(1).optional().describe("Thread name to resolve, like `send`."),
+      },
+    },
+    ({ message_id, channel_id, thread_name }) =>
+      guard(async () => {
+        const channel = await resolveTargetChannel(channel_id, thread_name);
+        await getOwnMessage(channel.id, message_id, "delete");
+        await api().delete(Routes.channelMessage(channel.id, message_id));
+        return { deleted: true, message_id };
       }),
   );
 }
