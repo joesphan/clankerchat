@@ -173,3 +173,12 @@ react-native) — mine them before designing.
   domain-on-Cloudflare answer + tunnel-login click + Spark dialog paste
   (docs/SPARK.md has the runbook). Joe's companion app error: Tyler says
   working — item closed, no screenshot needed.
+- [x] **Spark gateway public leg LIVE (2026-10-04 ~18:57Z)** — named tunnel
+  "spark" (2bb03a0f) on 87fcf90e.rapidracing.us → 127.0.0.1:8791, user
+  services clankerchat-tunnel + clankerchat-spark both active. WAN-verified:
+  dead-host 404 + x-robots noindex through CF edge; handshake 200; first
+  spark-driven prompt pmtnwsfetfd answered in 23s (fp spark:6d6039b6…,
+  posted channel root). Connect card: ~/tools/spark-connect.txt (0600 —
+  URL+token). Crawl posture: unguessable subdomain + 192-bit path + uniform
+  404 + noindex (d92e7db). REMAINING: owner pastes URL into Spark custom
+  apps (web), notes credential fields if any.
