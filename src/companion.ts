@@ -433,7 +433,7 @@ export function startCompanionServer(opts: {
           return json(res, 200, { asks });
         }
 
-        const askM = url.pathname.match(/^\/asks\/([a-z0-9-]+)\/(approve|deny)$/);
+        const askM = url.pathname.match(/^\/asks\/([a-z0-9-]+)\/(approve|deny|yolo)$/);
         if (method === "POST" && askM) {
           const existing = getAsk(spoolDir, askM[1]);
           if (!existing) return json(res, 404, { error: "no such ask" });
@@ -444,7 +444,16 @@ export function startCompanionServer(opts: {
             log(`companion: ask ${askM[1]} tap arrived after ${existing.status} (${existing.decidedBy ?? "?"}) — nothing changed`);
             return json(res, 409, { error: `already ${existing.status}`, status: existing.status, decidedBy: existing.decidedBy ?? null });
           }
-          const rec = decideAsk(spoolDir, askM[1], askM[2] === "approve" ? "approved" : "denied", `companion:${v.phone.id}`);
+          // Three-verb map (c2a7ebe contract): yolo = one-shot full-auto, NOT
+          // a deny-else default — the binary map here would have silently
+          // recorded YOLO taps as denials, the exact bug class caught on the
+          // watcher's button path (round 11).
+          const rec = decideAsk(
+            spoolDir,
+            askM[1],
+            askM[2] === "approve" ? "approved" : askM[2] === "yolo" ? "yolo" : "denied",
+            `companion:${v.phone.id}`,
+          );
           if (!rec || rec.status === "pending") return json(res, 500, { error: "decision failed to record" });
           log(`companion: ask ${askM[1]} ${rec.status} by ${v.phone.id} — delivery pending watcher sweep`);
           return json(res, 200, { status: rec.status, askId: rec.askId });

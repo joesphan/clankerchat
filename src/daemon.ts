@@ -72,6 +72,7 @@ import { classifyAudit, filterAuditSince, type AuditLike } from "./audit.js";
 import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
 import {
   askClockLine,
+  askDecisionInstruction,
   askDecisionLine,
   buildAskCountdownEdit,
   buildDisabledAskComponents,
@@ -2489,11 +2490,7 @@ async function enqueueAskDecision(rec: AskRecord, clickerName: string): Promise<
       `"""`,
       rec.question,
       `"""`,
-      rec.status === "approved"
-        ? `The human approved — proceed with exactly what the ask requested, then answer in the thread.`
-        : rec.status === "yolo"
-          ? `The human YOLO'd — one-shot full-auto granted by their click: execute the ask's request now with no further asks, then answer in the thread with the receipt.`
-          : `The human denied — do NOT proceed; stand down and acknowledge the denial in the thread.`,
+      askDecisionInstruction(rec.status, clickerName),
     ].join("\n"),
     from: clickerName,
     fromId: rec.decidedBy!,
@@ -2557,11 +2554,7 @@ async function enqueueCompanionDecision(rec: AskRecord, name: string): Promise<v
       `"""`,
       rec.question,
       `"""`,
-      rec.status === "approved"
-        ? `The human approved — proceed with exactly what the ask requested, then answer in the thread.`
-        : rec.status === "yolo"
-          ? `The human YOLO'd — one-shot full-auto granted by their click: execute the ask's request now with no further asks, then answer in the thread with the receipt.`
-          : `The human denied — do NOT proceed; stand down and acknowledge the denial in the thread.`,
+      askDecisionInstruction(rec.status, name),
     ].join("\n"),
     from: name,
     fromId: client.user?.id ?? rec.askId,

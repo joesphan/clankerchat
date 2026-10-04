@@ -338,6 +338,14 @@ async function signedFetch(
 // purpose — rejecting a pairing must stay friction-free even mid-attack.
 // SDK note: FaceID on iOS needs a development build (Expo Go limitation);
 // there the API errors and we degrade to key-possession.
+/** Biometric prompt text per ask verb — YOLO says what it grants, because the
+ *  gesture is the biggest one on this screen (yolo-route-v12: one-shot
+ *  full-auto, no further asks). Doubles as the doctor bundle marker. */
+const PRESENCE_REASON: Record<"approve" | "deny" | "yolo", string> = {
+  approve: "Approve this ask",
+  deny: "Deny this ask",
+  yolo: "YOLO — one-shot full-auto, no further asks (yolo-route-v12)",
+};
 async function requirePresence(reason: string): Promise<boolean> {
   try {
     if (!(await LocalAuthentication.hasHardwareAsync())) return true;
@@ -824,9 +832,9 @@ export default function App() {
   );
 
   const doAskDecision = useCallback(
-    async (askId: string, verb: "approve" | "deny") => {
+    async (askId: string, verb: "approve" | "deny" | "yolo") => {
       if (!active || !seed || !phoneId) return;
-      if (!(await requirePresence(verb === "approve" ? "Approve this ask" : "Deny this ask"))) {
+      if (!(await requirePresence(PRESENCE_REASON[verb]))) {
         setError("presence declined — nothing sent");
         return;
       }
@@ -1249,6 +1257,13 @@ export default function App() {
                   <Text style={s.buttonText}>Deny</Text>
                 </Pressable>
               </View>
+              <Pressable
+                style={[s.button, s.yolo]}
+                disabled={busy}
+                onPress={() => void doAskDecision(a.askId, "yolo")}
+              >
+                <Text style={s.buttonText}>YOLO · full-auto once, no further asks</Text>
+              </Pressable>
             </View>
           ))
         : null}
@@ -1445,6 +1460,10 @@ const s = StyleSheet.create({
   button: { backgroundColor: "#7aa2f7", borderRadius: 10, paddingVertical: 12, paddingHorizontal: 22 },
   allow: { backgroundColor: "#9ece6a", flex: 1, alignItems: "center" },
   deny: { backgroundColor: "#f7768e", flex: 1, alignItems: "center" },
+  // YOLO sits full-width BELOW Approve/Deny — visually the escalation it is,
+  // not a third peer of the same weight (amber = caution-class, not the
+  // deny-red; it grants power rather than refusing it).
+  yolo: { backgroundColor: "#e0af68", alignSelf: "stretch", alignItems: "center", marginTop: 4 },
   buttonText: { color: "#1a1b26", fontWeight: "700", fontSize: 15 },
   chip: { backgroundColor: "#24283b", borderRadius: 999, paddingHorizontal: 14, paddingVertical: 8 },
   chipActive: { backgroundColor: "#7aa2f7" },

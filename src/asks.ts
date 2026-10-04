@@ -466,3 +466,19 @@ export function askDecisionLine(rec: AskRecord, decidedName: string): string {
   const verb = rec.status === "approved" ? "Approved" : rec.status === "denied" ? "Denied" : rec.status === "yolo" ? "YOLO'd" : "Expired";
   return `${verb} by ${decidedName} · ${t}Z`;
 }
+
+/** The per-status INSTRUCTION a decision run executes — ONE shared source for
+ *  every delivery surface (Discord click, phone tap, and any future one), so
+ *  a YOLO means one-shot full-auto no matter which host delivers the run.
+ *  Round-12 law: the delivery paths used to carry only the bare status word
+ *  ("[ask decision] YOLO by …"), leaving the semantics to whichever brain
+ *  read it — daemon.ts had the instructions inline, the watcher host didn't,
+ *  and the two hosts' YOLO runs would have behaved differently. deciderName
+ *  is display-only (authority was the API/signed-surface check upstream). */
+export function askDecisionInstruction(status: AskRecord["status"], deciderName: string): string {
+  if (status === "approved")
+    return `The human (${deciderName}) approved — proceed with exactly what the ask requested, then answer in the thread.`;
+  if (status === "yolo")
+    return `The human (${deciderName}) YOLO'd — one-shot full-auto granted by their gesture: execute the ask's request now with no further asks, then answer in the thread with the receipt.`;
+  return `The human (${deciderName}) denied — do NOT proceed; stand down and acknowledge the denial in the thread.`;
+}

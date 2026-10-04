@@ -20,10 +20,10 @@ export interface DoctorLine {
 /** Current UI marker embedded in the app source — the served dev bundle must
  *  contain it or the phone is being handed STALE CODE (the exact class that
  *  burned an evening: old cached bundle + degraded dev server). Bump this
- *  whenever the app's primary surface changes. Current literal = the biometric
- *  gate's refusal line (biometric round 2026-10-04) — only the gate-era
- *  bundle carries it. */
-export const BUNDLE_MARKER = "presence declined — nothing sent";
+ *  whenever the app's primary surface changes. Current literal = the YOLO
+ *  presence prompt (round 12: phone YOLO route + per-status decision
+ *  framing) — only round-12 bundles carry it. */
+export const BUNDLE_MARKER = "yolo-route-v12";
 
 function tcpReachable(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
   return new Promise((resolve) => {

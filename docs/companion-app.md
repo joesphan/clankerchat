@@ -113,7 +113,7 @@ app goes through the same `sanitizePeerText` discipline the tap block uses.
 | `POST /attempts/:id/allow` `{sas}` | typed peer SAS → same commit path as `pair --confirm` (mismatch = refuse, nothing written); audit event appended with `via=companion:<phoneFp>` |
 | `POST /attempts/:id/deny` | clear pairing state, nothing written |
 | `GET /asks` | pending asks, oldest first (round 4); no channel ids on the wire |
-| `POST /asks/:id/approve` \| `/deny` | decide with provenance `companion:<phoneFp>`; 409 carries the standing decision when the click/expiry won the race |
+| `POST /asks/:id/approve` \| `/deny` \| `/yolo` | decide with provenance `companion:<phoneFp>`; 409 carries the standing decision when the click/expiry won the race. `yolo` (round 12) records the distinct one-shot full-auto verb — never a deny-else default |
 | `POST /prompt` `{text, route?}` | write a prompt record (round 5); `route:"peer"` (multi-machine phase 1) routes it to the peer machine — unknown values or a lane-less machine are 400 at the door, never a silent expiry later |
 | `GET /prompts` `?q=` `?before=` | lifecycle chips + `?q=` search (round 5 / 5.1) + `?before=<createdAt ms>` strictly-older history pages (round 7, `?limit=` 1-50; invalid cursor = 400, never a silent default-list fall-through); `more` says whether older rows exist |
 | `GET /machine` | the machine card (round 6): pool, queues, lane verdict, peer recency, delivery-health + journal/audit alert lines |
@@ -140,6 +140,14 @@ warning (phones cannot reach it; pass `--bind` / set the env like the lane).
 - **Allow sheet** — types the peer's 8 characters (same normalization as the
   CLI), confirm gesture, sends the signed allow.
 - **Deny** — one tap, signed.
+- **ASK cards** — pending asks render with their live countdown and the
+  lazy-consensus disclosure ("silence = yes") when the ask auto-approves at
+  expiry. Approve/Deny are the peer buttons; **YOLO** (round 12) sits
+  full-width beneath them in amber — the escalation it is: one-shot
+  full-auto, no further asks, same biometric presence gate as Approve. The
+  run's per-status instruction comes from one shared helper
+  (`askDecisionInstruction`) on every delivery surface, so a phone YOLO and
+  a Discord YOLO execute identically.
 - **Prompt + route toggle** (round 5 + multi-machine phase 1) — composer
   carries a "run on: this machine / peer machine" chip pair (cyan, visually
   distinct from the blue machine-select chips). Peer routing is per-send

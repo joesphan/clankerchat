@@ -327,3 +327,28 @@ last 24h is already in the lane. Verified live: three restarts, one unacked
 degrade notice.
 
 187/187; watch+companion+botlink restarted and verified.
+
+## Round 12 — YOLO from the phone + one shared decision-instruction source (2026-10-04)
+
+Gap found by surface audit: c2a7ebe gave Discord cards a third verb (YOLO =
+one-shot full-auto) but the phone could only Approve/Deny — and BOTH watcher
+delivery paths (button click + phone tap) told the spawned run only the bare
+status word, so a YOLO run's semantics depended on which brain read it
+(daemon.ts inlined the instructions; the watcher host didn't). Same class as
+the round-11 binary-map bug: decision surfaces replicate the verb map and the
+framing independently.
+
+- src/asks.ts: `askDecisionInstruction(status, decider)` — ONE shared
+  per-status instruction (approved = proceed exactly as asked; yolo =
+  one-shot full-auto, no further asks, receipt in-thread; denied = stand
+  down). daemon.ts's two enqueue fns render from it; the watcher's two
+  delivery paths (button + companion) append it to the trigger content.
+- src/companion.ts: `/asks/:id/(approve|deny|yolo)` with the three-verb
+  decideAsk map — the binary map there was the round-11 bug class one commit
+  away from re-minting YOLO taps as denials.
+- App.tsx: YOLO button full-width in amber beneath Approve/Deny (the
+  escalation, not a third peer), presence-gated like Approve with a prompt
+  that says what it grants. New bundle marker literal (`yolo-route-v12`) —
+  doctor BUNDLE_MARKER bumped so pre-round-12 bundles read STALE.
+- 188/188 (+1 asks instruction test; companion yolo case inside the existing
+  route test).

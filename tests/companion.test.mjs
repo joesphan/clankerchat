@@ -793,6 +793,17 @@ test("asks routes: list pending, decide with provenance, races and replays stay 
     assert.equal(res.status, 200);
     assert.equal(getAsk(spool, lazy.askId).status, "denied");
 
+    // YOLO from the phone (round 12): third verb records "yolo" with phone
+    // provenance — NOT a deny-else default (the round-11 binary-map class).
+    const yoloAsk = createPendingAsk(spool, { question: "yolo me", channelId: "1", messageId: null, approvers: [A] });
+    res = await signed("POST", `/asks/${yoloAsk.askId}/yolo`);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).status, "yolo");
+    const yRec = getAsk(spool, yoloAsk.askId);
+    assert.equal(yRec.status, "yolo", "a YOLO tap is a YOLO decision");
+    assert.equal(yRec.decidedBy, `companion:${phone.fingerprint}`);
+    assert.ok(listCompanionDecisions(spool).some((r) => r.askId === yoloAsk.askId), "awaiting watcher delivery");
+
     // unknown ask id → 404
     res = await signed("POST", "/asks/no-such-ask/approve");
     assert.equal(res.status, 404);

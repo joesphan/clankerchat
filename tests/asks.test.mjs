@@ -28,6 +28,7 @@ import {
   listCompanionDecisions,
   renderAskForApp,
   askDecisionLine,
+  askDecisionInstruction,
   ASK_V2_FLAG,
   buildAskV2Components,
   askClockLine,
@@ -202,6 +203,17 @@ test("listPendingAsks lists every record file (registry view, all statuses)", ()
   decideAsk(spool, b.askId, "approved", APPROVER);
   const ids = listPendingAsks(spool).map((r) => r.askId).sort();
   assert.deepEqual(ids, [a.askId, b.askId].sort());
+});
+
+test("askDecisionInstruction carries the per-status execution semantics from ONE source", () => {
+  // round 12: every delivery surface (Discord click, phone tap) renders its
+  // run instruction from this helper — YOLO must mean one-shot full-auto on
+  // every host, not just whichever one happened to inline the words.
+  assert.match(askDecisionInstruction("approved", "fast335xi"), /approved.*proceed with exactly what the ask requested/s);
+  assert.match(askDecisionInstruction("yolo", "phone (companion)"), /YOLO'd.*one-shot full-auto.*no further asks/s);
+  assert.match(askDecisionInstruction("denied", "joesphan"), /denied.*do NOT proceed.*stand down/s);
+  // every branch names the decider — authority framing is display-only but always present
+  for (const s of ["approved", "yolo", "denied"]) assert.ok(askDecisionInstruction(s, "who").includes("who"));
 });
 
 test("askDecisionLine renders Approved/Denied/YOLO'd with the decider's display name", () => {
