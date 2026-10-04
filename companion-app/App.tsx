@@ -182,6 +182,17 @@ interface AskView {
   lazy: boolean;
 }
 
+/** A phone-originated prompt (GET /prompts, round 5) — status only: the
+ *  answer posts in Discord (the app push-notifies), the phone shows the
+ *  lifecycle pending → enqueued → answered/failed. */
+interface PromptView {
+  promptId: string;
+  text: string;
+  status: "pending" | "enqueued" | "answered" | "failed" | "expired";
+  createdAt: number;
+  finishedAt: number | null;
+}
+
 const K_SEED = "cc.seed";
 const K_MACHINES = "cc.machines";
 const K_COUNTERS = "cc.counters";
@@ -259,6 +270,8 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [attempt, setAttempt] = useState<AttemptView | null>(null);
   const [asks, setAsks] = useState<AskView[]>([]);
+  const [prompts, setPrompts] = useState<PromptView[]>([]);
+  const [promptText, setPromptText] = useState("");
   const [sasInput, setSasInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>("");
@@ -310,6 +323,10 @@ export default function App() {
         const askRes = await signedFetch(active, seed, phoneId, "GET", "/asks");
         if (!stopped && askRes.status === 200) {
           setAsks(Array.isArray(askRes.json.asks) ? (askRes.json.asks as unknown as AskView[]) : []);
+        }
+        const promptRes = await signedFetch(active, seed, phoneId, "GET", "/prompts");
+        if (!stopped && promptRes.status === 200) {
+          setPrompts(Array.isArray(promptRes.json.prompts) ? (promptRes.json.prompts as unknown as PromptView[]) : []);
         }
       } catch (e) {
         if (!stopped) setError(`unreachable: ${(e as Error).message}`);
@@ -453,6 +470,46 @@ export default function App() {
     [active, phoneId, seed],
   );
 
+  // Send an owner prompt to the active machine (round 5): the machine's
+  // watcher sweep turns it into an owner-priority run whose answer posts in
+  // Discord — this surface tracks the lifecycle, it is not the inbox.
+  const doSendPrompt = useCallback(async () => {
+    if (!active || !seed || !phoneId) return;
+    const text = promptText.trim();
+    if (!text) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const { status, json } = await signedFetch(active, seed, phoneId, "POST", "/prompt", { text });
+      if (status === 200) {
+        setNotice("Sent — the machine picks it up within ~15s; the answer posts in Discord.");
+        setPromptText("");
+      } else {
+        setError(String(json.error ?? `HTTP ${status}`));
+      }
+    } catch (e) {
+      setError(`unreachable: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [active, phoneId, promptText, seed]);
+
+  const promptStatusLine = (p: PromptView): string => {
+    switch (p.status) {
+      case "pending":
+        return "queued — waiting for the machine's sweep";
+      case "enqueued":
+        return "running — answer posts in Discord when done";
+      case "answered":
+        return "answered — check Discord";
+      case "failed":
+        return "run failed — ask again or from Discord";
+      case "expired":
+        return "never picked up — machine's delivery sweep was down";
+    }
+  };
+
   const secondsLeft = attempt ? Math.max(0, Math.floor((attempt.expiresAt - Date.now()) / 1000)) : 0;
 
   // ---- render ----
@@ -524,6 +581,7 @@ export default function App() {
                 setActive(m);
                 setAttempt(null);
                 setAsks([]);
+                setPrompts([]);
                 setNotice("");
                 setError("");
               }}
@@ -577,6 +635,50 @@ export default function App() {
             </View>
           ))
         : null}
+
+      {active ? (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>PROMPT THIS MACHINE</Text>
+          <TextInput
+            style={s.promptInput}
+            value={promptText}
+            onChangeText={setPromptText}
+            multiline
+            placeholder="What should the machine work on?"
+            placeholderTextColor="#565f89"
+          />
+          <Pressable
+            style={[s.button, (!promptText.trim() || busy) ? s.buttonDim : null]}
+            disabled={!promptText.trim() || busy}
+            onPress={() => void doSendPrompt()}
+          >
+            <Text style={s.buttonText}>Send</Text>
+          </Pressable>
+          <Text style={s.muted}>
+            Same trust as Approve up there — the machine runs it as an owner request and answers
+            in Discord (your app pings you).
+          </Text>
+        </View>
+      ) : null}
+
+      {active && prompts.length > 0 ? (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>SENT</Text>
+          {prompts
+            .slice()
+            .reverse()
+            .map((p) => (
+              <View key={p.promptId} style={s.promptRow}>
+                <Text style={s.muted} numberOfLines={2}>
+                  {p.text}
+                </Text>
+                <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
+                  {promptStatusLine(p)}
+                </Text>
+              </View>
+            ))}
+        </View>
+      ) : null}
 
       {active && !attempt ? (
         <View style={s.card}>
@@ -655,6 +757,17 @@ const s = StyleSheet.create({
     fontSize: 22,
     letterSpacing: 2,
   },
+  promptInput: {
+    color: "#c0caf5",
+    backgroundColor: "#1f2335",
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 15,
+    minHeight: 72,
+    textAlignVertical: "top",
+  },
+  promptRow: { borderTopWidth: 1, borderTopColor: "#1f2335", paddingTop: 8, gap: 2 },
+  buttonDim: { opacity: 0.4 },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
   button: { backgroundColor: "#7aa2f7", borderRadius: 10, paddingVertical: 12, paddingHorizontal: 22 },
   allow: { backgroundColor: "#9ece6a", flex: 1, alignItems: "center" },

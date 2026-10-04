@@ -35,6 +35,12 @@ import path from "node:path";
 import { appendInjectEvent, fingerprintOfPublicKey, parseKey } from "./botlink.js";
 import { decideAsk, getAsk, listPendingAsks, renderAskForApp } from "./asks.js";
 import {
+  createPhonePrompt,
+  listPhonePrompts,
+  renderPromptForApp,
+  type PromptRecord,
+} from "./prompts.js";
+import {
   attemptIdOfState,
   buildConfirmPlan,
   clearPairingState,
@@ -422,6 +428,50 @@ export function startCompanionServer(opts: {
           if (!rec || rec.status === "pending") return json(res, 500, { error: "decision failed to record" });
           log(`companion: ask ${askM[1]} ${rec.status} by ${v.phone.id} — delivery pending watcher sweep`);
           return json(res, 200, { status: rec.status, askId: rec.askId });
+        }
+
+        // --- prompts from the phone (round 5, 2026-10-04): the same trust
+        // --- class as ask decisions, aimed the other way — the enrolled
+        // --- phone STARTS work instead of gating it. This surface writes a
+        // --- prompt record and never delivers: the watcher's 15s sweep
+        // --- claims it and enqueues an owner-priority run; the answer lands
+        // --- in Discord (the owner's app push-notifies), the phone polls
+        // --- status only. Text is data like any Discord content.
+        if (method === "GET" && url.pathname === "/prompts") {
+          const now = Date.now();
+          const prompts = listPhonePrompts(spoolDir)
+            .filter(
+              (r) =>
+                r.status === "pending" ||
+                r.status === "enqueued" ||
+                (r.finishedAt ?? 0) > now - 30 * 60 * 1000, // recent history chips
+            )
+            .slice(-20) // newest 20 — a scroll, not the registry
+            .map(renderPromptForApp);
+          return json(res, 200, { prompts });
+        }
+
+        if (method === "POST" && url.pathname === "/prompt") {
+          let msg: Record<string, unknown>;
+          try {
+            msg = JSON.parse(body.toString("utf8") || "{}") as Record<string, unknown>;
+          } catch {
+            return json(res, 400, { error: "body is not JSON" });
+          }
+          if (typeof msg.text !== "string" || !msg.text.trim()) {
+            return json(res, 400, { error: "text required" });
+          }
+          let rec: PromptRecord;
+          try {
+            rec = createPhonePrompt(spoolDir, { text: msg.text, fp: v.phone.id });
+          } catch (err) {
+            const e = (err as Error).message;
+            const full = e.includes("queue full");
+            log(`companion: prompt from ${v.phone.id} refused — ${e}`);
+            return json(res, full ? 429 : 400, { error: e });
+          }
+          log(`companion: prompt ${rec.promptId} from ${v.phone.id} (${rec.text.length} chars) — pickup pending watcher sweep`);
+          return json(res, 200, { promptId: rec.promptId, status: rec.status });
         }
 
         const allowM = url.pathname.match(/^\/attempts\/([0-9a-f]{1,64})\/allow$/);

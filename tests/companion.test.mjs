@@ -492,3 +492,100 @@ test("asks routes: list pending, decide with provenance, races and replays stay 
     listener.close();
   }
 });
+
+test("prompt routes (round 5): send from the phone, list lifecycle, caps and auth", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(spool, { recursive: true });
+  const logs = [];
+  const listener = startCompanionServer({
+    bind: "127.0.0.1",
+    port: 0,
+    paths: p,
+    spoolDir: spool,
+    store,
+    log: (l) => logs.push(l),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+
+  try {
+    // unsigned → 401 before any handler (same gate as every signed route)
+    let res = await fetch(base + "/prompt", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "spoofed" }),
+    });
+    assert.equal(res.status, 401);
+
+    res = await signed("GET", "/prompts");
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).prompts, [], "empty list");
+
+    // empty text → 400
+    res = await signed("POST", "/prompt", { text: "   " });
+    assert.equal(res.status, 400);
+
+    // happy path
+    res = await signed("POST", "/prompt", { text: "what's the machine doing?" });
+    assert.equal(res.status, 200);
+    const { promptId, status } = await res.json();
+    assert.equal(status, "pending");
+    assert.match(promptId, /^pmt[a-z]{8}$/);
+
+    // lifecycle visibility: watcher-side transitions show through the list
+    const { stampPromptEnqueued, finishPrompt } = await import("../dist/prompts.js");
+    stampPromptEnqueued(spool, promptId);
+    finishPrompt(spool, promptId, { exit: 0, posted: true });
+    res = await signed("GET", "/prompts");
+    const listed = (await res.json()).prompts;
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].status, "answered");
+    assert.equal(listed[0].promptId, promptId);
+    assert.equal(listed[0].fp, undefined, "no fingerprint on the wire");
+    assert.equal(listed[0].channelId, undefined, "no channel ids on the wire");
+
+    // queue-full cap → 429 (5 in flight max)
+    for (let i = 0; i < 5; i++) {
+      res = await signed("POST", "/prompt", { text: `filler ${i}` });
+      assert.equal(res.status, 200);
+    }
+    res = await signed("POST", "/prompt", { text: "one too many" });
+    assert.equal(res.status, 429);
+    assert.match(String((await res.json()).error), /queue full/);
+
+    // replay of a burned counter → 403, nothing written
+    counter -= 1;
+    const body = Buffer.from(JSON.stringify({ text: "replayed" }));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage("POST", "/prompt", sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    res = await fetch(base + "/prompt", {
+      method: "POST",
+      headers: { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig, "content-type": "application/json" },
+      body,
+    });
+    assert.equal(res.status, 403, "replayed counter refused");
+    const inFlight = (await import("../dist/prompts.js")).listPhonePrompts(spool).filter((r) => r.text === "replayed");
+    assert.equal(inFlight.length, 0, "replay prompted nothing");
+  } finally {
+    listener.close();
+  }
+});
