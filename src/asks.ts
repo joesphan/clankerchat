@@ -118,6 +118,29 @@ export function askCustomId(askId: string, action: "approve" | "deny"): string {
   return `ask:${askId}:${action}`;
 }
 
+/** Sentinel prefix for the live countdown line (buildAskCountdownEdit). */
+export const ASK_COUNTDOWN_PREFIX = "⏳";
+
+/** Live countdown edit: while an ask is PENDING, the watcher PATCHes the
+ *  card once a minute with a fresh "⏳ Xm left" line — humans see the fuse
+ *  burning in-channel without opening the app. Idempotent by sentinel: any
+ *  existing ⏳-prefixed line is REPLACED, never duplicated. The caller must
+ *  re-send the button row unchanged (an edit that dropped components would
+ *  kill the ask); null = nothing to edit (decided or already past expiry). */
+export function buildAskCountdownEdit(
+  content: string,
+  rec: Pick<AskRecord, "status" | "expiresAt">,
+  now = Date.now(),
+): { content: string; minutesLeft: number } | null {
+  if (rec.status !== "pending" || rec.expiresAt <= now) return null;
+  const minutesLeft = Math.max(1, Math.ceil((rec.expiresAt - now) / 60_000));
+  const lines = String(content ?? "")
+    .split("\n")
+    .filter((l) => !l.startsWith(ASK_COUNTDOWN_PREFIX));
+  lines.push(`${ASK_COUNTDOWN_PREFIX} ${minutesLeft}m left`);
+  return { content: lines.join("\n"), minutesLeft };
+}
+
 /** Inverse of askCustomId — returns null for anything not ours. A foreign
  *  custom_id (another bot's component on a message we can see) must parse to
  *  null so the handler ignores it instead of crashing. */

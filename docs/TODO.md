@@ -56,12 +56,17 @@ react-native) — mine them before designing.
   (question as text display, buttons as section accessory). VERIFY discord.js/raw-REST
   support for the IS_COMPONENTS_V2 message flag in our pinned versions before designing.
 - [ ] **Prompt search on the phone** (app-side): search box wired to GET
-  /prompts?q= (server half shipped — see Now section).
-- [ ] **Ask expiry countdown edit**: watcher edits the ask message with a live-ish
-  countdown once per minute while pending (one PATCH/min, stop at decision) — humans
-  see the lazy-consensus fuse burning.
+  /prompts?q= (server half shipped — see Now section). Fork shipped theirs
+  (9f5af5a, incl. signedFetch pathname-only) — awaiting lane cite to port.
+- [x] ~~**Ask expiry countdown edit**~~ SHIPPED: buildAskCountdownEdit in
+  asks.ts (sentinel-idempotent "⏳ Xm left" line, ceil minutes min 1, null once
+  decided/expired) + the watcher's 60s loop PATCHes each pending ask's message
+  once a minute with the button row passed back unchanged; the expiry sweep
+  owns terminal state, the countdown only decorates it.
+  (cherry-picked from fork 19144eb.)
 - [ ] **Doctor → phone**: the doctor's FAIL lines (sweep down, stale bundle) are exactly
   what the MACHINE card should escalate in red, not just journal text.
+  Fork shipped theirs (7e2305a, /machine `alerts`) — awaiting lane cite to port.
 
 ## Ideas (parked — owner decision or bigger design)
 
