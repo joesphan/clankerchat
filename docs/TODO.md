@@ -58,9 +58,11 @@ react-native) — mine them before designing.
 - [x] ~~**Prompt search on the phone** (app-side)~~ SHIPPED: FIND card —
   one-shot search (submit/button, not per-keystroke), results newest-first
   with status + excerpt; signedFetch signs pathname-only so ?q= rides free.
-- [ ] **Ask expiry countdown edit**: watcher edits the ask message with a live-ish
-  countdown once per minute while pending (one PATCH/min, stop at decision) — humans
-  see the lazy-consensus fuse burning.
+- [x] ~~**Ask expiry countdown edit**~~ SHIPPED: buildAskCountdownEdit in
+  asks.ts (sentinel-idempotent "⏳ Xm left" line, ceil minutes min 1, null once
+  decided/expired) + the watcher's 60s loop PATCHes each pending ask's message
+  once a minute with the button row passed back unchanged; the expiry sweep
+  owns terminal state, the countdown only decorates it.
 - [x] ~~**Doctor → phone**~~ SHIPPED: /machine serves `alerts` — the two
   FAIL lines a pocket owner can act on (stuck pending prompts >60s,
   phone-decided asks undelivered), same file scans as the CLI doctor,

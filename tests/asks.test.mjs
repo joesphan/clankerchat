@@ -11,7 +11,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  ASK_COUNTDOWN_PREFIX,
   ASK_TTL_MS,
+  buildAskCountdownEdit,
   buildAskComponents,
   buildDisabledAskComponents,
   askCustomId,
@@ -299,4 +301,29 @@ test("renderAskForApp: question + clock + lazy flag, and NOTHING else", () => {
   assert.equal(view.question, "ship it?");
   assert.equal(view.channelId, undefined, "no channel ids on the phone surface");
   assert.equal(view.approvers, undefined);
+});
+
+test("countdown edit (TODO round): one ⏳ line, replaced not duplicated, null when terminal", () => {
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, { question: "fuse?", channelId: "1", messageId: "m1", approvers: [APPROVER] });
+  const now = Date.now();
+  // 5.5 minutes left → ceil = 6, never 0
+  const t0 = rec.expiresAt - 330_000;
+  const first = buildAskCountdownEdit(`**fuse?**\nbuttons above`, rec, t0);
+  assert.ok(first);
+  assert.equal(first.minutesLeft, 6);
+  assert.ok(first.content.endsWith("⏳ 6m left"));
+  // second edit on ALREADY-countdown content → the old line is replaced
+  const second = buildAskCountdownEdit(first.content, rec, t0 + 60_000);
+  assert.ok(second);
+  assert.equal(second.content.match(/⏳/g)?.length, 1, "exactly one countdown line");
+  assert.ok(second.content.endsWith("⏳ 5m left"));
+  assert.ok(second.content.includes("**fuse?**"), "question text preserved");
+  // sub-minute remainder floors to "1m left", never 0
+  const last = buildAskCountdownEdit(first.content, rec, rec.expiresAt - 5_000);
+  assert.equal(last?.minutesLeft, 1);
+  // terminal states: decided → null; past expiry → null (expiry sweep owns it)
+  const decided = decideAsk(spool, rec.askId, "approved", APPROVER);
+  assert.equal(buildAskCountdownEdit("x", decided, now), null);
+  assert.equal(buildAskCountdownEdit("x", { status: "pending", expiresAt: now - 1 }, now), null);
 });
