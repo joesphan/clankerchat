@@ -210,6 +210,10 @@ interface MachineView {
   lastRunAt: string | null;
   updated: string | null;
   stale: boolean;
+  /** Median received→consumed for injects this machine handled, from the
+   *  audit log (chain-verified server-side). Null = no paired events. */
+  laneHealthMs: number | null;
+  lanePaired: number;
 }
 
 const K_SEED = "cc.seed";
@@ -699,6 +703,11 @@ export default function App() {
       {active && machine ? (
         <View style={s.card}>
           <Text style={s.cardTitle}>MACHINE</Text>
+          {machine.lanePaired > 0 && machine.laneHealthMs !== null ? (
+            <Text style={s.muted}>
+              injects: {(machine.laneHealthMs / 1000).toFixed(1)}s median · {machine.lanePaired} paired
+            </Text>
+          ) : null}
           {machine.stale ? (
             <Text style={s.err}>state stale — watcher stopped writing?</Text>
           ) : (

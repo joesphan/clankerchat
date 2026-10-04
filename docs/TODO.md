@@ -21,11 +21,16 @@ react-native) — mine them before designing.
   FaceID-in-Expo-Go degrades to key-possession (SDK limitation).
 - [x] ~~SecureStore for the phone signing key~~ — already done (K_SEED via
   expo-secure-store in App.tsx; verified 2026-10-04).
+- [x] ~~**Lane inject round-trip metric on the phone**~~ SHIPPED: /machine
+  serves `laneHealthMs`/`lanePaired` from the chain-verified inject.log
+  (deriveInjectMetrics — survives watcher death, omitted honestly on a
+  corrupt log); MACHINE card renders "injects: X.Xs median · N paired".
+- [x] ~~**Prompt search on the phone** (server-side)~~ SHIPPED: GET
+  /prompts?q= searches the WHOLE registry (promptId or text substring,
+  case-insensitive, newest 50) — signature covers pathname only, so the
+  query never breaks auth. App-side search box = next round.
 - [ ] **Phone-prompt history navigation**: SENT list is newest-20 only; a "load more"
   or per-prompt detail view (full excerpt, timestamps) once real usage shows the need.
-- [ ] **Lane inject round-trip metric on the phone**: MACHINE card shows peer
-  injects_total; add the median received→consumed from `botlink-server report`
-  (already computed) as a lane health line.
 
 ## Next (design first)
 
@@ -50,11 +55,11 @@ react-native) — mine them before designing.
   — Container/Section/Text Display (types 9/10/17) would give ask cards real structure
   (question as text display, buttons as section accessory). VERIFY discord.js/raw-REST
   support for the IS_COMPONENTS_V2 message flag in our pinned versions before designing.
+- [ ] **Prompt search on the phone** (app-side): search box wired to GET
+  /prompts?q= (server half shipped — see Now section).
 - [ ] **Ask expiry countdown edit**: watcher edits the ask message with a live-ish
   countdown once per minute while pending (one PATCH/min, stop at decision) — humans
   see the lazy-consensus fuse burning.
-- [ ] **Prompt search on the phone** (server-side): GET /prompts?q= — promptId lookup
-  so the owner can find "that thing I asked Tuesday" without scroll.
 - [ ] **Doctor → phone**: the doctor's FAIL lines (sweep down, stale bundle) are exactly
   what the MACHINE card should escalate in red, not just journal text.
 
