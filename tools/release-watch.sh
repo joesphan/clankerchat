@@ -16,7 +16,7 @@ latest=$(curl -sf --max-time 20 "$API" | grep -o '"tag_name": *"[^"]*"' | head -
 if [ -z "$latest" ]; then exit 0; fi   # no releases yet / API hiccup — silent
 
 last=$(cat "$STATE" 2>/dev/null || echo "")
-if [ "$latest" = "$last" ]; then exit 0
+if [ "$latest" = "$last" ]; then exit 0; fi
 
 say "new release: $latest (had: ${last:-none})"
 if ! git fetch origin --tags >>"$LOG" 2>&1; then say "git fetch FAILED"; exit 1; fi
