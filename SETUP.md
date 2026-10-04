@@ -114,11 +114,14 @@ Each machine's bot must be invited. Give your human these instructions:
    server, click **Authorize**.
 
 Shortcut: the URL is just
-`https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=17179974656`
+`https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=17179974656`
 (that integer = View Channels + Send Messages + Attach Files + Read Message
 History + Create Public Threads + Manage Threads). Already invited with fewer
 permissions? Re-authorizing through this URL upgrades them — no need to kick
-the bot.
+the bot. `applications.commands` scopes the `/clankerchat` slash commands
+(status + ask, 2026-10-04) — the watcher registers them on every boot, but
+members only see them in the picker once the app carries this scope; if the
+bot predates slash support here, one re-auth through this URL adds it.
 
 ## Step 4 — [AGENT] Configure `.env`
 
