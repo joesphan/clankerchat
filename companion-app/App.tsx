@@ -451,13 +451,14 @@ export default function App() {
     };
   }, [active, seed, phoneId]);
 
-  // Notification permission: ask once on mount. Denied (or Expo Go quirk) →
-  // scheduleNotificationAsync just no-ops into its catch; the in-app cards
-  // are unchanged either way.
+  // Notification permission: ask once on mount. A denial is SURFACED (quiet
+  // notice line) rather than swallowed — "no banner" with no reason is
+  // undebuggable from the phone; "notifications denied" is actionable.
   useEffect(() => {
     void (async () => {
       try {
-        await Notifications.requestPermissionsAsync();
+        const p = await Notifications.requestPermissionsAsync();
+        if (!p.granted) setNotice("notifications not permitted — banners won't show (check OS settings)");
       } catch {
         /* no notification surface (desktop web preview) — fine */
       }
@@ -481,7 +482,9 @@ export default function App() {
             body: String(p.answerExcerpt ?? p.text ?? "").slice(0, 140),
           },
           trigger: null, // local, immediate
-        }).catch(() => {});
+          // surfaced, not swallowed: a silent catch here means "no banner"
+          // with zero signal, which cost us a debugging round once already
+        }).catch((e) => setError(`notification failed: ${(e as Error).message}`));
       }
       seenPromptStatus.current.set(p.promptId, p.status);
     }
