@@ -214,6 +214,8 @@ interface MachineView {
    *  audit log (chain-verified server-side). Null = no paired events. */
   laneHealthMs: number | null;
   lanePaired: number;
+  /** Doctor-subset FAIL lines (delivery health) — rendered in red. */
+  alerts: string[];
 }
 
 const K_SEED = "cc.seed";
@@ -739,6 +741,13 @@ export default function App() {
       {active && machine ? (
         <View style={s.card}>
           <Text style={s.cardTitle}>MACHINE</Text>
+          {machine.alerts?.length
+            ? machine.alerts.map((a, i) => (
+                <Text key={`alert-${i}`} style={s.err}>
+                  ⚠ {a}
+                </Text>
+              ))
+            : null}
           {machine.lanePaired > 0 && machine.laneHealthMs !== null ? (
             <Text style={s.muted}>
               injects: {(machine.laneHealthMs / 1000).toFixed(1)}s median · {machine.lanePaired} paired

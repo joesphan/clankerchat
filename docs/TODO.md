@@ -61,8 +61,11 @@ react-native) — mine them before designing.
 - [ ] **Ask expiry countdown edit**: watcher edits the ask message with a live-ish
   countdown once per minute while pending (one PATCH/min, stop at decision) — humans
   see the lazy-consensus fuse burning.
-- [ ] **Doctor → phone**: the doctor's FAIL lines (sweep down, stale bundle) are exactly
-  what the MACHINE card should escalate in red, not just journal text.
+- [x] ~~**Doctor → phone**~~ SHIPPED: /machine serves `alerts` — the two
+  FAIL lines a pocket owner can act on (stuck pending prompts >60s,
+  phone-decided asks undelivered), same file scans as the CLI doctor,
+  inlined per-poll and rendered red as ⚠ lines. Metro/bundle freshness
+  stays CLI-doctor-only (a 2s poll must not curl the dev server).
 
 ## Ideas (parked — owner decision or bigger design)
 
