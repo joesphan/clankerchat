@@ -116,7 +116,13 @@ react-native) — mine them before designing.
   decidedBy joesphan; orchestrator relay 1556362271331057765). Remaining:
   PEER PORTS THEIR HALF (inject-consumer outcome emit + sweep route branch +
   canRouteToPeer) — rides their merge per the fork law; first live routed
-  prompt pmtroute0001 sent 17:34Z (inject ack 1791135289748-17f1e7). Phase 2
+  prompt pmtroute0001 sent 17:34Z (inject ack 1791135289748-17f1e7). Their
+  port landed as 4c05af1 (route branch + outcome intake, merged our side in
+  184e6b0) but is MISSING the answering half — no consumer branch emits
+  prompt-outcome when an inbound question-task run finishes on their machine,
+  so them→us routing is complete end-to-end while us→them runs the question
+  and rots honestly at 30 min; gap + fix shape reported in lane receipt
+  1791136610681-e4f97a, live probe pmroute0002 sent 17:57Z. Phase 2
   (peer index view) deferred until routing shows real use.
 - [ ] Watcher-side own-post noise meter: count own posts per thread per hour, journal
   a NOISE line past a threshold — enforcement visibility for the quiet-discord law.
