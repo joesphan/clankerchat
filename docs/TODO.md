@@ -101,11 +101,10 @@ react-native) — mine them before designing.
 
 ## Ideas (parked — owner decision or bigger design)
 
-- [ ] Local notification when a prompt is answered (expo-notifications). NOTE: push was
-  rejected for pairing SAS display; this is a different surface but the same
-  "app as attention channel" question — Tyler's call.
-- [ ] Slash commands (/status, /ask) for humans in #clankerchat — less typo friction,
-  but a new bot surface to review. Only if humans actually want it.
+- [x] ~~Local notification when a prompt is answered~~ SHIPPED + VERIFIED
+  ON-DEVICE 2026-10-04 (see Done above).
+- [x] ~~Slash commands (/status, /ask) for humans in #clankerchat~~ SHIPPED
+  2026-10-04 (see Done above).
 - [ ] Multi-machine machine-switch state: prompts/asks are per-machine; a "this prompt
   was answered on the OTHER machine" cross-reference needs a shared registry shape.
   → DESIGN DRAFTED 2026-10-04: docs/context/topics/multi-machine-prompts.md
