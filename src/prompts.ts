@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { findLeakSignals } from "./leaks.js";
 
 // Phone-originated owner prompts (round 5, 2026-10-04): the enrolled phone can
 // APPROVE asks (round 4) and commit key rotations; this file adds the same
@@ -24,6 +25,11 @@ export interface PromptRecord {
   /** Creator provenance: the enrolled phone's fingerprint (never a
    *  self-reported name). */
   fp: string;
+  /** Multi-machine routing hint (phase 1, docs/context/topics/
+   *  multi-machine-prompts.md): "peer" = the PEER machine runs this prompt;
+   *  the record stays HERE and the outcome echoes back over the lane.
+   *  Absent = this machine runs it (default, back-compat). */
+  route?: "peer";
   createdAt: number;
   status: PhonePromptStatus;
   /** Watcher claim stamp — set once, exactly-once. */
@@ -42,6 +48,16 @@ export interface PromptRecord {
  *  watcher is alive, so anything still pending that long means the delivery
  *  machinery is down — the record says so on the phone instead of hanging. */
 export const PROMPT_TTL_MS = 15 * 60 * 1000;
+/** Routed prompts (route:"peer") get a wider window — decided 2026-10-04,
+ *  owner-delegated (channel post 1556355104607707247): the 15-min local claim
+ *  window plus lane round-trip margin (peer queue wait + their 10-min run +
+ *  the outcome echo). One budget for the WHOLE lifecycle: pending past it
+ *  expires; enqueued past it fails honestly (the peer's emit never came). */
+export const ROUTED_PROMPT_TTL_MS = 30 * 60 * 1000;
+/** promptIds are filename-derived (`pmt` + 8 lowercase here) but lane echoes
+ *  carry caller-chosen ids — anything that could dodge a path component is
+ *  refused before it reaches the filesystem. */
+export const PROMPT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /** Thumb-mash guard: the phone queue holds a handful of in-flight prompts,
  *  not an unbounded scroll. Finished records never count against this. */
 export const MAX_PENDING_PROMPTS = 5;
@@ -71,14 +87,20 @@ function writePrompt(spoolDir: string, rec: PromptRecord): void {
 
 /** Create a pending prompt from the signed phone surface. Text is trimmed and
  *  hard-capped (not rejected — a thumb that overruns still means something).
- *  Throws when the pending queue is full (the route maps that to 429). */
+ *  `route:"peer"` marks the PEER machine as the runner (phase 1) — anything
+ *  else in that field is refused, not silently ignored (the phone must never
+ *  believe a prompt routed somewhere it didn't). Throws when the pending
+ *  queue is full (the route maps that to 429). */
 export function createPhonePrompt(
   spoolDir: string,
-  input: { text: string; fp: string },
+  input: { text: string; fp: string; route?: "peer" },
 ): PromptRecord {
   const text = String(input.text ?? "").trim().slice(0, MAX_PROMPT_CHARS);
   if (!text) throw new Error("empty prompt");
   if (typeof input.fp !== "string" || !input.fp) throw new Error("missing phone fingerprint");
+  if (input.route !== undefined && input.route !== "peer") {
+    throw new Error(`unknown route "${String(input.route).slice(0, 16)}" — only "peer" is routable`);
+  }
   const pending = listPhonePrompts(spoolDir).filter((r) => r.status === "pending" || r.status === "enqueued");
   if (pending.length >= MAX_PENDING_PROMPTS) {
     throw new Error(`prompt queue full (${MAX_PENDING_PROMPTS} in flight) — wait for one to finish`);
@@ -87,6 +109,7 @@ export function createPhonePrompt(
     promptId: newPromptId(),
     text,
     fp: input.fp,
+    ...(input.route === "peer" ? { route: "peer" as const } : {}),
     createdAt: Date.now(),
     status: "pending",
   };
@@ -117,11 +140,15 @@ export function listPhonePrompts(spoolDir: string): PromptRecord[] {
   }
 }
 
+/** A record's rot deadline: routed prompts carry the 30-min lane round-trip
+ *  budget, local ones the 15-min claim window. */
+function rotDeadline(rec: PromptRecord): number {
+  return rec.createdAt + (rec.route === "peer" ? ROUTED_PROMPT_TTL_MS : PROMPT_TTL_MS);
+}
+
 /** Records the watcher has not yet claimed: pending and not past TTL. */
 export function listClaimablePrompts(spoolDir: string, now = Date.now()): PromptRecord[] {
-  return listPhonePrompts(spoolDir).filter(
-    (r) => r.status === "pending" && r.createdAt + PROMPT_TTL_MS > now,
-  );
+  return listPhonePrompts(spoolDir).filter((r) => r.status === "pending" && rotDeadline(r) > now);
 }
 
 /** The watcher's claim ticket: pending → enqueued, exactly once. Null when
@@ -171,12 +198,40 @@ export function finishPrompt(
   return next;
 }
 
+/** Receive-side outcome echo (phase 1): the PEER machine ran a routed prompt
+ *  and reported {promptId, exit, posted, excerpt} over the lane. The daemon
+ *  verified shape at the door and landed it as a file; THIS function is the
+ *  watcher's apply step. Guards, in order: the id is shape-safe (never a
+ *  path component), the record exists, and it is a ROUTED record still in
+ *  flight (or a stuck-sweep guess — a late real outcome wins, same law as
+ *  local runs). A LOCAL record is untouchable from the lane: its outcome
+ *  only ever comes from this machine's own run-exit hook. Registry miss or
+ *  wrong class → null, caller drops + journals — the echo only ever touches
+ *  a record WE created for routing. The excerpt is phone DISPLAY data and
+ *  leak-shape-checked here (defense in depth past the daemon's door check);
+ *  on trip the phone gets no preview, not the secret. */
+export function applyPeerPromptOutcome(
+  spoolDir: string,
+  outcome: { promptId: string; exit: number; posted: boolean; excerpt?: string },
+): PromptRecord | null {
+  if (typeof outcome.promptId !== "string" || !PROMPT_ID_RE.test(outcome.promptId)) return null;
+  const rec = getPrompt(spoolDir, outcome.promptId);
+  if (!rec || rec.route !== "peer") return null;
+  const rawExcerpt = String(outcome.excerpt ?? "");
+  const excerpt = rawExcerpt && findLeakSignals(rawExcerpt).length === 0 ? rawExcerpt : "";
+  return finishPrompt(spoolDir, outcome.promptId, {
+    exit: Number.isInteger(outcome.exit) ? outcome.exit : -1,
+    posted: outcome.posted === true,
+    excerpt,
+  });
+}
+
 /** Rot overdue pending prompts to expired (delivery machinery down — say so
  *  on the phone instead of hanging a spinner forever). */
 export function sweepExpiredPrompts(spoolDir: string, now = Date.now()): PromptRecord[] {
   const swept: PromptRecord[] = [];
   for (const rec of listPhonePrompts(spoolDir)) {
-    if (rec.status === "pending" && rec.createdAt + PROMPT_TTL_MS <= now) {
+    if (rec.status === "pending" && rotDeadline(rec) <= now) {
       const next: PromptRecord = { ...rec, status: "expired", finishedAt: now };
       try {
         writePrompt(spoolDir, next);
@@ -193,13 +248,19 @@ export function sweepExpiredPrompts(spoolDir: string, now = Date.now()): PromptR
  *  drop, watcher crash between claim and exit, spawn failure) would hang the
  *  phone's chip on "running" forever — every other sweep only touches
  *  PENDING records, so "enqueued" is a one-way door whose only key is a live
- *  run. RUN_TIMEOUT is 10min; 20min covers queue wait on top. Rotates to
+ *  run. RUN_TIMEOUT is 10min; 20min covers queue wait on top. ROUTED records
+ *  instead rot on the whole-lifecycle budget (their "run" is a lane
+ *  round-trip: peer queue + their 10-min run + the outcome echo — 20 min
+ *  would cut off a healthy peer behind one queued job). A late echo can
+ *  still overwrite the guess (finishPrompt's late-finish path). Rotates to
  *  failed so the phone says "ask again" instead of spinning. */
 export const STUCK_ENQUEUED_MS = 20 * 60 * 1000;
 export function sweepStuckEnqueued(spoolDir: string, now = Date.now()): PromptRecord[] {
   const swept: PromptRecord[] = [];
   for (const rec of listPhonePrompts(spoolDir)) {
-    if (rec.status === "enqueued" && (rec.enqueuedAt ?? rec.createdAt) + STUCK_ENQUEUED_MS <= now) {
+    const deadline =
+      rec.route === "peer" ? rotDeadline(rec) : (rec.enqueuedAt ?? rec.createdAt) + STUCK_ENQUEUED_MS;
+    if (rec.status === "enqueued" && deadline <= now) {
       const next: PromptRecord = { ...rec, status: "failed", finishedAt: now, exit: -1 };
       try {
         writePrompt(spoolDir, next);
@@ -250,6 +311,7 @@ export function renderPromptForApp(rec: PromptRecord): Record<string, unknown> {
     promptId: rec.promptId,
     text: rec.text,
     status: rec.status,
+    route: rec.route ?? null, // "peer" chips render where the answer will come from
     createdAt: rec.createdAt,
     finishedAt: rec.finishedAt ?? null,
     answerExcerpt: rec.answerExcerpt ?? null,

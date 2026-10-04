@@ -350,6 +350,10 @@ export function startCompanionServer(opts: {
   spoolDir: string;
   store: CompanionStore;
   log: (line: string) => void;
+  /** Routed prompts (phase 1): true when THIS machine can send to a peer
+   *  over the lane. Absent/false → POST /prompt with route:"peer" is refused
+   *  at the door — a 30-min honest-expiry lie is worse than a 400 now. */
+  canRouteToPeer?: () => boolean;
 }): { close: () => void; port: number } {
   const { store, paths, spoolDir, log } = opts;
   const server = http.createServer((req, res) => {
@@ -577,17 +581,32 @@ export function startCompanionServer(opts: {
           if (typeof msg.text !== "string" || !msg.text.trim()) {
             return json(res, 400, { error: "text required" });
           }
+          // Routed prompts (phase 1): route:"peer" asks the PEER machine to
+          // run this. Refused here — not expired later — when the lane isn't
+          // configured; any other route value is refused outright (the phone
+          // must never believe a prompt routed somewhere it didn't).
+          if (msg.route !== undefined && msg.route !== "peer") {
+            return json(res, 400, { error: `unknown route — only "peer" is routable` });
+          }
+          if (msg.route === "peer" && !opts.canRouteToPeer?.()) {
+            log(`companion: routed prompt from ${v.phone.id} refused — no lane configured on this machine`);
+            return json(res, 400, { error: "this machine has no peer lane configured — route unavailable" });
+          }
           let rec: PromptRecord;
           try {
-            rec = createPhonePrompt(spoolDir, { text: msg.text, fp: v.phone.id });
+            rec = createPhonePrompt(spoolDir, {
+              text: msg.text,
+              fp: v.phone.id,
+              ...(msg.route === "peer" ? { route: "peer" as const } : {}),
+            });
           } catch (err) {
             const e = (err as Error).message;
             const full = e.includes("queue full");
             log(`companion: prompt from ${v.phone.id} refused — ${e}`);
             return json(res, full ? 429 : 400, { error: e });
           }
-          log(`companion: prompt ${rec.promptId} from ${v.phone.id} (${rec.text.length} chars) — pickup pending watcher sweep`);
-          return json(res, 200, { promptId: rec.promptId, status: rec.status });
+          log(`companion: prompt ${rec.promptId} from ${v.phone.id} (${rec.text.length} chars${rec.route ? `, route ${rec.route}` : ""}) — pickup pending watcher sweep`);
+          return json(res, 200, { promptId: rec.promptId, status: rec.status, route: rec.route ?? null });
         }
 
         const allowM = url.pathname.match(/^\/attempts\/([0-9a-f]{1,64})\/allow$/);

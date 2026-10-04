@@ -70,7 +70,7 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import qrcode from "qrcode-terminal";
 import { defaultCompanionStore, issueEnrollToken, startCompanionServer } from "./companion.js";
-import { appendInjectEvent, fingerprintOfPublicKey, generateBotKey, parseKey, renderInjectReport, startBotlinkServer } from "./botlink.js";
+import { appendInjectEvent, fingerprintOfPublicKey, generateBotKey, parseKey, renderInjectReport, resolveBotlinkPeerFromEnv, startBotlinkServer } from "./botlink.js";
 import {
   buildConfirmPlan,
   clearPairingState,
@@ -520,6 +520,11 @@ function cmdCompanion(args: string[]): void {
       paths: p,
       spoolDir: defaultSpoolDir(),
       store,
+      // Routed prompts (phase 1): the companion surface only accepts
+      // route:"peer" when this machine can actually send — resolved live per
+      // request so a confirmed rotation (or a dropped drop-in) needs no
+      // companion restart to change the answer.
+      canRouteToPeer: () => resolveBotlinkPeerFromEnv(process.env, PROJECT_ROOT) !== null,
       log: (line) => console.error(`companion: ${line}`),
     });
     console.error(`companion: serving on ${bind}:${port} — enroll phones with "companion --enroll".`);

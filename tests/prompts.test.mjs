@@ -138,8 +138,9 @@ test("renderPromptForApp: minimum surface — no fp, no ids beyond the prompt id
   const dir = tmp();
   const rec = createPhonePrompt(dir, { text: "render me", fp: "SHA256:secret-fp" });
   const view = renderPromptForApp(rec);
-  assert.deepEqual(Object.keys(view).sort(), ["answerExcerpt", "createdAt", "finishedAt", "promptId", "status", "text"]);
+  assert.deepEqual(Object.keys(view).sort(), ["answerExcerpt", "createdAt", "finishedAt", "promptId", "route", "status", "text"]);
   assert.equal(view.answerExcerpt, null, "no excerpt before an answer exists");
+  assert.equal(view.route, null, "own-machine default renders as null, not a string");
   assert.equal(JSON.stringify(view).includes("SHA256:secret-fp"), false, "no fingerprint on the wire");
 });
 
