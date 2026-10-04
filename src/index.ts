@@ -46,7 +46,7 @@ import { z } from "zod";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, buildFileTransfer, resolveBotlinkPeerFromEnv, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "./leaks.js";
-import { newAskId, buildAskComponents, createPendingAsk } from "./asks.js";
+import { newAskId, buildAskV2Components, askClockLine, ASK_V2_FLAG, createPendingAsk } from "./asks.js";
 import { listContext, readContext, searchContext } from "./context.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
@@ -104,12 +104,13 @@ async function sendMessage(channelId: string, payload: SendPayload): Promise<{ i
   // before the first live ask 2026-10-04 — the ask would have posted with NO
   // buttons). The input side now can't drift; runtime forwarding below must
   // still name each field explicitly — that's the part live checks cover.
-  const body = typeof payload === "string" ? { content: payload } : { content: payload.content };
+  const body = typeof payload === "string" ? { content: payload } : payload.content === undefined ? {} : { content: payload.content };
   const files = typeof payload === "string" || !payload.files
     ? undefined
     : payload.files.map((f) => ({ data: fs.readFileSync(f.attachment), name: f.name }));
   const ref = typeof payload === "string" || !payload.reply ? undefined : { message_id: payload.reply.messageReference };
   const components = typeof payload === "string" ? undefined : payload.components;
+  const flags = typeof payload === "string" ? undefined : payload.flags;
   // allowed_mentions, if PRESENT without parse/users/roles, suppresses
   // EVERY mention in the message — Discord treats the object as the whole
   // allowlist. Replying must silence only the replied-to user (anti
@@ -124,7 +125,7 @@ async function sendMessage(channelId: string, payload: SendPayload): Promise<{ i
     : { parse: ["users"] };
   try {
     return (await api().post(Routes.channelMessages(channelId), {
-      body: { ...body, message_reference: ref, allowed_mentions: allowedMentions, components },
+      body: { ...body, message_reference: ref, allowed_mentions: allowedMentions, components, flags },
       files,
     })) as { id: string };
   } catch (err) {
@@ -133,7 +134,7 @@ async function sendMessage(channelId: string, payload: SendPayload): Promise<{ i
     // a degraded reply must not silently drop the ask's button row either.
     if (ref && /10008|Unknown Message/i.test(errTextOf(err))) {
       return (await api().post(Routes.channelMessages(channelId), {
-        body: { ...body, allowed_mentions: allowedMentions, components },
+        body: { ...body, allowed_mentions: allowedMentions, components, flags },
         files,
       })) as { id: string };
     }
@@ -163,12 +164,15 @@ function toThreadShim(raw: RThread): ThreadShim {
 }
 
 /** Sendable payload across the channel/thread shims — one shape so every
- *  tool shares it. `components` carries the ask tool's button row. */
+ *  tool shares it. `components` carries the ask tool's button row; `flags`
+ *  carries IS_COMPONENTS_V2 for the ask card, where content is DISABLED by
+ *  the API — so content is optional and omitted, never sent empty. */
 type SendPayload = string | {
-  content: string;
+  content?: string;
   files?: { attachment: string; name: string }[];
   reply?: { messageReference: string };
   components?: unknown[];
+  flags?: number;
 };
 
 /** Minimal channel/thread interfaces the tool bodies rely on (shims for the
@@ -1130,12 +1134,15 @@ function registerTools(server: McpServer): void {
         if (findMassMentions(content).length > 0) throw new Error(massMentionRefusal());
         const channel = await resolveTargetChannel(channel_id, thread_name);
         const askId = newAskId();
-        // discord.js channel.send suppresses mention parsing by default; the
-        // tripwires above already refused mass-mention TEXT, so the payload is
-        // lawful on every axis before it touches the wire.
+        // Components V2 card (content is DISABLED under this flag): question +
+        // sender prefix + lazy note ride as the id-1 TextDisplay (the composed
+        // `content` string verbatim — same tripwires already ran on it), the
+        // fuse as the id-2 clock slot, buttons as the id-3 row. custom_ids are
+        // the same contract as the legacy row, so clicks never know the shape.
+        const clockLine = askClockLine({ status: "pending", expiresAt: Date.now() + ttlMin * 60_000 });
         const sent = await channel.send({
-          content,
-          components: buildAskComponents(askId),
+          flags: ASK_V2_FLAG,
+          components: buildAskV2Components(askId, content, { clockLine: clockLine ?? `${ttlMin}m` }),
         });
         const rec = createPendingAsk(ASK_SPOOL, {
           askId, // the id baked into the buttons' custom_ids — one mint, or

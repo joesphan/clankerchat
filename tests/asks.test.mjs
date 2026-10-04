@@ -28,6 +28,11 @@ import {
   listCompanionDecisions,
   renderAskForApp,
   askDecisionLine,
+  ASK_V2_FLAG,
+  buildAskV2Components,
+  askClockLine,
+  isAskV2Message,
+  rebuildAskV2ForEdit,
 } from "../dist/asks.js";
 
 function tmpSpool() {
@@ -326,4 +331,82 @@ test("countdown edit (TODO round): one ⏳ line, replaced not duplicated, null w
   const decided = decideAsk(spool, rec.askId, "approved", APPROVER);
   assert.equal(buildAskCountdownEdit("x", decided, now), null);
   assert.equal(buildAskCountdownEdit("x", { status: "pending", expiresAt: now - 1 }, now), null);
+});
+
+// --- Components V2 ask cards (TODO round 2026-10-04) ---------------------------
+// The V2 flag is permanent per-message, so the two shapes coexist forever:
+// these pin the tree shape, the shape gate, the clock slot contract, and the
+// edit surgery (question verbatim, clock swapped, buttons never re-enabled).
+test("ask V2: container tree shape, custom_id law, shape gate", () => {
+  assert.equal(ASK_V2_FLAG, 32_768, "flag value is 1 << 15 (MessageFlags.IsComponentsV2)");
+  const tree = buildAskV2Components("abc123", "ship it?\nline two", { clockLine: "⏳ 5m left" });
+  assert.equal(tree.length, 1);
+  const c = tree[0];
+  assert.equal(c.type, 17); // container
+  assert.equal(typeof c.accent_color, "number");
+  const [q, clock, row] = c.components;
+  assert.equal(q.type, 10); // text display
+  assert.equal(q.id, 1);
+  assert.equal(q.content, "ship it?\nline two"); // composed text rides verbatim
+  assert.equal(clock.type, 10);
+  assert.equal(clock.id, 2);
+  assert.equal(clock.content, "⏳ 5m left");
+  assert.equal(row.type, 1); // action row
+  assert.equal(row.id, 3);
+  assert.deepEqual(
+    row.components.map((b) => [b.label, b.custom_id, b.disabled]),
+    [
+      ["Approve", "ask:abc123:approve", false],
+      ["Deny", "ask:abc123:deny", false],
+    ],
+    "custom_id contract IDENTICAL to the legacy row — clicks never know the shape",
+  );
+  // disabled variant (not used by the post path; the rebuild path owns edits)
+  assert.equal(buildAskV2Components("x9", "q", { clockLine: "c", disabled: true })[0].components[2].components[0].disabled, true);
+  // shape gate: container tree → true; legacy row / empty / junk → false
+  assert.equal(isAskV2Message(tree), true);
+  assert.equal(isAskV2Message(buildAskComponents("abc123")), false);
+  assert.equal(isAskV2Message([]), false);
+  assert.equal(isAskV2Message(undefined), false);
+});
+
+test("ask V2: clock line math shared with the legacy sentinel edit", () => {
+  const soon = Date.now() + 330_000; // 5.5 min → ceil 6
+  assert.equal(askClockLine({ status: "pending", expiresAt: soon }), "⏳ 6m left");
+  assert.equal(askClockLine({ status: "pending", expiresAt: Date.now() + 5_000 }), "⏳ 1m left", "min 1");
+  assert.equal(askClockLine({ status: "approved", expiresAt: soon }), null);
+  assert.equal(askClockLine({ status: "pending", expiresAt: Date.now() - 1 }), null);
+});
+
+test("ask V2: edit surgery — clock swapped, question verbatim, buttons never re-enabled", () => {
+  const tree = buildAskV2Components("abc123", "the QUESTION stays byte-exact", { clockLine: "⏳ 60m left" });
+  // terminal edit: decision line lands in the clock slot, buttons disabled
+  const terminal = rebuildAskV2ForEdit(tree, "Approved by tyler · 12:00:00Z", { disabled: true });
+  const tc = terminal[0].components;
+  assert.equal(tc[0].content, "the QUESTION stays byte-exact");
+  assert.equal(tc[1].content, "Approved by tyler · 12:00:00Z");
+  assert.ok(tc[2].components.every((b) => b.disabled === true));
+  assert.deepEqual(tc[2].components.map((b) => b.custom_id), ["ask:abc123:approve", "ask:abc123:deny"]);
+  // countdown edit: disabled UNDEFINED must not touch clickability — a tick
+  // racing the decision edit can never re-enable buttons
+  const disabledTree = rebuildAskV2ForEdit(tree, "x", { disabled: true });
+  const ticked = rebuildAskV2ForEdit(disabledTree, "⏳ 30m left", {});
+  assert.ok(ticked[0].components[2].components.every((b) => b.disabled === true), "undefined disabled passes through");
+  // non-container tops and non-matching children pass through untouched
+  const mixed = [{ type: 1, components: [{ type: 2, custom_id: "ask:abc123:approve" }] }, ...rebuildAskV2ForEdit(tree, "y", { disabled: true })];
+  const out = rebuildAskV2ForEdit(mixed, "z", { disabled: true });
+  assert.deepEqual(out[0], mixed[0], "legacy row tops untouched");
+  // discord.js class instances (toJSON) normalize before surgery
+  const classy = [
+    {
+      toJSON: () => ({ type: 17, id: 0, accent_color: 1, components: [
+        { toJSON: () => ({ type: 10, id: 1, content: "q" }) },
+        { toJSON: () => ({ type: 10, id: 2, content: "old" }) },
+      ] }),
+    },
+  ];
+  const norm = rebuildAskV2ForEdit(classy, "⏳ 2m left", {});
+  assert.equal(norm[0].components[1].content, "⏳ 2m left");
+  assert.equal(norm[0].components[0].content, "q");
+  assert.ok(!("toJSON" in norm[0]), "output is plain data");
 });
