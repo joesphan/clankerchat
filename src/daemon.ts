@@ -43,6 +43,7 @@ import {
   TextChannel,
   ThreadChannel,
   type ButtonInteraction,
+  type ChatInputCommandInteraction,
   type Interaction,
   type Message,
   type MessageEditOptions,
@@ -55,7 +56,8 @@ import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
-import { findMassMentions, scanTextOfPost } from "./leaks.js";
+import { findLeakSignals, findMassMentions, leakRefusal, massMentionRefusal, scanTextOfPost } from "./leaks.js";
+import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
 import {
   askClockLine,
   askDecisionLine,
@@ -940,12 +942,15 @@ async function handleMeta(job: Job, rest: string): Promise<void> {
         Object.entries(config.threads)
           .map(([n, p]) => `${n} → ${p}`)
           .join("; ") || "(none)";
+      // Shared renderer (fork 3e8c6ab): the typed fast-path and /clankerchat
+      // status render the SAME card for the same facts — machines can't drift.
+      // Overseer-debug tail stays machine-local underneath it.
       await sendToThread(
         job.threadId,
-        `overseer status — ${client.user?.username ?? "?"}, up since ${START_ISO}\n` +
-          `watching every team thread; mapped: ${mapped}\n` +
-          `wake=${config.wake} (grace ${config.wakeGraceMs / 1000}s), fullAuto=${config.fullAuto}, poll=${config.pollMs}ms, reposRoot=${config.reposRoot}\n` +
-          `queue=${queue.length}, busy=${activeJobs.length}/${config.maxConcurrent}, wake-checks pending=${pendingFollowups.length}\n` +
+        renderStatusCard(statusFacts()) +
+          "\n" +
+          `overseer: watching every team thread; mapped: ${mapped}\n` +
+          `poll=${config.pollMs}ms (event-driven), wake=${config.wake} (grace ${config.wakeGraceMs / 1000}s), wake-checks pending=${pendingFollowups.length}\n` +
           `worker sessions: ${Object.entries(state.sessions).map(([n, id]) => `${n}: ${id.slice(0, 8)}`).join(", ") || "(none yet)"}`,
       );
       return;
@@ -1206,6 +1211,7 @@ function drain(): void {
       const i = activeJobs.indexOf(job);
       if (i >= 0) activeJobs.splice(i, 1);
       lastRunAt = new Date().toISOString(); // a dispatched trigger completed — "ran Xm ago"
+      lastRunWhere = job.threadName; // …and WHERE, for the status card
       writeWatcherState();
       drain();
     });
@@ -1377,6 +1383,8 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
 let laneFacts: { ok: boolean; bot: string | null; pending: number } | null = null;
 /** ISO time the last dispatched trigger completed (any outcome) — "ran Xm ago". */
 let lastRunAt: string | null = null;
+/** Thread the last dispatched trigger ran in — the status card's "where". */
+let lastRunWhere: string | null = null;
 
 /** The lane peer for the heartbeat probe. Prefers full botlink env (the
  * MCP-side shape); under `npm run daemon` only .env is loaded, so fall back
@@ -1482,6 +1490,17 @@ async function main(): Promise<void> {
       `mapped=[${Object.keys(config.threads).join(", ")}]; reposRoot=${config.reposRoot}; ` +
       `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; EVENT-DRIVEN (gateway)`,
   );
+
+  // Slash tree (fork 3e8c6ab): guild-scoped bulk overwrite, idempotent per
+  // boot. Members only SEE the commands once the app carries the
+  // applications.commands scope (SETUP.md re-auth); registration succeeds
+  // either way, so a failure here logs and moves on — no boot dependency.
+  try {
+    await registerSlashCommands(client.rest, me.application?.id ?? me.user.id, parent.guildId);
+    log(`slash: /clankerchat (status, ask) registered in guild ${parent.guildId}`);
+  } catch (err) {
+    log(`slash registration failed: ${errText(err)} — commands unavailable this boot`);
+  }
 
   // CLANKER SPEC A1: one REST catch-up at boot, then the gateway is the only
   // trigger source — no idle polling, no cursor crawls, no swallowed history.
@@ -1717,6 +1736,13 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
   // Any delivered interaction proves the gateway is live — feed both watchdogs.
   lastGatewayEventAt = Date.now();
   lastPollAt = Date.now();
+  // Slash (/clankerchat status|ask, fork 3e8c6ab) — classed BEFORE buttons:
+  // a chat-input interaction is the other interaction class we own, and the
+  // button path below must never see one.
+  if (interaction.isChatInputCommand()) {
+    await handleSlashCommand(interaction);
+    return;
+  }
   if (!interaction.isButton()) return;
   const parsed = parseAskCustomId(interaction.customId);
   if (!parsed) return; // foreign component on a message we can see — not ours, ignore silently
@@ -1777,6 +1803,137 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
     log(`ask ${askId}: decision edit failed: ${errText(err)}`);
   }
   await enqueueAskDecision(decided, interaction.user.username);
+}
+
+// ---------------------------------------------------------------------------
+// Slash commands (/clankerchat status|ask — per-machine glue for fork 3e8c6ab).
+// The interaction carries API-verified identity (interaction.user.id) — same
+// trust class as an ask click; the ask TEXT is untrusted trigger content
+// downstream, exactly like a tagged message.
+// ---------------------------------------------------------------------------
+
+/** The status card's facts, gathered where they live (slash reply and the
+ *  !ov fast-path share one renderer — fork law: same facts, same card). */
+function statusFacts(): StatusFacts {
+  return {
+    bot: process.env.CLANKER_NAME ?? client.user?.username ?? "clankerchat",
+    uptimeMs: Date.now() - DAEMON_START_MS,
+    active: activeJobs.length,
+    maxConcurrent: config.maxConcurrent,
+    queuedHuman: queue.filter((q) => !q.fromBot).length,
+    queuedBot: queue.filter((q) => q.fromBot).length,
+    lastRunAgoMs: lastRunAt ? Date.now() - Date.parse(lastRunAt) : null,
+    lastRunWhere,
+    spoolPending: laneFacts?.pending ?? 0,
+    servicesLine:
+      `lane ${laneFacts ? (laneFacts.ok ? "ok" : "down") : "not probed"} · ` +
+      `fullAuto=${config.fullAuto} · wake=${config.wake} · up since ${START_ISO}`,
+  };
+}
+
+async function handleSlashCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (interaction.commandName !== "clankerchat") return; // not our tree — silence
+  // Venue quarantine FIRST, and ABSOLUTE: no ephemeral either — a reply into a
+  // blocked venue would defeat the quarantine exactly like a notice post.
+  if (venueBlocked(interaction.channelId)) {
+    log(
+      `quarantine: refused slash /${interaction.commandName} from ${interaction.user.username} ` +
+        `(${interaction.user.id}) in blocked venue ${interaction.channelId}`,
+    );
+    return;
+  }
+  const parent = parentChannel;
+  if (!parent) return; // pre-boot stray — nothing is watched yet
+  // Same perimeter as live messages: the team channel + its threads only.
+  const inRoot = interaction.channelId === parent.id;
+  let threadName: string | null = null;
+  let threadId = parent.id;
+  if (!inRoot) {
+    const ch = interaction.channel;
+    if (!(ch instanceof ThreadChannel) || ch.parentId !== parent.id) {
+      await interaction
+        .reply({ content: "This channel isn't watched by the daemon — use the team channel or one of its threads.", ephemeral: true })
+        .catch((err) => log(`slash venue ephemeral failed: ${errText(err)}`));
+      return;
+    }
+    threadName = ch.name;
+    threadId = ch.id;
+  }
+  const sub = interaction.options.getSubcommand();
+  if (sub === "status") {
+    // Canned card, no model run — the spec's promise.
+    await interaction
+      .reply({ content: renderStatusCard(statusFacts()), ephemeral: true })
+      .catch((err) => log(`slash status ephemeral failed: ${errText(err)}`));
+    return;
+  }
+  if (sub === "ask") {
+    // Trigger allowlist — API identity only, the same classes isTrigger uses.
+    if (interaction.user.bot || !(config.allowAllHumans || config.allow.includes(interaction.user.id))) {
+      log(`slash ask: ${interaction.user.username} (${interaction.user.id}) not allowlisted — refused`);
+      await interaction
+        .reply({ content: "You're not on this daemon's trigger allowlist.", ephemeral: true })
+        .catch((err) => log(`slash ask refusal ephemeral failed: ${errText(err)}`));
+      return;
+    }
+    if (threadName && config.pausedThreads.some((n) => n.toLowerCase() === threadName!.toLowerCase())) {
+      await interaction
+        .reply({ content: "circuit breaker: this thread is paused (machine-safety). Triggers refused until unpaused.", ephemeral: true })
+        .catch((err) => log(`slash ask circuit-breaker ephemeral failed: ${errText(err)}`));
+      return;
+    }
+    const text = interaction.options.getString("text", true).trim();
+    // Door tripwires: leak-shape and mass-mention text refuses HERE, never
+    // enqueued — a queued prompt's answer would carry the shape back out.
+    const leakKinds = findLeakSignals(text);
+    if (leakKinds.length > 0) {
+      log(`slash ask: leak-shaped text from ${interaction.user.username} refused at the door (${leakKinds.join(",")})`);
+      await interaction
+        .reply({ content: leakRefusal(leakKinds), ephemeral: true })
+        .catch((err) => log(`slash ask leak-refusal ephemeral failed: ${errText(err)}`));
+      return;
+    }
+    const mass = findMassMentions(text);
+    if (mass.length > 0) {
+      log(`slash ask: mass-mention text from ${interaction.user.username} refused at the door`);
+      await interaction
+        .reply({ content: massMentionRefusal(), ephemeral: true })
+        .catch((err) => log(`slash ask mass-mention refusal ephemeral failed: ${errText(err)}`));
+      return;
+    }
+    if (queue.length >= MAX_QUEUE) {
+      await interaction
+        .reply({ content: "Queue is full — try again once the current backlog drains.", ephemeral: true })
+        .catch((err) => log(`slash ask queue-full ephemeral failed: ${errText(err)}`));
+      return;
+    }
+    // Ask-class trigger: the interaction identity is API-verified human, so it
+    // carries human provenance and never coalesces (two deliberate asks are
+    // two events). The text rides as the prompt, untrusted downstream.
+    enqueue({
+      threadName: threadName ?? "(channel root)",
+      threadId,
+      rootChannel: threadName === null,
+      cwd: threadName ? mappedCwdFor(threadName) : null,
+      prompt: text,
+      from: interaction.user.username,
+      fromId: interaction.user.id,
+      fromBot: interaction.user.bot,
+      untagged: false,
+      triggerId: interaction.id,
+      noCoalesce: true,
+    });
+    await interaction
+      .reply({
+        content:
+          `Prompt queued — the answer will post in ${inRoot ? "this channel" : `"${threadName}"`}. ` +
+          `(pool ${activeJobs.length}/${config.maxConcurrent}, queue ${queue.length})`,
+        ephemeral: true,
+      })
+      .catch((err) => log(`slash ask ack ephemeral failed: ${errText(err)}`));
+    return;
+  }
+  log(`slash: unknown subcommand "${sub}" — ignored`);
 }
 
 /** A decided ask becomes a HUMAN-priority trigger: the clicker passed the
