@@ -107,6 +107,13 @@ export interface StatusFacts {
   spoolPending: number;
   /** Pre-built machine-local line (service states) appended verbatim. */
   servicesLine?: string;
+  /** Peer machine's last-run time (ISO), relayed by the lane heartbeat —
+   *  multi-machine prompts phase 0 on the Discord card. Null-honest: no
+   *  fresh lane facts (never probed, peer down) renders NO line rather than
+   *  a stale one; the renderer also skips unparseable dates defensively. */
+  peerLastRunAt?: string | null;
+  /** Lane peer's bot name for the same line (their status verb's "bot"). */
+  peerName?: string | null;
 }
 
 function fmtAgo(ms: number): string {
@@ -137,6 +144,13 @@ export function renderStatusCard(f: StatusFacts): string {
         : " · no runs this boot"),
   );
   if (f.servicesLine) lines.push(noMention(f.servicesLine));
+  // Peer recency line (phase 0): only when the heartbeat delivered a
+  // parseable timestamp — absent, null, or garbage renders nothing, so the
+  // card never claims peer freshness it doesn't have.
+  const peerMs = f.peerLastRunAt ? Date.parse(f.peerLastRunAt) : NaN;
+  if (peerMs === peerMs && peerMs > 0) {
+    lines.push(`peer ${noMention(f.peerName ?? "machine")} last ran ${fmtAgo(Math.max(0, Date.now() - peerMs))}`);
+  }
   lines.push(`lane spool: ${f.spoolPending} pending — richer asks still spawn a run`);
   return lines.join("\n");
 }

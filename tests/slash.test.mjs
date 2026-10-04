@@ -83,6 +83,41 @@ test("renderStatusCard: mention-shaped text in card slots renders literal (own-p
   assert.doesNotMatch(card, /<@&\d+>/);
 });
 
+test("renderStatusCard: peer recency line — present when fresh, absent when not (phase 0)", () => {
+  const base = {
+    bot: "fast-clank",
+    uptimeMs: 60_000,
+    active: 0,
+    maxConcurrent: 2,
+    queuedHuman: 0,
+    queuedBot: 0,
+    lastRunAgoMs: 1_000,
+    spoolPending: 0,
+  };
+  // fresh heartbeat facts → one honest line, name mention-stripped
+  const withPeer = renderStatusCard({
+    ...base,
+    peerLastRunAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+    peerName: "joesp-desktop",
+  });
+  assert.match(withPeer, /peer joesp-desktop last ran 12m ago/);
+
+  // a peer name carrying mention text renders inert like every other slot
+  const evil = renderStatusCard({
+    ...base,
+    peerLastRunAt: new Date(Date.now() - 60_000).toISOString(),
+    peerName: "@everyone",
+  });
+  assert.doesNotMatch(evil, /@(everyone|here)\b/);
+  assert.match(evil, /peer everyone last ran/);
+
+  // absent / null / unparseable → NO line (never a stale or NaN claim)
+  for (const bad of [undefined, null, "not-a-date", ""]) {
+    const c = renderStatusCard({ ...base, peerLastRunAt: bad });
+    assert.doesNotMatch(c, /peer .* last ran/, `no peer line for ${JSON.stringify(bad)}`);
+  }
+});
+
 test("registerSlashCommands: one guild-scoped bulk overwrite carrying the spec", async () => {
   const calls = [];
   const rest = {
