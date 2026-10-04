@@ -227,6 +227,15 @@ async function saveJson(key: string, value: unknown): Promise<void> {
 // Signed transport (mirrors src/companion.ts verifyCompanionRequest)
 // ---------------------------------------------------------------------------
 
+// Counter burn is SERIALIZED (audit fix 4): signedFetch is async, so two
+// overlapping calls — the 2s poll tick colliding with an Approve tap, or a
+// double-tap — could both read counter N from SecureStore, both persist N+1,
+// and both SIGN N+1; the server correctly refuses the second as a replay
+// (spurious 403 on a legitimate action). A module-level promise chain makes
+// the read-modify-write section single-filed; the signing/request itself
+// stays concurrent.
+let counterChain: Promise<void> = Promise.resolve();
+
 async function signedFetch(
   machine: Machine,
   seed: Uint8Array,
@@ -235,10 +244,15 @@ async function signedFetch(
   path: string,
   bodyObj?: unknown,
 ): Promise<{ status: number; json: Record<string, unknown> }> {
-  const counters = (await loadJson<Record<string, number>>(K_COUNTERS)) ?? {};
-  const counter = (counters[machine.id] ?? 0) + 1;
-  counters[machine.id] = counter;
-  await saveJson(K_COUNTERS, counters); // burn optimistically: gaps are fine, repeats never
+  let counter = 0;
+  const gate = counterChain.then(async () => {
+    const counters = (await loadJson<Record<string, number>>(K_COUNTERS)) ?? {};
+    counter = (counters[machine.id] ?? 0) + 1;
+    counters[machine.id] = counter;
+    await saveJson(K_COUNTERS, counters); // burn optimistically: gaps are fine, repeats never
+  });
+  counterChain = gate.catch(() => {}); // storage failure must not poison later calls
+  await gate;
 
   const body: Bytes = method === "GET" ? new Uint8Array(0) : utf8(JSON.stringify(bodyObj ?? {}));
   const msg = lenDelim(
@@ -385,11 +399,24 @@ export default function App() {
         // Eyeball gate: the human must confirm the machine fingerprint shown
         // in the QR matches the machine's terminal (printed by --enroll).
         // Here we simply carry it into the stored record + render it.
-        const res = await fetch(`http://${payload.host}:${payload.port}/enroll`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ token: payload.tkn, phonePub: pubLine }),
-        });
+        // AbortController (audit fix 6): a scanned host that's a black hole
+        // (wrong network, machine gone) hung this fetch forever — busy stayed
+        // true and the enroll screen was bricked until app restart.
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 5000);
+        let res: Response;
+        try {
+          res = await fetch(`http://${payload.host}:${payload.port}/enroll`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: payload.tkn, phonePub: pubLine }),
+            signal: ctrl.signal,
+          });
+        } catch (e) {
+          throw new Error(`enroll unreachable: ${(e as Error).message} — check you're on the same network`);
+        } finally {
+          clearTimeout(timer);
+        }
         const out = (await res.json()) as { id?: string; error?: string };
         if (res.status !== 200 || out.id !== phoneId) {
           throw new Error(String(out.error ?? `enroll failed (${res.status})`));
