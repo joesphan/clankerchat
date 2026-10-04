@@ -1,5 +1,5 @@
 /**
- * journal — append-only, hash-chained local record of the two event classes
+ * journal — append-only, hash-chained local record of the event classes
  * that were previously invisible outside daemon.log prose (owner round
  * 2026-10-04 "use your discord features to the best of your abilities"):
  *
@@ -10,6 +10,8 @@
  *   - audit-log events (S-tier #5): classified guild audit entries (see
  *     audit.ts) — deletions of our posts, channel/permission surgery,
  *     webhook spawns, role changes on the bot.
+ *   - noise meter lines (TODO round): the daemon's own-post rate per thread
+ *     crossing the quiet-discord threshold — visibility, never suppression.
  *
  * Both machines use this module verbatim (plain fs, atomic-ish appends,
  * no discord.js import). The chain gives tamper-EVIDENCE, not tamper
@@ -33,10 +35,10 @@ export interface JournalEntry {
    *  base name) so genesis is file-bound, not forgeable as a constant. */
   h: string;
   ts: number; // epoch ms
-  kind: "interaction" | "audit";
+  kind: "interaction" | "audit" | "noise";
   /** One-line human summary (already oneLine()-cleaned by the caller). */
   detail: string;
-  /** interaction: "chat_input" | "button" */
+  /** interaction: "chat_input" | "button"; noise: "own-post meter" */
   type?: string;
   /** interaction: "/clankerchat ask" or the button custom_id */
   name?: string;

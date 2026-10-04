@@ -21,14 +21,18 @@ test("journal: appends chain correctly and verifies", () => {
   appendJournal(dir, { ts: 1, kind: "interaction", detail: "slash /clankerchat status", type: "chat_input", outcome: "handled" });
   appendJournal(dir, { ts: 2, kind: "interaction", detail: "ask click refused", type: "button", name: "ask:x:approve", outcome: "refused", actor: "123" });
   appendJournal(dir, { ts: 3, kind: "audit", detail: "webhook created", action: "WEBHOOK_CREATE", severity: "critical" });
+  // noise meter lines (own-post rate) chain like any other kind — and the
+  // stats below must stay blind to them
+  appendJournal(dir, { ts: 4, kind: "noise", detail: "noise: 10 own posts in thread 1 within 1h", type: "own-post meter" });
 
   const entries = verifyJournalFile(journalFile(dir));
-  assert.equal(entries.length, 3);
+  assert.equal(entries.length, 4);
   assert.equal(entries[0].outcome, "handled");
   assert.equal(entries[1].actor, "123");
   assert.equal(entries[2].severity, "critical");
+  assert.equal(entries[3].kind, "noise");
   // every link is distinct (chain advances per entry)
-  assert.equal(new Set(entries.map((e) => e.h)).size, 3);
+  assert.equal(new Set(entries.map((e) => e.h)).size, 4);
 });
 
 test("journal: tampering with a line breaks the chain", () => {

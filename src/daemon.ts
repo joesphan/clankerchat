@@ -67,6 +67,7 @@ import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
 import { findLeakSignals, findMassMentions, leakRefusal, massMentionRefusal, scanTextOfPost } from "./leaks.js";
 import { appendJournal } from "./journal.js";
+import { appendNotice } from "./notices.js";
 import { classifyAudit, filterAuditSince, type AuditLike } from "./audit.js";
 import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
 import {
@@ -598,10 +599,41 @@ async function sendToThread(threadId: string, message: string): Promise<string |
       allowedMentions: { parse: ["users"] },
     });
     daemonMessageIds.add(sent.id);
+    countOwnPost(threadId);
     return sent.id;
   } catch (err) {
     log(`ack send failed in ${threadId}: ${errText(err)}`);
     return null;
+  }
+}
+
+/** Own-post noise meter (TODO "quiet-discord enforcement visibility"):
+ *  rolling per-thread count of the daemon's own posts. Past NOISE_THRESHOLD
+ *  in an hour the meter journals a NOISE line ONCE per thread per hour (the
+ *  journal is the record; the log mirrors it) — no card alert, no post, no
+ *  suppression: the meter makes the noise VISIBLE, it never cuts the wire
+ *  that's reporting it. In-memory by design: a restart resets the window,
+ *  which is the conservative direction (undercount, never phantom noise). */
+const NOISE_THRESHOLD = 10;
+const ownPostTimes = new Map<string, number[]>();
+const noiseFlagged = new Map<string, number>();
+
+function countOwnPost(threadId: string): void {
+  const now = Date.now();
+  const hourAgo = now - 60 * 60 * 1000;
+  const times = (ownPostTimes.get(threadId) ?? []).filter((t) => t > hourAgo);
+  times.push(now);
+  ownPostTimes.set(threadId, times);
+  if (times.length < NOISE_THRESHOLD) return;
+  const lastFlag = noiseFlagged.get(threadId) ?? 0;
+  if (now - lastFlag < 60 * 60 * 1000) return; // one flag per thread per hour
+  noiseFlagged.set(threadId, now);
+  const line = `noise: ${times.length} own posts in thread ${threadId} within 1h (threshold ${NOISE_THRESHOLD}) — quiet-discord law visibility`;
+  log(line);
+  try {
+    appendJournal(askSpool(), { ts: now, kind: "noise", detail: line });
+  } catch {
+    /* the journal is decoration here; the log line already landed */
   }
 }
 
@@ -1730,12 +1762,25 @@ async function sweepAuditLogs(): Promise<void> {
       });
       log(`audit-watch: [${verdict.severity}] ${verdict.label}`);
       pushAuditAlert(verdict.label);
+      // Critical events ALSO ride the notices lane (round 8): the phone
+      // banners them on arrival — one more human-eyes path that works even
+      // when Discord itself is the thing being tampered with. Ids-only label
+      // re-checked by appendNotice's leak scanner anyway.
       if (verdict.severity === "critical") {
         // One human-eyes line per event (ids only — labels carry no display
         // names, and sendToThread re-runs the mass-mention/venue tripwires).
         // Owner tag = first allowlist entry, users-parse only.
         const owner = config.allow.length > 0 ? ` <@${config.allow[0]}>` : "";
         void sendToThread(parent.id, `⚠ audit-watch: ${verdict.label}${owner}`);
+        try {
+          appendNotice(askSpool(), {
+            from: "audit-watch",
+            text: `⚠ ${verdict.label}`,
+            severity: "warn",
+          });
+        } catch (noticeErr) {
+          log(`audit-watch: notice append failed: ${errText(noticeErr as Error)}`);
+        }
       }
     }
     writeWatcherState(); // audit_alerts may have changed
@@ -1757,6 +1802,15 @@ async function sweepAuditLogs(): Promise<void> {
         auditDeniedLogged = true;
         log(`audit-watch: bot lacks View Audit Log — watch degraded (alerts will say so), not retrying loudly`);
         pushAuditAlert("audit watch degraded — bot lacks View Audit Log permission");
+        try {
+          appendNotice(askSpool(), {
+            from: "audit-watch",
+            text: "audit watch degraded — bot lacks View Audit Log permission; critical-event pings are OFF until re-invited with the permission",
+            severity: "warn",
+          });
+        } catch {
+          /* the card alert above already says it */
+        }
         writeWatcherState();
       }
     } else {

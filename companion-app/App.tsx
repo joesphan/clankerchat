@@ -26,6 +26,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as Battery from "expo-battery";
+import * as Haptics from "expo-haptics";
 import * as Notifications from "expo-notifications";
 import * as ScreenCapture from "expo-screen-capture";
 import {
@@ -371,6 +372,28 @@ Notifications.setNotificationHandler({
   }),
 });
 
+// Haptics (owner's "use the expo features" directive): the FEEL layer for
+// the moments this surface exists for — an ask arriving (warning pattern),
+// an answer landing (success/error), a notice landing (light), a decision
+// committing (medium tap). Always fire-and-forget: a device without a
+// taptic engine (simulator, desktop web preview) no-ops and the flow moves
+// on — feedback must never gate the action it decorates.
+function haptic(pattern: "light" | "medium" | "warning" | "success" | "error"): void {
+  const fire =
+    pattern === "light" || pattern === "medium"
+      ? Haptics.impactAsync(
+          pattern === "light" ? Haptics.ImpactFeedbackStyle.Light : Haptics.ImpactFeedbackStyle.Medium,
+        )
+      : Haptics.notificationAsync(
+          pattern === "warning"
+            ? Haptics.NotificationFeedbackType.Warning
+            : pattern === "success"
+              ? Haptics.NotificationFeedbackType.Success
+              : Haptics.NotificationFeedbackType.Error,
+        );
+  void fire.catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -568,6 +591,7 @@ export default function App() {
       const key = `${active.id}:${a.askId}`;
       if (seenAsks.current.has(key)) continue;
       seenAsks.current.add(key);
+      haptic("warning");
       void Notifications.scheduleNotificationAsync({
         content: {
           title: "Ask needs your decision",
@@ -588,6 +612,7 @@ export default function App() {
       const key = `${active.id}:${n.id}`;
       if (seenNotices.current.has(key)) continue;
       seenNotices.current.add(key);
+      haptic(n.severity === "warn" ? "warning" : "light");
       void Notifications.scheduleNotificationAsync({
         content: {
           title: n.severity === "warn" ? `⚠ machine notice (${n.from})` : `machine notice (${n.from})`,
@@ -623,6 +648,7 @@ export default function App() {
         before !== p.status &&
         (p.status === "answered" || p.status === "failed")
       ) {
+        haptic(p.status === "answered" ? "success" : "error");
         void Notifications.scheduleNotificationAsync({
           content: {
             title: p.status === "answered" ? "Prompt answered" : "Prompt failed",
@@ -798,6 +824,7 @@ export default function App() {
       try {
         const { status, json } = await signedFetch(active, seed, phoneId, "POST", `/asks/${askId}/${verb}`);
         if (status === 200) {
+          haptic("medium");
           setNotice(`Ask ${String(json.status ?? verb)} — recorded`);
           setAsks((prev) => prev.filter((a) => a.askId !== askId));
         } else if (status === 409) {

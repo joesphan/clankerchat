@@ -237,3 +237,22 @@ permissions docs banked — envelope mode, --print-timeout, read_url rule
 syntax) + gemini-ask.mjs upgraded to --output-format json + --print-timeout
 3m (external SIGKILL demoted to 210s backstop; usage line on stderr; live
 E2E re-verified).
+
+## Round — audit→notices bridge, noise meter, haptics (2026-10-04)
+
+CRITICAL AUDIT → NOTICES: the audit watch's critical events and its
+one-time 403 degrade now ALSO write a warn notice — the phone banners
+them on arrival, a human-eyes path that survives Discord itself being
+the tampered surface. Journal kind widened to "noise" for the meter
+below (chain-verified, stats stay blind to it).
+
+OWN-POST NOISE METER (parked TODO item, shipped): countOwnPost at the
+sendToThread chokepoint — rolling 1h per-thread window, threshold 10,
+ONE journal NOISE line per thread per hour. Visibility only: no card
+alert, no suppression (never cut the wire that reports). In-memory by
+design — restart undercounts, never phantom-noise.
+
+HAPTICS (expo-haptics ~57.0.3): ask arrival (warning), answer/failed
+transition (success/error), notice arrival (warn→warning else light),
+decision commit (medium). Fire-and-forget — no-engine devices no-op and
+the flow never gates on feedback. 185/185; app tsc clean.
