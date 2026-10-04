@@ -69,11 +69,14 @@ test("journal: stats count refusals + critical audit in the window only", () => 
     { h: "x", ts: now - 1000, kind: "interaction", outcome: "handled" },
     { h: "x", ts: now - 1000, kind: "audit", severity: "critical" },
     { h: "x", ts: now - 1000, kind: "audit", severity: "notify" },
+    { h: "x", ts: now - 1000, kind: "noise", detail: "webhook post in 1 by \"w\" (2)" },
     { h: "x", ts: now - 48 * 60 * 60 * 1000, kind: "interaction", outcome: "refused" }, // outside 24h
+    { h: "x", ts: now - 48 * 60 * 60 * 1000, kind: "noise", detail: "stale noise" }, // outside 24h
   ];
   const stats = journalStats(entries, now);
   assert.equal(stats.refused, 2);
   assert.equal(stats.criticalAudit, 1);
+  assert.equal(stats.noise, 1); // round 16: window-scoped noise count (webhook/spoof)
 });
 
 test("journal: daily digest text counts the 24h window and carries the chain verdict", () => {
@@ -110,12 +113,13 @@ test("CLI: journal-verify proves the chain (and says so loudly when broken)", ()
 
   appendJournal(dir, { ts: Date.now(), kind: "interaction", detail: "slash /clankerchat status", outcome: "handled" });
   appendJournal(dir, { ts: Date.now(), kind: "audit", detail: "webhook created", severity: "critical" });
-  r = run(["--spool", dir, "--tail", "1"]);
+  appendJournal(dir, { ts: Date.now(), kind: "noise", detail: "webhook post in 1555103465179455488 by \"w\" (1)" });
+  r = run(["--spool", dir, "--tail", "2"]);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /chain OK · 2 entries/);
+  assert.match(r.stdout, /chain OK · 3 entries/);
   // this fixture has 0 refused interactions, 1 critical audit — the summary
   // counts both per-class AND the 24h window
-  assert.match(r.stdout, /0 refused · 1 critical · last 24h: 0 refused \/ 1 critical/);
+  assert.match(r.stdout, /0 refused · 1 critical · last 24h: 0 refused \/ 1 critical \/ 1 noise/);
   assert.match(r.stdout, /webhook created/);
 
   // tamper → exit 1 with the broken-link line

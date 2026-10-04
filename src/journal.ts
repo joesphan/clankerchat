@@ -147,15 +147,21 @@ export function readJournalTail(spoolDir: string, n: number): JournalEntry[] {
 export function journalStats(entries: JournalEntry[], now = Date.now(), windowMs = 24 * 60 * 60 * 1000): {
   refused: number;
   criticalAudit: number;
+  noise: number;
 } {
   let refused = 0;
   let criticalAudit = 0;
+  let noise = 0;
   for (const e of entries) {
     if (now - e.ts > windowMs) continue;
     if (e.kind === "interaction" && (e.outcome === "refused" || e.outcome === "venue-blocked")) refused++;
     if (e.kind === "audit" && e.severity === "critical") criticalAudit++;
+    // Round 16: noise = webhook posts + identity-spoof refusals (watcher
+    // flavor writes them; display-identity events the machine never acted on
+    // but the audit trail keeps). Surfaced on the phone card + verify CLI.
+    if (e.kind === "noise") noise++;
   }
-  return { refused, criticalAudit };
+  return { refused, criticalAudit, noise };
 }
 
 /** One-line 24h summary for the daily digest notice (round 9). Pure: the

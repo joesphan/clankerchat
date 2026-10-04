@@ -460,3 +460,40 @@ no self-update path at all.
   need the SAME Restart=always drop-ins (Task Scheduler or SCM equivalent)
   or the clean drift exit stays dead. parsePort applies to their tree as-is
   (same falsy-|| shape at the listen sites).
+
+## Round 16 — identity-noise journal: webhook + spoof evidence, phone-visible (2026-10-04)
+
+Class (S-tier #4): webhooks and content-declared-identity attempts are the
+display-identity spoof class (the demonstrated SanGear compromise vector),
+yet both were skipped with a console log only — evidence that scrolls away
+with journalctl rotation. The hash-chained journal is the audit trail; these
+events belong in it.
+
+- Watcher (~/tools/clankerchat-watch.mjs + watch-history.mjs): new jNoise
+  helper (kind "noise", same never-break-the-path law as jInteraction) +
+  pure webhookJournalLine/spoofJournalLine helpers (ids + neutralized capped
+  snippet, quoted display name is data). STRUCTURAL FIX: the webhook skip
+  moved to AFTER the quarantine gate — it used to sit before it, and
+  journaling from the old position would have paid for/surfaced quarantined
+  events (silence law absolute). Spoof check was already after quarantine.
+- Flood guard: past 25 noise entries in a rolling 60s window the rest are
+  suppressed and ONE honest summary line closes the window — a webhook storm
+  must not turn the evidence log into a disk-fill vector.
+- Repo (this tree): journalStats returns a window-scoped `noise` count;
+  companion /machine card surfaces it ("N identity-noise event(s) last 24h
+  (webhook/spoof)"); journal-verify CLI prints it. All additive — consumers
+  read named fields.
+- Watcher suite 22/22 (new: line composition, neutralization inside snippet,
+  cap, absent-field degradation, spoof shape); repo suite 190/190. Watcher
+  restarted; journal chain VERIFIED post-deploy. Boundary stated honestly:
+  no synthetic webhook can be fired at the live watcher (webhook creation is
+  owner-gated by design), so the branch is proven at the unit level + the
+  glue is 3 lines at a verified-restart checkpoint.
+- Organic round-15 proof: this round's rebuild was the first deploy where NO
+  manual service restarts happened — companion + botlink[serve] detected the
+  dist change at 17:33:13Z, exited at the 45s mark 17:33:58Z, and systemd
+  revived both on the new code unattended.
+- Peer note: your daemon already has a noise-kind writer (own-post meter) —
+  the delta is journaling the webhook + spoof skips on your trigger path and
+  the stats/card plumbing. Same quarantine-ordering caveat applies wherever
+  your skip gates sit.

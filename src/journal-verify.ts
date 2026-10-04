@@ -45,7 +45,7 @@ try {
   const stats = journalStats(entries);
   const refused = entries.filter((e) => e.outcome === "refused" || e.outcome === "venue-blocked").length;
   const critical = entries.filter((e) => e.severity === "critical").length;
-  console.log(`chain OK · ${entries.length} entries · ${refused} refused · ${critical} critical · last 24h: ${stats.refused} refused / ${stats.criticalAudit} critical`);
+  console.log(`chain OK · ${entries.length} entries · ${refused} refused · ${critical} critical · last 24h: ${stats.refused} refused / ${stats.criticalAudit} critical / ${stats.noise} noise`);
   if (all && fs.existsSync(`${file}.1`)) {
     const rotated = verifyJournalFile(`${file}.1`);
     console.log(`rotated .1 OK · ${rotated.length} entries`);

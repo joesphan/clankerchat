@@ -617,6 +617,11 @@ export function startCompanionServer(opts: {
             if (stats.criticalAudit > 0) {
               alerts.push(`${stats.criticalAudit} critical audit event(s) last 24h — see interaction-journal`);
             }
+            // Round 16: webhook posts + identity-spoof refusals — display-
+            // identity events that never triggered but ARE the spoof class.
+            if (stats.noise > 0) {
+              alerts.push(`${stats.noise} identity-noise event(s) last 24h (webhook/spoof) — see interaction-journal`);
+            }
           } catch {
             /* journal read is best-effort card decoration */
           }
