@@ -365,6 +365,61 @@ test("HTTP e2e: enroll, attempts, allow (wrong/right SAS), replay, single-use, d
   }
 });
 
+test("doctor: surface + spool verdicts from machine-side facts (metro/journal/ufw skipped)", async () => {
+  const { runDoctor } = await import("../dist/doctor.js");
+  const dir = tmp();
+  const keysDir = path.join(dir, "companion-keys");
+  fs.mkdirSync(keysDir, { recursive: true });
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(path.join(spool, "pending-prompts"), { recursive: true });
+
+  // dead port → FAIL on the surface check, everything else still reports
+  let lines = await runDoctor({
+    keysDir,
+    companionHost: "127.0.0.1",
+    companionPort: 1, // nothing listens here
+    spoolDir: spool,
+    skip: ["metro", "journal", "ufw"],
+  });
+  assert.equal(lines.find((l) => l.check === "companion signed surface").state, "FAIL");
+
+  // a stuck pending prompt (older than 60s) → the sweep-down verdict
+  fs.writeFileSync(
+    path.join(spool, "pending-prompts", "pmtstuck01.json"),
+    JSON.stringify({ promptId: "pmtstuck01", text: "x", fp: "fp", createdAt: Date.now() - 120_000, status: "pending" }),
+  );
+  lines = await runDoctor({
+    keysDir,
+    companionHost: "127.0.0.1",
+    companionPort: 1,
+    spoolDir: spool,
+    skip: ["metro", "journal", "ufw"],
+  });
+  assert.equal(lines.find((l) => l.check === "prompt delivery sweep").state, "FAIL");
+  assert.match(lines.find((l) => l.check === "prompt delivery sweep").detail, /sweep is down/);
+
+  // live surface + clean spool → PASS; a live server is the real thing
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const listener = startCompanionServer({ bind: "127.0.0.1", port: 0, paths: p, spoolDir: spool, store, log: () => {} });
+  await new Promise((r) => setTimeout(r, 50));
+  try {
+    fs.rmSync(path.join(spool, "pending-prompts", "pmtstuck01.json"));
+    lines = await runDoctor({
+      keysDir,
+      companionHost: "127.0.0.1",
+      companionPort: listener.port,
+      spoolDir: spool,
+      skip: ["metro", "journal", "ufw"],
+    });
+    assert.equal(lines.find((l) => l.check === "companion signed surface").state, "PASS");
+    assert.equal(lines.find((l) => l.check === "prompt delivery sweep").state, "PASS");
+    assert.equal(lines.find((l) => l.check === "ask decision delivery").state, "PASS");
+  } finally {
+    listener.close();
+  }
+});
+
 test("CLI: companion --enroll with existing keys", () => {
   const dir = tmp();
   const keydir = path.join(dir, "keys");

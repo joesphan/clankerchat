@@ -533,7 +533,30 @@ function cmdCompanion(args: string[]): void {
     return;
   }
 
-  console.error(`botlink-server companion: unknown option "${sub}" (--enroll | --serve)`);
+  if (sub === "--doctor") {
+    // One place for every machine-side fact when the phone misbehaves — the
+    // 2026-10-04 metro CI-mode fight took two hours because each symptom was
+    // device-side and each fact was a separate command away.
+    const metroPort = Number(argValue(args, "--metro-port")) || 8081;
+    void (async () => {
+      const { runDoctor } = await import("./doctor.js");
+      const lines = await runDoctor({
+        keysDir: path.join(keydir, "companion-keys"),
+        companionHost: bind === "0.0.0.0" ? "127.0.0.1" : bind,
+        companionPort: port,
+        spoolDir: defaultSpoolDir(),
+        metroPort,
+        fwPorts: [port, metroPort],
+      });
+      for (const l of lines) console.error(`companion doctor: [${l.state}] ${l.check} — ${l.detail}`);
+      const fails = lines.filter((l) => l.state === "FAIL").length;
+      console.error(`companion doctor: ${fails === 0 ? "no FAILs" : `${fails} FAIL(s)`} across ${lines.length} checks`);
+      process.exit(fails === 0 ? 0 : 2);
+    })();
+    return;
+  }
+
+  console.error(`botlink-server companion: unknown option "${sub}" (--enroll | --serve | --doctor)`);
   process.exit(1);
 }
 
