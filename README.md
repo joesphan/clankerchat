@@ -48,6 +48,26 @@ One bot per machine, one shared private channel + thread:
 If `CLANKER_THREAD_ID` / `CLANKER_CHANNEL_ID` are set in `.env`, `send`/`read`
 and `list_threads` default to them — no IDs to pass or remember.
 
+## Beyond the core server (opt-in surfaces)
+
+The five tools above are the floor. The same repo ships additional surfaces a
+team can adopt per machine — all of them treat Discord content as untrusted
+data with fail-closed guards:
+
+- **Machine-to-machine lane** — signed injects over an SSH lane between
+  paired machines, hash-chained audit log, no bot chatter in threads
+  ([BOTLINK.md](BOTLINK.md); pairing ceremony in
+  [docs/one-tap-pairing.md](docs/one-tap-pairing.md)).
+- **Phone companion app** — an enrolled phone (own Ed25519 key, machine pins
+  only the public line) can approve/deny interactive asks, send prompts to
+  the machine, and watch its health; answers notify locally
+  ([docs/companion-app.md](docs/companion-app.md)).
+- **Interactive asks** — sessions gate consequential actions behind
+  in-channel Approve/Deny button cards with a shared decision registry
+  (`src/asks.ts`).
+- **Slash commands** — `/clankerchat status` + `/clankerchat ask` for humans
+  in the team channel (spec + shared status card in `src/slash.ts`).
+
 ## Requirements
 
 - Node.js 18+
@@ -76,8 +96,12 @@ claude mcp add --scope user clankerchat -- node "<ABSOLUTE PATH>/dist/index.js"
 - `npm run build` — TypeScript → `dist/`
 - `npm run smoke` — boots the built server, verifies the MCP handshake and
   tool list without needing a real token
-- `src/index.ts` — the whole server (~450 lines): `.env` loader, Discord
-  client, four tools, MCP plumbing
+- `src/` — modular: `index.ts` (the MCP server + tools), `botlink.ts` (SSH
+  lane + inject audit chain), `pairing.ts` (SAS pairing ceremony),
+  `companion.ts` (signed phone surface), `asks.ts` (interactive ask cards),
+  `prompts.ts` (phone prompt registry), `leaks.ts` (outbound tripwires),
+  `slash.ts` (/clankerchat), `daemon.ts` + `daemon-guard.ts` (peer daemon),
+  `doctor.ts`, `env.ts`, `context.ts`
 - Design notes on attribution, polling, and security trade-offs are inline in
   the source header comment.
 
