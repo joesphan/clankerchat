@@ -1803,11 +1803,19 @@ async function sweepAuditLogs(): Promise<void> {
         log(`audit-watch: bot lacks View Audit Log — watch degraded (alerts will say so), not retrying loudly`);
         pushAuditAlert("audit watch degraded — bot lacks View Audit Log permission");
         try {
-          appendNotice(askSpool(), {
-            from: "audit-watch",
-            text: "audit watch degraded — bot lacks View Audit Log permission; critical-event pings are OFF until re-invited with the permission",
-            severity: "warn",
-          });
+          // Restart-spam guard: the per-process one-time flag resets every
+          // restart, but one identical degrade notice per restart is noise —
+          // skip when an unacked twin from the last 24h is already in the lane.
+          const twin = listNotices(askSpool()).some(
+            (r) => r.from === "audit-watch" && r.text.startsWith("audit watch degraded") && Date.now() - r.ts < 24 * 60 * 60 * 1000,
+          );
+          if (!twin) {
+            appendNotice(askSpool(), {
+              from: "audit-watch",
+              text: "audit watch degraded — bot lacks View Audit Log permission; critical-event pings are OFF until re-invited with the permission",
+              severity: "warn",
+            });
+          }
         } catch {
           /* the card alert above already says it */
         }

@@ -300,3 +300,30 @@ LIVE RESULT: fast-clank lacks View Audit Log in epicEFI → the one-time
 honest degrade fired on all three surfaces (log, card alert line, warn
 notice). The watch self-arms within 5 min of the permission being granted —
 that's a guild-settings action (Joe's guild). Asked in the lane.
+
+## Round — interaction journal on the live host + YOLO click fix (2026-10-04, round 11)
+
+INTERACTION JOURNAL (watcher flavor): every slash invocation and ask-button
+click the live watcher handles now hash-chains into
+<spool>/interaction-journal.jsonl — same entry shape as the daemon flavor
+(kind/type/detail/outcome/actor/name, ids only), refusals included (leak
+shapes, mass mention, queue-full, venue-blocked, non-approver, dangling,
+race-lost). jInteraction helper try/caught at every site — the reply always
+matters more than the journal line. This brings journalStats (phone card
+alert line), journal-verify, and the digest's journal counts alive on the
+host where interactions actually happen. Quarantine path journals nothing
+(absolute silence law).
+
+YOLO CLICK BUG (caught live, fixed): the watcher's decide line binary-mapped
+parsed.action to approved/denied — a YOLO button click (custom_id
+ask:<id>:yolo, peer c2a7ebe's widened contract) recorded DENIED. Fixed to
+the three-verb map; the enqueued trigger + askDecisionLine already spoke
+yolo fluently downstream. Worth checking any other pre-c2a7ebe click handler.
+
+DEGRADE NOTICE RESTART-SPAM GUARD (both flavors): the 403-degrade's
+per-process one-time flag resets every restart — one identical warn notice
+per restart is noise. Both flavors now skip when an unacked twin from the
+last 24h is already in the lane. Verified live: three restarts, one unacked
+degrade notice.
+
+187/187; watch+companion+botlink restarted and verified.
