@@ -451,6 +451,35 @@ export function startCompanionServer(opts: {
           return json(res, 200, { prompts });
         }
 
+        if (method === "GET" && url.pathname === "/machine") {
+          // Round 6 (pocket lane dashboard): the watcher's published state —
+          // pool, queues, lane verdict, idle time. Facts only, no secrets, no
+          // channel ids. An absent or stale file is HONEST on the wire
+          // (stale: true) rather than an error — a stopped watcher is itself
+          // a fact worth showing.
+          try {
+            const raw = JSON.parse(fs.readFileSync(path.join(spoolDir, "watcher-state.json"), "utf8")) as Record<string, unknown>;
+            const ageMs = typeof raw.updated === "string" ? Date.now() - Date.parse(raw.updated) : NaN;
+            const lane = (raw.lane ?? null) as Record<string, unknown> | null;
+            return json(res, 200, {
+              machine: {
+                active: Number(raw.active ?? 0),
+                queuedHuman: Number(raw.queued_human ?? 0),
+                queuedBot: Number(raw.queued_bot ?? 0),
+                maxConcurrent: Number(raw.max_concurrent ?? 0),
+                laneOk: lane ? Boolean(lane.ok) : null,
+                lanePeer: lane && typeof lane.bot === "string" ? lane.bot : null,
+                lanePending: lane ? Number(lane.pending ?? 0) : 0,
+                lastRunAt: typeof raw.last_run_at === "string" ? raw.last_run_at : null,
+                updated: typeof raw.updated === "string" ? raw.updated : null,
+                stale: !(ageMs === ageMs && ageMs < 300_000), // NaN (no timestamp) or >5min → stale
+              },
+            });
+          } catch {
+            return json(res, 200, { machine: { stale: true } });
+          }
+        }
+
         if (method === "POST" && url.pathname === "/prompt") {
           let msg: Record<string, unknown>;
           try {

@@ -195,6 +195,22 @@ interface PromptView {
   answerExcerpt: string | null;
 }
 
+/** The machine's published health (GET /machine, round 6) — pool, queues,
+ *  the botlink lane verdict from the watcher's heartbeat, idle time. Facts
+ *  rendered as data; a stopped watcher shows stale: true honestly. */
+interface MachineView {
+  active: number;
+  queuedHuman: number;
+  queuedBot: number;
+  maxConcurrent: number;
+  laneOk: boolean | null;
+  lanePeer: string | null;
+  lanePending: number;
+  lastRunAt: string | null;
+  updated: string | null;
+  stale: boolean;
+}
+
 const K_SEED = "cc.seed";
 const K_MACHINES = "cc.machines";
 const K_COUNTERS = "cc.counters";
@@ -273,6 +289,7 @@ export default function App() {
   const [attempt, setAttempt] = useState<AttemptView | null>(null);
   const [asks, setAsks] = useState<AskView[]>([]);
   const [prompts, setPrompts] = useState<PromptView[]>([]);
+  const [machine, setMachine] = useState<MachineView | null>(null);
   const [promptText, setPromptText] = useState("");
   const [sasInput, setSasInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -329,6 +346,10 @@ export default function App() {
         const promptRes = await signedFetch(active, seed, phoneId, "GET", "/prompts");
         if (!stopped && promptRes.status === 200) {
           setPrompts(Array.isArray(promptRes.json.prompts) ? (promptRes.json.prompts as unknown as PromptView[]) : []);
+        }
+        const machineRes = await signedFetch(active, seed, phoneId, "GET", "/machine");
+        if (!stopped && machineRes.status === 200 && machineRes.json?.machine) {
+          setMachine(machineRes.json.machine as unknown as MachineView);
         }
       } catch (e) {
         if (!stopped) setError(`unreachable: ${(e as Error).message}`);
@@ -584,6 +605,7 @@ export default function App() {
                 setAttempt(null);
                 setAsks([]);
                 setPrompts([]);
+                setMachine(null);
                 setNotice("");
                 setError("");
               }}
@@ -608,6 +630,31 @@ export default function App() {
         <Text style={s.fp} selectable={false}>
           machine fingerprint: {active.fp}
         </Text>
+      ) : null}
+
+      {active && machine ? (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>MACHINE</Text>
+          {machine.stale ? (
+            <Text style={s.err}>state stale — watcher stopped writing?</Text>
+          ) : (
+            <>
+              <Text style={s.muted}>
+                pool {machine.active}/{machine.maxConcurrent} · queue {machine.queuedHuman + machine.queuedBot}
+                {machine.lastRunAt
+                  ? ` · ran ${Math.max(0, Math.round((Date.now() - Date.parse(machine.lastRunAt)) / 60000))}m ago`
+                  : " · no runs yet"}
+              </Text>
+              <Text style={machine.laneOk === false ? s.err : s.ok}>
+                {machine.laneOk === null
+                  ? "lane: not probed yet"
+                  : `lane ${machine.lanePeer ?? "peer"} ${machine.laneOk ? "✓" : "✗"}${
+                      machine.lanePending > 0 ? ` · ${machine.lanePending} queued on peer` : ""
+                    }`}
+              </Text>
+            </>
+          )}
+        </View>
       ) : null}
 
       {active && asks.length > 0

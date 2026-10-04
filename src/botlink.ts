@@ -611,14 +611,19 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
             if (verb === "status") {
               const pending = countPending();
               // Load-balancing surface (2026-10-02): the tag-watcher writes
-              // watcher-state.json into the spool on every queue change;
-              // status serves it only while fresh (<60s), so a dispatching
-              // peer routes by real load, never a stale snapshot.
+              // watcher-state.json into the spool on every queue change AND
+              // every 120s presence tick (round 6); status serves it only
+              // while fresh, so a dispatching peer routes by real load, never
+              // a stale snapshot. Freshness (180s) EXCEEDS the write cadence —
+              // an idle machine's 0/N load is still true load and stays
+              // servable; a machine that stops writing falls out of the
+              // window within 3 minutes.
+              const LOAD_FRESH_MS = 180_000;
               let load: Record<string, unknown> | undefined;
               try {
                 const raw = fs.readFileSync(path.join(opts.spoolDir, "watcher-state.json"), "utf8");
                 const parsed = JSON.parse(raw) as { updated?: string };
-                if (parsed.updated && Date.now() - Date.parse(parsed.updated) < 60_000) {
+                if (parsed.updated && Date.now() - Date.parse(parsed.updated) < LOAD_FRESH_MS) {
                   load = parsed as Record<string, unknown>;
                 }
               } catch {

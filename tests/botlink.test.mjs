@@ -830,10 +830,12 @@ test("status surfaces watcher load while fresh, omits it when absent or stale", 
   const withLoad = JSON.parse(await botlinkRequest(peer, "status"));
   assert.equal(withLoad.load.active, 1);
   assert.equal(withLoad.load.queued_bot, 2);
-  // Stale state (>60s old) → omitted, not served as truth.
+  // Stale state (beyond the 180s freshness window — the watcher refreshes
+  // every 120s, so anything older than 3min means the writer stopped) →
+  // omitted, not served as truth.
   fs.writeFileSync(
     path.join(spool, "watcher-state.json"),
-    JSON.stringify({ active: 0, updated: new Date(Date.now() - 120_000).toISOString() }) + "\n",
+    JSON.stringify({ active: 0, updated: new Date(Date.now() - 240_000).toISOString() }) + "\n",
   );
   const stale = JSON.parse(await botlinkRequest(peer, "status"));
   assert.equal(stale.load, undefined, "stale watcher-state.json must be omitted");

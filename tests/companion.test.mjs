@@ -420,6 +420,88 @@ test("doctor: surface + spool verdicts from machine-side facts (metro/journal/uf
   }
 });
 
+test("machine route (round 6): lane + pool facts from watcher state, honest staleness", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(path.join(spool), { recursive: true });
+  const listener = startCompanionServer({
+    bind: "127.0.0.1",
+    port: 0,
+    paths: p,
+    spoolDir: spool,
+    store,
+    log: () => {},
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+
+  try {
+    // unsigned → 401 (same gate as every signed route)
+    let res = await fetch(base + "/machine");
+    assert.equal(res.status, 401);
+
+    // no watcher state at all → honest stale, not an error
+    res = await signed("GET", "/machine");
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { machine: { stale: true } });
+
+    // fresh state with lane facts → facts on the wire, minimum shape
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({
+        active: 1,
+        queued_human: 0,
+        queued_bot: 2,
+        max_concurrent: 2,
+        lane: { ok: true, bot: "joesp-desktop", pending: 1, injects: 109, probedAt: new Date().toISOString() },
+        last_run_at: new Date().toISOString(),
+        updated: new Date().toISOString(),
+      }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const m = (await res.json()).machine;
+    assert.equal(m.stale, false);
+    assert.equal(m.active, 1);
+    assert.equal(m.queuedBot, 2);
+    assert.equal(m.laneOk, true);
+    assert.equal(m.lanePeer, "joesp-desktop");
+    assert.equal(m.lanePending, 1);
+    assert.ok(m.lastRunAt);
+    // wire shape is fixed — nothing else rides out
+    assert.deepEqual(
+      Object.keys(m).sort(),
+      ["active", "laneOk", "lanePeer", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
+    );
+
+    // stale state (>5min) → honest stale flag, no facts served as truth
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({ active: 0, updated: new Date(Date.now() - 360_000).toISOString() }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    assert.equal((await res.json()).machine.stale, true);
+  } finally {
+    listener.close();
+  }
+});
+
 test("CLI: companion --enroll with existing keys", () => {
   const dir = tmp();
   const keydir = path.join(dir, "keys");
