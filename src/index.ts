@@ -45,7 +45,7 @@ import path from "node:path";
 import { z } from "zod";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.js";
-import { findLeakSignals, leakRefusal } from "./leaks.js";
+import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "./leaks.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
 const VERSION = "0.1.0";
@@ -618,6 +618,11 @@ function registerTools(server: McpServer): void {
           }
         }
         const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        // Mass-mention law (owner 2026-10-04): @everyone/@here/role mentions
+        // never ride out in bot posts — refusal, not neutralization, so the
+        // composer rephrases instead of us shipping a mangled message.
+        const massMentions = findMassMentions(content);
+        if (massMentions.length > 0) throw new Error(massMentionRefusal());
         // Native reply (same channel only): keeps an answer attached to the
         // message it answers — the watcher also treats replies-to-our-messages
         // as explicit addressing, so threaded answers route cleanly.
@@ -762,7 +767,10 @@ function registerTools(server: McpServer): void {
           );
         }
         if (message) {
-          await created.send({ content: withSender(process.env.CLANKER_NAME, message), allowedMentions: { parse: ["users"] } });
+          const content = withSender(process.env.CLANKER_NAME, message);
+          const massMentions = findMassMentions(content);
+          if (massMentions.length > 0) throw new Error(massMentionRefusal());
+          await created.send({ content, allowedMentions: { parse: ["users"] } });
         }
         return { thread_id: created.id, name: created.name, existed: false };
       }),

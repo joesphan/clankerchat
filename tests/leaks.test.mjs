@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { findLeakSignals, leakRefusal } from "../dist/leaks.js";
+import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "../dist/leaks.js";
 
 test("findLeakSignals: every deployment secret shape is caught", () => {
   assert.deepEqual(findLeakSignals("cfut_ABCdef12345"), ["cloudflare api token"]);
@@ -63,4 +63,34 @@ test("short stubs that share a prefix but are not token-shaped stay clean", () =
   assert.deepEqual(findLeakSignals("cfut_short"), []);
   assert.deepEqual(findLeakSignals("sk-tooshort"), []);
   assert.deepEqual(findLeakSignals("xox-notas-1"), []);
+});
+
+test("findMassMentions: @everyone/@here in prose is caught (2026-10-04 incident shape)", () => {
+  // The exact incident: law-explaining prose containing the literal string.
+  assert.deepEqual(findMassMentions("tags notify, roles/@everyone stay impossible"), [
+    "@everyone/@here mass mention",
+  ]);
+  assert.deepEqual(findMassMentions("never tag @Everyone again"), ["@everyone/@here mass mention"]);
+  assert.deepEqual(findMassMentions("posting @here to wake the channel"), ["@everyone/@here mass mention"]);
+  assert.deepEqual(findMassMentions("@everyone"), ["@everyone/@here mass mention"]);
+  // Role mentions share the blast radius: <@&id> is the everyone-class syntax.
+  assert.deepEqual(findMassMentions("pinging <@&1555103465179455488> ops"), ["role mention (<@&id>)"]);
+});
+
+test("findMassMentions: legitimate text stays clean — user tags, emails, discussion", () => {
+  // Plain user tags are the whole point of mentions; they must keep working.
+  assert.deepEqual(findMassMentions("<@210949752617959424> this should have pinged you"), []);
+  // Email local-parts must not false-positive.
+  assert.deepEqual(findMassMentions("mail ops@everyone.example.com for details"), []);
+  assert.deepEqual(findMassMentions("reach me at joe@here.dev"), []);
+  // Discussing the law without the literal @-token.
+  assert.deepEqual(findMassMentions("bot posts never mass-mention everyone — rephrase"), []);
+  assert.deepEqual(findMassMentions(""), []);
+  assert.deepEqual(findMassMentions(undefined), []);
+});
+
+test("massMentionRefusal: starts with REFUSED and names the law", () => {
+  const text = massMentionRefusal();
+  assert.match(text, /^REFUSED: outbound text contains @everyone\/@here or a role mention/);
+  assert.match(text, /never mass-mention/);
 });

@@ -36,6 +36,42 @@ export function findLeakSignals(text: string): string[] {
   return [...hits];
 }
 
+/**
+ * Mass-mention tripwires — owner law 2026-10-04 ("never tag @everyone, ever"):
+ * bot posts NEVER carry @everyone/@here or role mentions. allowedMentions
+ * already restricts server-side parsing to users, but the literal string must
+ * never ride out either — clients render the raw text as a live tag pill even
+ * when notification is suppressed (2026-10-04 incident: a fix-announcement
+ * post said "roles/@everyone stay impossible" in prose and rendered as a real
+ * tag the owner had to delete). Role mentions (<@&id>) share the blast
+ * radius: a big role ≈ @everyone. Checked at outbound DISCORD surfaces only
+ * (send, create_thread, the relay script) — lane/inject text may DISCUSS the
+ * law, so it is not scanned here.
+ */
+export const MASS_MENTION_PATTERNS: LeakPattern[] = [
+  // Lookbehind excludes email-local fragments ("x@everyone.com"); line starts
+  // and punctuation-adjacent forms ("roles/@everyone") match, as they render.
+  { re: /(?<![a-zA-Z0-9._%+-])@(everyone|here)\b/i, kind: "@everyone/@here mass mention" },
+  { re: /<@&\d+>/, kind: "role mention (<@&id>)" },
+];
+
+/** Which mass-mention kinds does this text contain? Empty array = clean. */
+export function findMassMentions(text: string): string[] {
+  if (!text) return [];
+  const hits = new Set<string>();
+  for (const { re, kind } of MASS_MENTION_PATTERNS) if (re.test(text)) hits.add(kind);
+  return [...hits];
+}
+
+/** Refusal error text for a mass-mention hit — names the law, teaches the out. */
+export function massMentionRefusal(): string {
+  return (
+    "REFUSED: outbound text contains @everyone/@here or a role mention — bot posts never mass-mention " +
+    "(owner law 2026-10-04). Rephrase so the literal string does not appear (e.g. \"everyone-pings\" or " +
+    "\"mass-mentions\" in prose); plain user tags (<@id>) are fine."
+  );
+}
+
 /** Refusal error text for a boundary hit — names the kinds, teaches the rule. */
 export function leakRefusal(kinds: string[]): string {
   return (
