@@ -32,7 +32,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { appendInjectEvent, fingerprintOfPublicKey, parseKey } from "./botlink.js";
+import { appendInjectEvent, deriveInjectMetrics, fingerprintOfPublicKey, parseKey, verifyInjectLog } from "./botlink.js";
 import { decideAsk, getAsk, listPendingAsks, renderAskForApp } from "./asks.js";
 import {
   createPhonePrompt,
@@ -452,19 +452,45 @@ export function startCompanionServer(opts: {
         // --- status only. Text is data like any Discord content.
         if (method === "GET" && url.pathname === "/prompts") {
           const now = Date.now();
-          const prompts = listPhonePrompts(spoolDir)
-            .filter(
-              (r) =>
-                r.status === "pending" ||
-                r.status === "enqueued" ||
-                (r.finishedAt ?? 0) > now - 30 * 60 * 1000, // recent history chips
-            )
-            .slice(-20) // newest 20 — a scroll, not the registry
-            .map(renderPromptForApp);
+          // ?q= searches the WHOLE registry (promptId or text substring,
+          // case-insensitive) — "that thing I asked Tuesday" without scroll.
+          // No q= keeps the round-5 contract: active + recent chips, newest 20.
+          const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+          const prompts = q
+            ? listPhonePrompts(spoolDir)
+                .filter(
+                  (r) =>
+                    r.promptId.toLowerCase().includes(q) ||
+                    r.text.toLowerCase().includes(q),
+                )
+                .slice(-50) // newest 50 matches — bounded even on a big registry
+                .map(renderPromptForApp)
+            : listPhonePrompts(spoolDir)
+                .filter(
+                  (r) =>
+                    r.status === "pending" ||
+                    r.status === "enqueued" ||
+                    (r.finishedAt ?? 0) > now - 30 * 60 * 1000, // recent history chips
+                )
+                .slice(-20) // newest 20 — a scroll, not the registry
+                .map(renderPromptForApp);
           return json(res, 200, { prompts });
         }
 
         if (method === "GET" && url.pathname === "/machine") {
+          // Lane health rides the AUDIT LOG, not the watcher: median
+          // received→consumed for injects this machine has handled. It stays
+          // true when the watcher dies (exactly when the card needs facts
+          // most) — chain-verified first, omitted honestly when absent.
+          let laneHealthMs: number | null = null;
+          let lanePaired = 0;
+          try {
+            const metrics = deriveInjectMetrics(verifyInjectLog(spoolDir));
+            laneHealthMs = metrics.medianReceivedToConsumedMs;
+            lanePaired = metrics.receivedToConsumedMs.length;
+          } catch {
+            /* absent or chain-broken log — the card renders "no paired events" */
+          }
           // Round 6 (pocket lane dashboard): the watcher's published state —
           // pool, queues, lane verdict, idle time. Facts only, no secrets, no
           // channel ids. An absent or stale file is HONEST on the wire
@@ -486,10 +512,12 @@ export function startCompanionServer(opts: {
                 lastRunAt: typeof raw.last_run_at === "string" ? raw.last_run_at : null,
                 updated: typeof raw.updated === "string" ? raw.updated : null,
                 stale: !(ageMs === ageMs && ageMs < 300_000), // NaN (no timestamp) or >5min → stale
+                laneHealthMs,
+                lanePaired,
               },
             });
           } catch {
-            return json(res, 200, { machine: { stale: true } });
+            return json(res, 200, { machine: { stale: true, laneHealthMs, lanePaired } });
           }
         }
 

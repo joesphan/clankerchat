@@ -21,7 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { fingerprintOfPublicKey, generateBotKey, parseKey } from "../dist/botlink.js";
+import { appendInjectEvent, fingerprintOfPublicKey, generateBotKey, parseKey } from "../dist/botlink.js";
 import {
   companionRequestMessage,
   companionStore,
@@ -243,7 +243,7 @@ test("HTTP e2e: enroll, attempts, allow (wrong/right SAS), replay, single-use, d
     counter += 1;
     const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
     const sha = crypto.createHash("sha256").update(body).digest("hex");
-    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
     const sig = keyObj.sign(msg).toString("base64");
     const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
     if (method !== "GET") headers["content-type"] = "application/json";
@@ -462,7 +462,7 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     counter += 1;
     const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
     const sha = crypto.createHash("sha256").update(body).digest("hex");
-    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
     const sig = keyObj.sign(msg).toString("base64");
     const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
     if (method !== "GET") headers["content-type"] = "application/json";
@@ -474,10 +474,11 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     let res = await fetch(base + "/machine");
     assert.equal(res.status, 401);
 
-    // no watcher state at all → honest stale, not an error
+    // no watcher state at all → honest stale, not an error; lane health is
+    // audit-log truth and rides along (no inject.log here → null/0)
     res = await signed("GET", "/machine");
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { machine: { stale: true } });
+    assert.deepEqual(await res.json(), { machine: { stale: true, laneHealthMs: null, lanePaired: 0 } });
 
     // fresh state with lane facts → facts on the wire, minimum shape
     fs.writeFileSync(
@@ -504,8 +505,18 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     // wire shape is fixed — nothing else rides out
     assert.deepEqual(
       Object.keys(m).sort(),
-      ["active", "laneOk", "lanePeer", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
+      ["active", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
     );
+
+    // lane health from the audit log: one received→consumed pair → median
+    // lands on the wire (injects: Xs median · 1 paired)
+    await appendInjectEvent(spool, { event: "received", id: "h1", source: "peer", target: "shim" });
+    await new Promise((r) => setTimeout(r, 25)); // distinct ts → a real duration
+    await appendInjectEvent(spool, { event: "consumed", id: "h1", source: "peer", target: "shim" });
+    res = await signed("GET", "/machine");
+    const mh = (await res.json()).machine;
+    assert.equal(mh.lanePaired, 1);
+    assert.ok(mh.laneHealthMs !== null && mh.laneHealthMs >= 20, `median ${mh.laneHealthMs}ms from one paired inject`);
 
     // stale state (>5min) → honest stale flag, no facts served as truth
     fs.writeFileSync(
@@ -569,7 +580,7 @@ test("asks routes: list pending, decide with provenance, races and replays stay 
     counter += 1;
     const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
     const sha = crypto.createHash("sha256").update(body).digest("hex");
-    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
     const sig = keyObj.sign(msg).toString("base64");
     const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
     if (method !== "GET") headers["content-type"] = "application/json";
@@ -673,7 +684,7 @@ test("prompt routes (round 5): send from the phone, list lifecycle, caps and aut
     counter += 1;
     const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
     const sha = crypto.createHash("sha256").update(body).digest("hex");
-    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
     const sig = keyObj.sign(msg).toString("base64");
     const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
     if (method !== "GET") headers["content-type"] = "application/json";
@@ -741,6 +752,39 @@ test("prompt routes (round 5): send from the phone, list lifecycle, caps and aut
     assert.equal(res.status, 403, "replayed counter refused");
     const inFlight = (await import("../dist/prompts.js")).listPhonePrompts(spool).filter((r) => r.text === "replayed");
     assert.equal(inFlight.length, 0, "replay prompted nothing");
+
+    // ?q= searches the WHOLE registry — an old, long-finished prompt the
+    // default list no longer surfaces is findable by a text substring and
+    // by promptId; case-insensitive both ways. (Restore the counter the
+    // replay check deliberately burned above.)
+    counter += 1;
+    const old = {
+      promptId: "pmtuesday1",
+      text: "the tuesday audit question",
+      fp: phone.fingerprint,
+      createdAt: Date.now() - 3 * 24 * 3600_000,
+      status: "answered",
+      finishedAt: Date.now() - 3 * 24 * 3600_000,
+      exit: 0,
+    };
+    fs.writeFileSync(
+      path.join(spool, "pending-prompts", `${old.promptId}.json`),
+      JSON.stringify(old),
+    );
+    res = await signed("GET", "/prompts");
+    assert.ok(
+      !((await res.json()).prompts).some((r) => r.promptId === "pmtuesday1"),
+      "3-day-old answer is not in the default recent list",
+    );
+    res = await signed("GET", "/prompts?q=tuesday audit");
+    const hits = (await res.json()).prompts;
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].promptId, "pmtuesday1");
+    assert.equal(hits[0].status, "answered");
+    res = await signed("GET", "/prompts?q=PMTUESDAY1");
+    assert.equal(((await res.json()).prompts).length, 1, "promptId match, case-insensitive");
+    res = await signed("GET", "/prompts?q=no-such-thing");
+    assert.deepEqual(((await res.json()).prompts), []);
   } finally {
     listener.close();
   }
