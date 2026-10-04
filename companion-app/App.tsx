@@ -25,7 +25,9 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import * as Battery from "expo-battery";
 import * as Notifications from "expo-notifications";
+import * as ScreenCapture from "expo-screen-capture";
 import {
   ActivityIndicator,
   AppState,
@@ -388,6 +390,12 @@ export default function App() {
   const appState = useRef(AppState.currentState);
   // PromptId → last status SEEN by this app session (notification transitions).
   const seenPromptStatus = useRef<Map<string, string>>(new Map());
+  // machine:askId keys for ask-arrival banners — one banner per ask per app
+  // session, surviving machine switches (a flip must not re-spam old asks).
+  const seenAsks = useRef<Set<string>>(new Set());
+  // The pocket's own health (S-tier #3): the phone IS the approval surface,
+  // so its battery belongs beside the machine's health on the machine card.
+  const [battery, setBattery] = useState<{ level: number; charging: boolean } | null>(null);
 
   const deriveIdentity = useCallback(async (theSeed: Uint8Array) => {
     const pub = await ed25519.getPublicKeyAsync(theSeed);
@@ -458,6 +466,86 @@ export default function App() {
       sub.remove();
     };
   }, [active, seed, phoneId]);
+
+  // Screenshot prevention (S-tier #2, owner 2026-10-04 "use the expo features
+  // to the best of your abilities"): FLAG_SECURE on Android blocks screenshots
+  // AND app-switcher previews for the whole app — it only ever displays
+  // pairing/approval material, so always-on is the correct posture. iOS cannot
+  // prevent captures (detect only): the listener WARNS that a capture landed,
+  // because a photo-library copy of an on-screen SAS is exactly the leak class
+  // the never-transmit-SAS law exists to prevent.
+  useEffect(() => {
+    let on = true;
+    void ScreenCapture.preventScreenCaptureAsync().catch(() => {
+      /* Expo Go / platform without the surface — detection still armed */
+    });
+    const sub = ScreenCapture.addScreenshotListener(() => {
+      if (on) {
+        setError("screenshot captured — if an SAS was on screen it is now in your photo library; deny and re-pair if this wasn't you");
+      }
+    });
+    return () => {
+      on = false;
+      sub.remove();
+      void ScreenCapture.allowScreenCaptureAsync().catch(() => {});
+    };
+  }, []);
+
+  // Phone battery (S-tier #3): level + charging state, refreshed by listener
+  // events. Rendered on the machine card; <20% while unplugged escalates to a
+  // warning — a dead approval surface silently strands asks.
+  useEffect(() => {
+    let on = true;
+    void (async () => {
+      try {
+        const level = await Battery.getBatteryLevelAsync();
+        const state = await Battery.getBatteryStateAsync();
+        if (on) {
+          setBattery({
+            level,
+            charging: state === Battery.BatteryState.CHARGING,
+          });
+        }
+      } catch {
+        /* simulator / no battery surface — card just omits the line */
+      }
+    })();
+    const lvl = Battery.addBatteryLevelListener((e) => {
+      if (on) setBattery((prev) => ({ level: e.batteryLevel, charging: prev?.charging ?? false }));
+    });
+    const st = Battery.addBatteryStateListener((e) => {
+      if (on) {
+        const charging = e.batteryState === Battery.BatteryState.CHARGING;
+        setBattery((prev) => ({ level: prev?.level ?? 0, charging }));
+      }
+    });
+    return () => {
+      on = false;
+      lvl.remove();
+      st.remove();
+    };
+  }, []);
+
+  // Ask-arrival banners (same green-lit display-data class as prompt-outcome
+  // banners, 2026-10-04): a pending ask that goes unseen expires silently.
+  // Banner ONCE per ask per app session, question text only — never pairing or
+  // SAS material. Keyed machine:askId so switching machines neither re-spams
+  // nor cross-fires.
+  useEffect(() => {
+    if (!active) return;
+    for (const a of asks) {
+      const key = `${active.id}:${a.askId}`;
+      if (seenAsks.current.has(key)) continue;
+      seenAsks.current.add(key);
+      void Notifications.scheduleNotificationAsync({
+        content: {
+          title: "Ask needs your decision",
+          body: String(a.question).slice(0, 140),
+        },
+        trigger: null, // local, immediate
+      }).catch((e) => setError(`notification failed: ${(e as Error).message}`));
+    }
+  }, [asks, active]);
 
   // Notification permission: ask once on mount. A denial is SURFACED (quiet
   // notice line) rather than swallowed — "no banner" with no reason is
@@ -845,6 +933,12 @@ export default function App() {
                 </Text>
               ))
             : null}
+          {battery ? (
+            <Text style={battery.level < 0.2 && !battery.charging ? s.err : s.muted}>
+              phone battery {Math.round(battery.level * 100)}%{battery.charging ? " · charging" : ""}
+              {battery.level < 0.2 && !battery.charging ? " — approval surface may die soon" : ""}
+            </Text>
+          ) : null}
           {machine.lanePaired > 0 && machine.laneHealthMs !== null ? (
             <Text style={s.muted}>
               injects: {(machine.laneHealthMs / 1000).toFixed(1)}s median · {machine.lanePaired} paired
