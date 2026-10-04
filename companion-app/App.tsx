@@ -411,6 +411,12 @@ export default function App() {
   const [machine, setMachine] = useState<MachineView | null>(null);
   const [notices, setNotices] = useState<NoticeView[]>([]);
   const [unacked, setUnacked] = useState(0);
+  // Notices window width (round 9): the poll fetches the newest 10 by
+  // default; "Show older notices" widens to the whole 50-record registry.
+  // Kept in a ref so flipping it re-renders the toggle WITHOUT re-arming the
+  // poll effect — the next 2s tick simply fetches the wider window.
+  const [noticesLimit, setNoticesLimit] = useState(10);
+  const noticesLimitRef = useRef(10);
   const [promptText, setPromptText] = useState("");
   // Route toggle (multi-machine phase 1): false = this machine runs it (the
   // only behavior before phase 1); true = route:"peer" — the peer machine
@@ -499,7 +505,13 @@ export default function App() {
         if (!stopped && machineRes.status === 200 && machineRes.json?.machine) {
           setMachine(machineRes.json.machine as unknown as MachineView);
         }
-        const noticeRes = await signedFetch(active, seed, phoneId, "GET", "/notices");
+        const noticeRes = await signedFetch(
+          active,
+          seed,
+          phoneId,
+          "GET",
+          noticesLimitRef.current > 10 ? `/notices?limit=${noticesLimitRef.current}` : "/notices",
+        );
         if (!stopped && noticeRes.status === 200) {
           setNotices(Array.isArray(noticeRes.json.notices) ? (noticeRes.json.notices as unknown as NoticeView[]) : []);
           setUnacked(Number(noticeRes.json.unacked ?? 0));
@@ -1075,6 +1087,8 @@ export default function App() {
                 setSentMore(false);
                 setNotices([]); // notices are per-machine reports — clear, repoll repopulates
                 setUnacked(0);
+                noticesLimitRef.current = 10; // window width is a view preference per machine view
+                setNoticesLimit(10);
                 setExpanded(new Set());
                 seenPromptStatus.current.clear(); // notification transitions are per-machine:
                 // a stale status from machine A must never look like a
@@ -1182,6 +1196,30 @@ export default function App() {
           {unacked > 1 ? (
             <Pressable style={[s.button, s.buttonDim]} onPress={() => void doAckAllNotices()}>
               <Text style={s.buttonText}>Dismiss all ({unacked})</Text>
+            </Pressable>
+          ) : null}
+          {/* Window toggle: only offered when the window is FULL (exactly
+              `limit` rows) — a short list proves the registry has nothing
+              older to reveal. The flip takes effect on the next 2s poll. */}
+          {noticesLimit === 10 && notices.length >= 10 ? (
+            <Pressable
+              style={[s.button, s.buttonDim]}
+              onPress={() => {
+                noticesLimitRef.current = 50;
+                setNoticesLimit(50);
+              }}
+            >
+              <Text style={s.buttonText}>Show older notices</Text>
+            </Pressable>
+          ) : noticesLimit === 50 ? (
+            <Pressable
+              style={[s.button, s.buttonDim]}
+              onPress={() => {
+                noticesLimitRef.current = 10;
+                setNoticesLimit(10);
+              }}
+            >
+              <Text style={s.buttonText}>Recent only</Text>
             </Pressable>
           ) : null}
         </View>

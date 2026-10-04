@@ -66,8 +66,8 @@ import { shouldHaveStatusLine, statusLine, nextStatusDelayMs } from "./run-progr
 import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
 import { findLeakSignals, findMassMentions, leakRefusal, massMentionRefusal, scanTextOfPost } from "./leaks.js";
-import { appendJournal } from "./journal.js";
-import { appendNotice } from "./notices.js";
+import { appendJournal, dailyDigestText, journalFile, journalStats, verifyJournalFile } from "./journal.js";
+import { appendNotice, listNotices } from "./notices.js";
 import { classifyAudit, filterAuditSince, type AuditLike } from "./audit.js";
 import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
 import {
@@ -1819,6 +1819,44 @@ async function sweepAuditLogs(): Promise<void> {
   }
 }
 
+/** Daily digest (round 9): one notice per local day — the automated version
+ *  of the owner's "let me know not in discord but just on the phone". The
+ *  cursor is the REGISTRY ITSELF: the newest existing daily-digest notice's
+ *  local day. No state field, no first-boot seeding, crash-safe by
+ *  construction — the append is the commit. Doubles as a daily tamper check:
+ *  a broken journal chain files the digest at warn severity with the counts
+ *  marked untrusted. */
+async function sweepDailyDigest(): Promise<void> {
+  const today = new Date().toLocaleDateString("en-CA"); // local YYYY-MM-DD
+  const last = listNotices(askSpool()).filter((r) => r.from === "daily-digest").at(-1);
+  if (last && new Date(last.ts).toLocaleDateString("en-CA") === today) return;
+  const file = journalFile(askSpool());
+  if (!fs.existsSync(file)) {
+    appendNotice(askSpool(), {
+      from: "daily-digest",
+      text: "last 24h: no journal yet — no interactions or audit events recorded",
+      severity: "info",
+    });
+    log(`daily digest notice filed (${today} boundary, no journal yet)`);
+    return;
+  }
+  let entries: ReturnType<typeof verifyJournalFile> = [];
+  let chainOk = true;
+  try {
+    entries = verifyJournalFile(file);
+  } catch (err) {
+    chainOk = false;
+    log(`daily digest: journal chain broken at digest time: ${errText(err)}`);
+  }
+  const stats = journalStats(entries);
+  appendNotice(askSpool(), {
+    from: "daily-digest",
+    text: dailyDigestText(entries, Date.now(), chainOk),
+    severity: !chainOk || stats.criticalAudit > 0 ? "warn" : "info",
+  });
+  log(`daily digest notice filed (${today} boundary, chain ${chainOk ? "OK" : "BROKEN"})`);
+}
+
 /** Publish the watcher's facts into the botlink spool: pool, queues, lane
  * verdict, last-run, updated. Written atomically (tmp+rename) — botlink's
  * status verb and companion's /machine read this file live and must never
@@ -1966,6 +2004,14 @@ async function main(): Promise<void> {
   void sweepAuditLogs().catch((err) => log(`audit-watch boot sweep failed: ${errText(err)}`));
   setInterval(() => {
     void sweepAuditLogs().catch((err) => log(`audit-watch sweep failed: ${errText(err)}`));
+  }, 300_000).unref();
+
+  // Daily digest (round 9): checked at boot + every 5 min — the boundary
+  // lands within 5 min of local midnight. Same catch shape as the audit
+  // watch: a digest failure is logged, never fatal to the daemon.
+  void sweepDailyDigest().catch((err) => log(`daily digest failed: ${errText(err)}`));
+  setInterval(() => {
+    void sweepDailyDigest().catch((err) => log(`daily digest failed: ${errText(err)}`));
   }, 300_000).unref();
 
   // CLANKER SPEC A3/A5 heartbeat: follow-ups + queue drain + watchdog feed.

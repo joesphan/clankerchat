@@ -157,3 +157,23 @@ export function journalStats(entries: JournalEntry[], now = Date.now(), windowMs
   }
   return { refused, criticalAudit };
 }
+
+/** One-line 24h summary for the daily digest notice (round 9). Pure: the
+ *  daemon supplies verified entries + the chain verdict from its own
+ *  verifyJournalFile try/catch — a broken chain still gets a digest, it just
+ *  says so loudly instead of presenting untrusted counts as fact. */
+export function dailyDigestText(entries: JournalEntry[], now = Date.now(), chainOk = true): string {
+  const windowMs = 24 * 60 * 60 * 1000;
+  const recent = entries.filter((e) => now - e.ts <= windowMs);
+  const interactions = recent.filter((e) => e.kind === "interaction").length;
+  const refused = recent.filter(
+    (e) => e.kind === "interaction" && (e.outcome === "refused" || e.outcome === "venue-blocked"),
+  ).length;
+  const critical = recent.filter((e) => e.kind === "audit" && e.severity === "critical").length;
+  const notify = recent.filter((e) => e.kind === "audit" && e.severity === "notify").length;
+  const noise = recent.filter((e) => e.kind === "noise").length;
+  const counts = `${interactions} interactions (${refused} refused) · ${critical} critical + ${notify} notify audit · ${noise} noise flags`;
+  return chainOk
+    ? `last 24h: ${counts} · journal chain OK`
+    : `JOURNAL CHAIN BROKEN — counts untrusted: ${counts}`;
+}

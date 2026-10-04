@@ -7,6 +7,7 @@ import path from "node:path";
 
 import {
   appendJournal,
+  dailyDigestText,
   journalFile,
   journalStats,
   readJournalTail,
@@ -73,6 +74,26 @@ test("journal: stats count refusals + critical audit in the window only", () => 
   const stats = journalStats(entries, now);
   assert.equal(stats.refused, 2);
   assert.equal(stats.criticalAudit, 1);
+});
+
+test("journal: daily digest text counts the 24h window and carries the chain verdict", () => {
+  const now = Date.now();
+  const entries = [
+    { h: "x", ts: now - 1000, kind: "interaction", outcome: "handled" },
+    { h: "x", ts: now - 1000, kind: "interaction", outcome: "refused" },
+    { h: "x", ts: now - 1000, kind: "audit", severity: "critical" },
+    { h: "x", ts: now - 1000, kind: "audit", severity: "notify" },
+    { h: "x", ts: now - 1000, kind: "noise", detail: "10 own posts" },
+    { h: "x", ts: now - 48 * 60 * 60 * 1000, kind: "interaction", outcome: "refused" }, // outside
+  ];
+  const ok = dailyDigestText(entries, now, true);
+  // window only: 2 interactions (the third is 48h old), 1 critical, 1 notify, 1 noise
+  assert.match(ok, /last 24h: 2 interactions \(1 refused\) · 1 critical \+ 1 notify audit · 1 noise flags · journal chain OK/);
+  // a broken chain still files a digest — it just refuses to vouch for the counts
+  const broken = dailyDigestText(entries, now, false);
+  assert.match(broken, /JOURNAL CHAIN BROKEN — counts untrusted: 2 interactions/);
+  // an all-quiet day is still a digest (the daily all-clear IS the signal)
+  assert.match(dailyDigestText([], now, true), /last 24h: 0 interactions \(0 refused\) · 0 critical \+ 0 notify audit · 0 noise flags/);
 });
 
 test("CLI: journal-verify proves the chain (and says so loudly when broken)", () => {

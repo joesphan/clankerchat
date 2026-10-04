@@ -117,7 +117,7 @@ app goes through the same `sanitizePeerText` discipline the tap block uses.
 | `POST /prompt` `{text, route?}` | write a prompt record (round 5); `route:"peer"` (multi-machine phase 1) routes it to the peer machine — unknown values or a lane-less machine are 400 at the door, never a silent expiry later |
 | `GET /prompts` `?q=` `?before=` | lifecycle chips + `?q=` search (round 5 / 5.1) + `?before=<createdAt ms>` strictly-older history pages (round 7, `?limit=` 1-50; invalid cursor = 400, never a silent default-list fall-through); `more` says whether older rows exist |
 | `GET /machine` | the machine card (round 6): pool, queues, lane verdict, peer recency, delivery-health + journal/audit alert lines |
-| `GET /notices` `?limit=` | machine→phone reports (round 8): newest window in registry order + `unacked` over the WHOLE registry (the badge never lies when the window is all-read). Read lane only — writers are local processes |
+| `GET /notices` `?limit=` | machine→phone reports (round 8): newest window in registry order + `unacked` over the WHOLE registry (the badge never lies when the window is all-read). Read lane only — writers are local processes, incl. the once-per-local-day `daily-digest` (round 9; the registry itself is the cursor — the newest daily-digest notice's day) |
 | `POST /notices/:id/ack` | dismiss one (idempotent; 404 unknown) |
 | `POST /notices/ack-all` | dismiss every unread notice, `{acked: N}` |
 
@@ -153,7 +153,10 @@ warning (phones cannot reach it; pass `--bind` / set the env like the lane).
 - **NOTICES card** (round 8) — machine→phone reports with an unread badge,
   warn severity in red, per-notice + dismiss-all gestures. Arrival banner
   once per notice per app session while unacked (unacked = the owner never
-  saw it — a reopen re-banners, a machine flip does not).
+  saw it — a reopen re-banners, a machine flip does not). "Show older
+  notices" (round 9) widens the window to the whole 50-record registry when
+  the default window is full; offered only then — a short list proves there
+  is nothing older to reveal.
 - **Haptics** — warning pattern on ask arrival, success/error on answer
   transitions, warning/light on notices, medium tap on decision commit.
   Fire-and-forget: devices without an engine no-op and the flow never

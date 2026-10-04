@@ -256,3 +256,27 @@ HAPTICS (expo-haptics ~57.0.3): ask arrival (warning), answer/failed
 transition (success/error), notice arrival (warn→warning else light),
 decision commit (medium). Fire-and-forget — no-engine devices no-op and
 the flow never gates on feedback. 185/185; app tsc clean.
+
+## Round — daily digest notice + notices window toggle (2026-10-04, round 9)
+
+DAILY DIGEST: one notice per local day on the phone — the automated version
+of the owner's "let me know not in discord but just on the phone". Cursor =
+the REGISTRY ITSELF (newest daily-digest notice's local day): no state
+field, no first-boot seeding, crash-safe by construction (the append IS the
+commit). Two flavors, same ritual:
+- daemon deployment (src/daemon.ts sweepDailyDigest): 24h journal counts
+  (interactions/refused/critical+notify audit/noise) + CHAIN VERDICT — a
+  broken chain files at warn severity with counts marked untrusted, so the
+  digest doubles as a daily tamper check. dailyDigestText lives in
+  src/journal.ts (pure, tested).
+- watcher host (~/tools/clankerchat-watch.mjs): runs-since-start counter +
+  lane verdict (this machine has no interaction journal — daemon-side
+  feature). First digest fires 5s after boot (post lane-probe).
+
+NOTICES WINDOW TOGGLE (phone): "Show older notices" widens GET /notices to
+?limit=50 when the default window is full; "Recent only" shrinks back.
+Limit rides a ref so the poll effect isn't re-armed; machine flip resets.
+
+journal-verify CLI also landed this round-block (human-facing chain proof;
+see commit 879056f). 187/187; watch+companion+botlink restarted; first
+digest verified live in the registry (seq 3).
