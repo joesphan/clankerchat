@@ -277,14 +277,18 @@ export function createPendingAsk(
     onExpiry?: "approve";
   },
 ): AskRecord {
+  // One clock read for both stamps: createdAt/expiresAt differ by EXACTLY
+  // the ttl (tests assert this; two Date.now() calls drifted ±ms on a
+  // scheduler tick and flaked the suite).
+  const now = Date.now();
   const full: AskRecord = {
     askId: rec.askId ?? newAskId(),
     question: rec.question.slice(0, 1500),
     channelId: rec.channelId,
     messageId: rec.messageId,
     approvers: rec.approvers.filter((id) => /^\d{15,25}$/.test(id)).slice(0, 10),
-    createdAt: Date.now(),
-    expiresAt: Date.now() + (rec.ttlMs ?? ASK_TTL_MS),
+    createdAt: now,
+    expiresAt: now + (rec.ttlMs ?? ASK_TTL_MS),
     status: "pending",
     ...(rec.onExpiry === "approve" ? { onExpiry: "approve" } : {}),
   };
