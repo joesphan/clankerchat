@@ -68,6 +68,7 @@ react-native) — mine them before designing.
   decided/expired) + the watcher's 60s loop PATCHes each pending ask's message
   once a minute with the button row passed back unchanged; the expiry sweep
   owns terminal state, the countdown only decorates it.
+  (peer cherry-picked 19144eb → 9b55d9c.)
 - [x] ~~**Doctor → phone**~~ SHIPPED: /machine serves `alerts` — the two
   FAIL lines a pocket owner can act on (stuck pending prompts >60s,
   phone-decided asks undelivered), same file scans as the CLI doctor,
