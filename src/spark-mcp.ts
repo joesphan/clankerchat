@@ -259,11 +259,15 @@ export function createSparkListener(
   now: () => number = Date.now,
 ): http.RequestListener {
   const notFound: http.RequestListener = (req, res) => {
-    res.writeHead(404, { "content-type": "text/plain" });
+    res.writeHead(404, { "content-type": "text/plain", "x-robots-tag": "noindex, nofollow, noarchive" });
     res.end("not found");
   };
   return (req, res) => {
     try {
+      // Crawl posture (owner ask): every response — 404s and MCP alike —
+      // carries noindex; headers set before the SDK writes merge into its
+      // response. Real invisibility is the uniform 404; this is belt.
+      res.setHeader("x-robots-tag", "noindex, nofollow, noarchive");
       const url = new URL(req.url ?? "/", "http://localhost");
       if (!capabilityMatch(url.pathname, gate.capPath)) return void notFound(req, res);
       if (!bearerOk(req.headers.authorization, gate.token)) return void notFound(req, res);
