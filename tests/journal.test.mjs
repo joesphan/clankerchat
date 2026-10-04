@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -72,4 +73,34 @@ test("journal: stats count refusals + critical audit in the window only", () => 
   const stats = journalStats(entries, now);
   assert.equal(stats.refused, 2);
   assert.equal(stats.criticalAudit, 1);
+});
+
+test("CLI: journal-verify proves the chain (and says so loudly when broken)", () => {
+  const dir = tmp();
+  const run = (args) =>
+    spawnSync(process.execPath, ["dist/journal-verify.js", ...args], {
+      cwd: path.resolve(import.meta.dirname, ".."),
+      encoding: "utf8",
+    });
+  // absent → honest exit 1
+  let r = run(["--spool", dir]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /no journal at/);
+
+  appendJournal(dir, { ts: Date.now(), kind: "interaction", detail: "slash /clankerchat status", outcome: "handled" });
+  appendJournal(dir, { ts: Date.now(), kind: "audit", detail: "webhook created", severity: "critical" });
+  r = run(["--spool", dir, "--tail", "1"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /chain OK · 2 entries/);
+  // this fixture has 0 refused interactions, 1 critical audit — the summary
+  // counts both per-class AND the 24h window
+  assert.match(r.stdout, /0 refused · 1 critical · last 24h: 0 refused \/ 1 critical/);
+  assert.match(r.stdout, /webhook created/);
+
+  // tamper → exit 1 with the broken-link line
+  const file = journalFile(dir);
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("webhook created", "nothing happened"));
+  r = run(["--spool", dir]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /chain broken/);
 });

@@ -4,10 +4,24 @@ Tyler's directive 2026-10-04: keep improving past review gates and bank the
 ask. Nothing here is blocked on this merge — all surfaces are file-compatible
 either way — but the fork tip carries one commit origin doesn't have yet.
 
-**Merge `tjbtiller/clankerchat` main @ `65493fc`** (the only non-merge commit
-in it is `767afb8`; everything older you already merged, including your
-`c2a7ebe` YOLO verb which we merged back, rebuilt, 185/185, restarted —
-both directions clean).
+**Merge `tjbtiller/clankerchat` main @ fork tip** (was `65493fc` when this
+doc was written; three follow-ups landed after — see the tip addendum below.
+Everything older you already merged, including your `c2a7ebe` YOLO verb
+which we merged back, rebuilt, tested, restarted — both directions clean).
+
+## Tip addendum (later same day)
+
+- `212cd79` — audit→notices bridge (critical audit events + the 403 degrade
+  also write a warn notice → phone banner; a human-eyes path that survives
+  Discord itself being tampered with), own-post noise meter at the
+  sendToThread chokepoint (journal kind `noise`; visibility, never
+  suppression), expo-haptics on the phone (ask arrival / answer transitions
+  / notices / decision commit — fire-and-forget).
+- `ac5280b` — companion-app spec doc catches up (routes table had predated
+  round 4 entirely).
+- journal-verify CLI (`dist/journal-verify.js`): human-facing proof of the
+  interaction journal's hash chain — chain OK / broken + counts + optional
+  tail; the loud path finally has a command.
 
 ## What's in `767afb8`
 
