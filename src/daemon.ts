@@ -386,7 +386,13 @@ async function sendToThread(threadId: string, message: string): Promise<string |
     } else if (!(channel instanceof TextChannel)) {
       return null;
     }
-    const sent = await channel.send(withSender(process.env.CLANKER_NAME, message));
+    // Same mention law as sendMessage (index.ts): daemon acks/notices state
+    // their allowlist explicitly and never ping roles or everyone-class —
+    // parse users-only on every outbound post.
+    const sent = await channel.send({
+      content: withSender(process.env.CLANKER_NAME, message),
+      allowedMentions: { parse: ["users"] },
+    });
     daemonMessageIds.add(sent.id);
     return sent.id;
   } catch (err) {

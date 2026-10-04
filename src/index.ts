@@ -104,23 +104,29 @@ async function sendMessage(
     ? undefined
     : payload.files.map((f) => ({ data: fs.readFileSync(f.attachment), name: f.name }));
   const ref = typeof payload === "string" || !payload.reply ? undefined : { message_id: payload.reply.messageReference };
+  // allowed_mentions, if PRESENT without parse/users/roles, suppresses
+  // EVERY mention in the message — Discord treats the object as the whole
+  // allowlist. Replying must silence only the replied-to user (anti
+  // ping-pong) while `<@id>` tags in the body still ping.
+  // parse stays users-ONLY, stated on every path (2026-10-04 law: bot posts
+  // never ping everyone-class or roles — a big role is functionally an
+  // everyone-tag): literal @everyone/@here/<@&id> in composed text renders
+  // inert instead of pinging, whatever the sending session was talked into.
+  const allowedMentions = ref
+    ? { parse: ["users"], replied_user: false }
+    : { parse: ["users"] };
   try {
     return (await api().post(Routes.channelMessages(channelId), {
-      // allowed_mentions, if PRESENT without parse/users/roles, suppresses
-      // EVERY mention in the message — Discord treats the object as the whole
-      // allowlist. Replying must silence only the replied-to user (anti
-      // ping-pong) while `<@id>` tags in the body still ping:
-      body: {
-        ...body,
-        message_reference: ref,
-        allowed_mentions: ref ? { parse: ["users", "roles"], replied_user: false } : undefined,
-      },
+      body: { ...body, message_reference: ref, allowed_mentions: allowedMentions },
       files,
     })) as { id: string };
   } catch (err) {
     // failIfNotExists parity: a deleted reply target degrades to a plain send.
     if (ref && /10008|Unknown Message/i.test(errTextOf(err))) {
-      return (await api().post(Routes.channelMessages(channelId), { body, files })) as { id: string };
+      return (await api().post(Routes.channelMessages(channelId), {
+        body: { ...body, allowed_mentions: allowedMentions },
+        files,
+      })) as { id: string };
     }
     throw err;
   }
