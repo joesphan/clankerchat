@@ -21,7 +21,8 @@
     "test:leaks": "node --test tests/leaks.test.mjs",
     "test:pairing": "node --test tests/pairing.test.mjs",
     "test:companion": "node --test tests/companion.test.mjs",
-    "test": "node --test tests/botlink.test.mjs tests/guards.test.mjs tests/leaks.test.mjs tests/pairing.test.mjs tests/companion.test.mjs tests/rotation.test.mjs"
+    "test:asks": "node --test tests/asks.test.mjs",
+    "test": "node --test tests/botlink.test.mjs tests/guards.test.mjs tests/leaks.test.mjs tests/pairing.test.mjs tests/companion.test.mjs tests/rotation.test.mjs tests/asks.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

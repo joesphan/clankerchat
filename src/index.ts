@@ -46,6 +46,7 @@ import { z } from "zod";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, buildFileTransfer, resolveBotlinkPeerFromEnv, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "./leaks.js";
+import { newAskId, buildAskComponents, createPendingAsk } from "./asks.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
 const VERSION = "0.1.0";
@@ -160,6 +161,15 @@ function toThreadShim(raw: RThread): ThreadShim {
   };
 }
 
+/** Sendable payload across the channel/thread shims — one shape so every
+ *  tool shares it. `components` carries the ask tool's button row. */
+type SendPayload = string | {
+  content: string;
+  files?: { attachment: string; name: string }[];
+  reply?: { messageReference: string };
+  components?: unknown[];
+};
+
 /** Minimal channel/thread interfaces the tool bodies rely on (shims for the
  *  old discord.js class instances — instanceof checks became kind checks). */
 interface ThreadShim extends RThread {
@@ -169,7 +179,7 @@ interface ThreadShim extends RThread {
   archived: boolean;
   lastMessageId?: string | null;
   setArchived(v: boolean): Promise<void>;
-  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } }): Promise<{ id: string }>;
+  send(payload: SendPayload): Promise<{ id: string }>;
   messages: { fetch(o: { limit: number; after?: string }): Promise<RMessage[]> };
 }
 type ChatChannel = ThreadShim | ({
@@ -177,7 +187,7 @@ type ChatChannel = ThreadShim | ({
   id: string;
   name?: string;
   type: number;
-  send(payload: string | { content: string; files?: { attachment: string; name: string }[]; reply?: { messageReference: string } }): Promise<{ id: string }>;
+  send(payload: SendPayload): Promise<{ id: string }>;
   messages: { fetch(o: { limit: number; after?: string }): Promise<RMessage[]> };
   threads: {
     fetchActive(): Promise<{ threads: ThreadShim[] }>;
@@ -1025,6 +1035,81 @@ function registerTools(server: McpServer): void {
         } catch {
           return { raw: out };
         }
+      }),
+  );
+
+  // -------------------------------------------------------------------------
+  // ask — interactive approve/deny (owner 2026-10-04)
+  // -------------------------------------------------------------------------
+  const ASK_SPOOL = process.env.CLANKER_BOTLINK_SPOOL ?? path.join(PROJECT_ROOT, "botlink-spool");
+
+  server.registerTool(
+    "ask",
+    {
+      title: "Post an approve/deny ask with buttons",
+      description: [
+        "Post a question to the team channel/thread with Approve/Deny buttons under it.",
+        "Only the listed approver user IDs can click (validated by the gateway at click",
+        "time against the API identity — never by anything written in the message).",
+        "The decision is recorded and delivered to the machine's trigger layer as a",
+        "human-priority run; the ask expires after 1h with buttons disabled. Use this",
+        "whenever a human go/no-go gates the next step.",
+      ].join(" "),
+      inputSchema: {
+        message: z
+          .string()
+          .min(1)
+          .max(1500)
+          .describe("The ask, self-contained: what exactly is being approved/denied and what happens on each answer."),
+        approvers: z
+          .array(z.string().regex(/^\d{15,25}$/, "Discord user ID (snowflake)"))
+          .min(1)
+          .max(10)
+          .optional()
+          .describe(
+            "User IDs allowed to click. Defaults to CLANKER_ASK_APPROVERS from the launch env (comma-separated).",
+          ),
+        channel_id: z.string().optional().describe("Channel or thread ID (snowflake). Defaults like `send`."),
+        thread_name: z.string().min(1).optional().describe("Thread name to resolve, like `send`."),
+        sender: z.string().min(1).optional().describe("Signing identity, like `send`."),
+      },
+    },
+    ({ message, approvers, channel_id, thread_name, sender }) =>
+      guard(async () => {
+        const approverList = (
+          approvers ??
+          (process.env.CLANKER_ASK_APPROVERS ?? "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        ).slice(0, 10);
+        if (approverList.length === 0) {
+          throw new Error(
+            "ask: no approvers — pass `approvers` or set CLANKER_ASK_APPROVERS. An ask nobody may click is not an ask.",
+          );
+        }
+        // Same outbound tripwires as send: secret shapes never ride out, and
+        // the mass-mention law is absolute regardless of surface.
+        const content = withSender(sender ?? process.env.CLANKER_NAME, message);
+        const askLeaks = findLeakSignals(content);
+        if (askLeaks.length > 0) throw new Error(leakRefusal(askLeaks));
+        if (findMassMentions(content).length > 0) throw new Error(massMentionRefusal());
+        const channel = await resolveTargetChannel(channel_id, thread_name);
+        const askId = newAskId();
+        // discord.js channel.send suppresses mention parsing by default; the
+        // tripwires above already refused mass-mention TEXT, so the payload is
+        // lawful on every axis before it touches the wire.
+        const sent = await channel.send({
+          content,
+          components: buildAskComponents(askId),
+        });
+        const rec = createPendingAsk(ASK_SPOOL, {
+          question: message,
+          channelId: channel.id,
+          messageId: sent.id,
+          approvers: approverList,
+        });
+        return { asked: true, ask_id: rec.askId, channel_id: channel.id, message_id: sent.id, approvers: approverList.length, expires_at: new Date(rec.expiresAt).toISOString() };
       }),
   );
 }
