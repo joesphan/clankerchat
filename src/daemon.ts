@@ -1832,6 +1832,10 @@ function statusFacts(): StatusFacts {
     lastRunAgoMs: lastRunAt ? Date.now() - Date.parse(lastRunAt) : null,
     lastRunWhere,
     spoolPending: laneFacts?.pending ?? 0,
+    // peer recency line (88f0fee): facts ride only while the lane is up —
+    // the probe failure path nulls peerLastRunAt, so a down lane self-clears.
+    peerLastRunAt: laneFacts?.ok ? laneFacts.peerLastRunAt : null,
+    peerName: laneFacts?.ok ? laneFacts.bot : null,
     servicesLine:
       `lane ${laneFacts ? (laneFacts.ok ? "ok" : "down") : "not probed"} · ` +
       `fullAuto=${config.fullAuto} · wake=${config.wake} · up since ${START_ISO}`,
