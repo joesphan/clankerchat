@@ -22,11 +22,13 @@
  * safe because each ask has exactly one file and only the decider mutates
  * it after creation):
  *   { askId, question, channelId, messageId, approvers[], createdAt,
- *     expiresAt, status: pending|approved|denied|expired, decidedBy?,
+ *     expiresAt, status: pending|approved|denied|expired|yolo, decidedBy?,
  *     decidedAt? }
  *
- * custom_id contract: "ask:<askId>:<approve|deny>" — ≤100 chars (Discord's
- * cap), one parse path, no free text rides it.
+ * custom_id contract: "ask:<askId>:<approve|deny|yolo>" — ≤100 chars (Discord's
+ * cap), one parse path, no free text rides it. yolo (owner-approved third
+ * verb, 2026-10-04): approve + one-shot full-auto — the click is the human
+ * grant, same standing as "yolo" said in-thread in their own words.
  */
 
 import fs from "node:fs";
@@ -44,7 +46,7 @@ export interface AskRecord {
   approvers: string[]; // Discord user ids allowed to click (API-checked)
   createdAt: number;
   expiresAt: number;
-  status: "pending" | "approved" | "denied" | "expired";
+  status: "pending" | "approved" | "denied" | "expired" | "yolo";
   decidedBy?: string; // user id of the clicker, or "auto-expiry" (below)
   decidedAt?: number;
   // Lazy-consensus mode (owner 2026-10-04: "a way for us to auto approve and
@@ -69,14 +71,14 @@ export function asksDir(spoolDir: string): string {
 // Discord component payload
 // ---------------------------------------------------------------------------
 
-/** One action row: [Approve (green)] [Deny (red)]. Legacy components — still
- *  fully supported, no Components-V2 flag needed (verified against Discord's
- *  message-components docs, 2026-10-04). */
+/** One action row: [Approve (green)] [Deny (red)] [YOLO (blurple)]. Legacy
+ *  components — still fully supported, no Components-V2 flag needed (verified
+ *  against Discord's message-components docs, 2026-10-04). */
 export function buildAskComponents(askId: string): {
   type: 1;
   components: {
     type: 2;
-    style: 3 | 4;
+    style: 1 | 3 | 4;
     label: string;
     custom_id: string;
   }[];
@@ -87,6 +89,7 @@ export function buildAskComponents(askId: string): {
       components: [
         { type: 2, style: 3, label: "Approve", custom_id: askCustomId(askId, "approve") },
         { type: 2, style: 4, label: "Deny", custom_id: askCustomId(askId, "deny") },
+        { type: 2, style: 1, label: "YOLO", custom_id: askCustomId(askId, "yolo") },
       ],
     },
   ];
@@ -97,7 +100,7 @@ export function buildDisabledAskComponents(askId: string): {
   type: 1;
   components: {
     type: 2;
-    style: 3 | 4;
+    style: 1 | 3 | 4;
     label: string;
     custom_id: string;
     disabled: boolean;
@@ -109,12 +112,15 @@ export function buildDisabledAskComponents(askId: string): {
       components: [
         { type: 2, style: 3, label: "Approve", custom_id: askCustomId(askId, "approve"), disabled: true },
         { type: 2, style: 4, label: "Deny", custom_id: askCustomId(askId, "deny"), disabled: true },
+        { type: 2, style: 1, label: "YOLO", custom_id: askCustomId(askId, "yolo"), disabled: true },
       ],
     },
   ];
 }
 
-export function askCustomId(askId: string, action: "approve" | "deny"): string {
+export type AskAction = "approve" | "deny" | "yolo";
+
+export function askCustomId(askId: string, action: AskAction): string {
   return `ask:${askId}:${action}`;
 }
 
@@ -145,9 +151,9 @@ export function buildAskCountdownEdit(
 /** Inverse of askCustomId — returns null for anything not ours. A foreign
  *  custom_id (another bot's component on a message we can see) must parse to
  *  null so the handler ignores it instead of crashing. */
-export function parseAskCustomId(customId: string): { askId: string; action: "approve" | "deny" } | null {
-  const m = customId.match(/^ask:([a-z0-9-]+):(approve|deny)$/);
-  return m ? { askId: m[1], action: m[2] as "approve" | "deny" } : null;
+export function parseAskCustomId(customId: string): { askId: string; action: AskAction } | null {
+  const m = customId.match(/^ask:([a-z0-9-]+):(approve|deny|yolo)$/);
+  return m ? { askId: m[1], action: m[2] as AskAction } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +184,7 @@ function askV2Row(askId: string, disabled: boolean) {
     components: [
       { type: 2 as const, style: 3 as const, label: "Approve", custom_id: askCustomId(askId, "approve"), disabled },
       { type: 2 as const, style: 4 as const, label: "Deny", custom_id: askCustomId(askId, "deny"), disabled },
+      { type: 2 as const, style: 1 as const, label: "YOLO", custom_id: askCustomId(askId, "yolo"), disabled },
     ],
   };
 }
@@ -321,18 +328,19 @@ export function listPendingAsks(spoolDir: string): AskRecord[] {
   }
 }
 
-/** Record a decision (approve/deny by a validated approver). Cross-process
- *  claim (audit finding 12): the companion HTTP process and the watcher
- *  process BOTH decide on this registry (phone decision vs button click) —
- *  the old get→check→write let both racers read "pending", both write, and
- *  both see their own decidedBy (double decision run + double message
- *  edit). O_EXCL makes the claim kernel-atomic: exactly one winner per ask,
- *  ever, across processes. The claim file persists beside the record as
- *  proof a decision was in flight — fail-closed direction for asks. */
+/** Record a decision (approve/deny/yolo by a validated approver). Cross-
+ *  process claim (audit finding 12): the companion HTTP process and the
+ *  watcher process BOTH decide on this registry (phone decision vs button
+ *  click) — the old get→check→write let both racers read "pending", both
+ *  write, and both see their own decidedBy (double decision run + double
+ *  message edit). O_EXCL makes the claim kernel-atomic: exactly one winner
+ *  per ask, ever, across processes. The claim file persists beside the
+ *  record as proof a decision was in flight — fail-closed direction for
+ *  asks. */
 export function decideAsk(
   spoolDir: string,
   askId: string,
-  decision: "approved" | "denied",
+  decision: "approved" | "denied" | "yolo",
   decidedBy: string,
 ): AskRecord | null {
   const rec = getAsk(spoolDir, askId);
@@ -455,6 +463,6 @@ export function renderAskForApp(rec: AskRecord): Record<string, unknown> {
 export function askDecisionLine(rec: AskRecord, decidedName: string): string {
   const t = new Date(rec.decidedAt ?? Date.now()).toISOString().slice(11, 19);
   if (rec.decidedBy === "auto-expiry") return `Auto-approved (no Deny before expiry) · ${t}Z`;
-  const verb = rec.status === "approved" ? "Approved" : rec.status === "denied" ? "Denied" : "Expired";
+  const verb = rec.status === "approved" ? "Approved" : rec.status === "denied" ? "Denied" : rec.status === "yolo" ? "YOLO'd" : "Expired";
   return `${verb} by ${decidedName} · ${t}Z`;
 }
