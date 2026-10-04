@@ -778,6 +778,10 @@ export default function App() {
                 setAsks([]);
                 setPrompts([]);
                 setMachine(null);
+                setSearchResults(null); // results belong to the machine they came from
+                seenPromptStatus.current.clear(); // notification transitions are per-machine:
+                // a stale status from machine A must never look like a
+                // "transition" for a colliding promptId on machine B
                 setNotice("");
                 setError("");
               }}
@@ -980,7 +984,6 @@ export default function App() {
 
       {active && !attempt ? (
         <View style={s.card}>
-          {error ? <Text style={s.err}> {error}</Text> : null}
           <Text style={s.muted}>No live pairing attempt. This screen updates automatically.</Text>
         </View>
       ) : null}
