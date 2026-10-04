@@ -13,6 +13,7 @@ import {
   finishPrompt,
   sweepExpiredPrompts,
   renderPromptForApp,
+  MAX_EXCERPT_CHARS,
   MAX_PENDING_PROMPTS,
   MAX_PROMPT_CHARS,
   PROMPT_TTL_MS,
@@ -111,6 +112,33 @@ test("renderPromptForApp: minimum surface — no fp, no ids beyond the prompt id
   const dir = tmp();
   const rec = createPhonePrompt(dir, { text: "render me", fp: "SHA256:secret-fp" });
   const view = renderPromptForApp(rec);
-  assert.deepEqual(Object.keys(view).sort(), ["createdAt", "finishedAt", "promptId", "status", "text"]);
+  assert.deepEqual(Object.keys(view).sort(), ["answerExcerpt", "createdAt", "finishedAt", "promptId", "status", "text"]);
+  assert.equal(view.answerExcerpt, null, "no excerpt before an answer exists");
   assert.equal(JSON.stringify(view).includes("SHA256:secret-fp"), false, "no fingerprint on the wire");
+});
+
+test("answer excerpt (round 5.1): normalized, capped, absent when empty, on the wire", () => {
+  const dir = tmp();
+  const a = createPhonePrompt(dir, { text: "with excerpt", fp: "fp" });
+  stampPromptEnqueued(dir, a.promptId);
+  const done = finishPrompt(dir, a.promptId, {
+    exit: 0,
+    posted: true,
+    excerpt: "  The answer is 42.\n\nDetails   follow\nin the thread.  ",
+  });
+  assert.equal(done.answerExcerpt, "The answer is 42. Details follow in the thread.");
+  assert.equal(renderPromptForApp(done).answerExcerpt, done.answerExcerpt, "excerpt rides the phone rendering");
+
+  // hard cap at MAX_EXCERPT_CHARS
+  const b = createPhonePrompt(dir, { text: "long", fp: "fp" });
+  stampPromptEnqueued(dir, b.promptId);
+  const capped = finishPrompt(dir, b.promptId, { exit: 0, posted: true, excerpt: "x".repeat(MAX_EXCERPT_CHARS + 500) });
+  assert.equal(capped.answerExcerpt.length, MAX_EXCERPT_CHARS);
+
+  // whitespace-only / missing excerpt → field absent (not an empty string)
+  const c = createPhonePrompt(dir, { text: "silent", fp: "fp" });
+  stampPromptEnqueued(dir, c.promptId);
+  const silent = finishPrompt(dir, c.promptId, { exit: 0, posted: false, excerpt: "   \n\t  " });
+  assert.equal(silent.answerExcerpt, undefined);
+  assert.equal(renderPromptForApp(silent).answerExcerpt, null);
 });

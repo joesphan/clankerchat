@@ -182,15 +182,17 @@ interface AskView {
   lazy: boolean;
 }
 
-/** A phone-originated prompt (GET /prompts, round 5) — status only: the
- *  answer posts in Discord (the app push-notifies), the phone shows the
- *  lifecycle pending → enqueued → answered/failed. */
+/** A phone-originated prompt (GET /prompts, round 5 + 5.1) — the lifecycle
+ *  pending → enqueued → answered/failed plus, when answered, a short excerpt
+ *  of the run's post so the pocket view closes without leaving the app
+ *  (Discord stays the record — the excerpt is a preview, rendered as data). */
 interface PromptView {
   promptId: string;
   text: string;
   status: "pending" | "enqueued" | "answered" | "failed" | "expired";
   createdAt: number;
   finishedAt: number | null;
+  answerExcerpt: string | null;
 }
 
 const K_SEED = "cc.seed";
@@ -502,7 +504,7 @@ export default function App() {
       case "enqueued":
         return "running — answer posts in Discord when done";
       case "answered":
-        return "answered — check Discord";
+        return p.answerExcerpt ? "answered — preview below, full answer in Discord" : "answered — check Discord";
       case "failed":
         return "run failed — ask again or from Discord";
       case "expired":
@@ -675,6 +677,11 @@ export default function App() {
                 <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
                   {promptStatusLine(p)}
                 </Text>
+                {p.status === "answered" && p.answerExcerpt ? (
+                  <Text style={s.excerpt} numberOfLines={6}>
+                    {p.answerExcerpt}
+                  </Text>
+                ) : null}
               </View>
             ))}
         </View>
@@ -767,6 +774,7 @@ const s = StyleSheet.create({
     textAlignVertical: "top",
   },
   promptRow: { borderTopWidth: 1, borderTopColor: "#1f2335", paddingTop: 8, gap: 2 },
+  excerpt: { color: "#9aa5ce", fontStyle: "italic", fontSize: 13, lineHeight: 18 },
   buttonDim: { opacity: 0.4 },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
   button: { backgroundColor: "#7aa2f7", borderRadius: 10, paddingVertical: 12, paddingHorizontal: 22 },

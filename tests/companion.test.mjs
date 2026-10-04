@@ -605,15 +605,17 @@ test("prompt routes (round 5): send from the phone, list lifecycle, caps and aut
     assert.equal(status, "pending");
     assert.match(promptId, /^pmt[a-z]{8}$/);
 
-    // lifecycle visibility: watcher-side transitions show through the list
+    // lifecycle visibility: watcher-side transitions show through the list,
+    // including the answer excerpt once the run's exit hook writes one
     const { stampPromptEnqueued, finishPrompt } = await import("../dist/prompts.js");
     stampPromptEnqueued(spool, promptId);
-    finishPrompt(spool, promptId, { exit: 0, posted: true });
+    finishPrompt(spool, promptId, { exit: 0, posted: true, excerpt: "done: 3 tests added, suite green" });
     res = await signed("GET", "/prompts");
     const listed = (await res.json()).prompts;
     assert.equal(listed.length, 1);
     assert.equal(listed[0].status, "answered");
     assert.equal(listed[0].promptId, promptId);
+    assert.equal(listed[0].answerExcerpt, "done: 3 tests added, suite green");
     assert.equal(listed[0].fp, undefined, "no fingerprint on the wire");
     assert.equal(listed[0].channelId, undefined, "no channel ids on the wire");
 

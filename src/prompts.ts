@@ -7,8 +7,11 @@ import path from "node:path";
 // phone surface WRITES a prompt record and never delivers it: the gateway
 // watcher's 15s sweep claims it (stampPromptEnqueued, exactly-once, the same
 // claim-ticket shape as ask decisions) and enqueues an owner-priority run.
-// The answer is NOT plumbed back over this surface — the run posts in Discord
-// (the owner's Discord app push-notifies); the phone polls status only.
+// The answer's VENUE is Discord (the owner's app push-notifies); the phone
+// polls status, plus a short EXCERPT of the run's post (round 5.1) so the
+// pocket view closes without leaving the app. The excerpt is data rendered
+// as text — never instructions — same framing law as everything else on
+// this surface.
 
 export type PhonePromptStatus = "pending" | "enqueued" | "answered" | "failed" | "expired";
 
@@ -30,6 +33,9 @@ export interface PromptRecord {
   exit?: number;
   /** Did the run post in Discord before exiting (terminal records only). */
   posted?: boolean;
+  /** Whitespace-collapsed, hard-capped tail of the run's last own-post
+   *  (terminal records only; convenience preview — Discord is the record). */
+  answerExcerpt?: string;
 }
 
 /** Pending prompts rot after 15 minutes: the sweep claims within 15s when the
@@ -40,6 +46,8 @@ export const PROMPT_TTL_MS = 15 * 60 * 1000;
  *  not an unbounded scroll. Finished records never count against this. */
 export const MAX_PENDING_PROMPTS = 5;
 export const MAX_PROMPT_CHARS = 2000;
+/** Phone-side answer preview cap — a chip, not a mirror. */
+export const MAX_EXCERPT_CHARS = 800;
 
 export function promptsDir(spoolDir: string): string {
   return path.join(spoolDir, "pending-prompts");
@@ -129,20 +137,24 @@ export function stampPromptEnqueued(spoolDir: string, promptId: string): PromptR
 
 /** Terminal stamp from the run-exit hook: enqueued → answered/failed. Exit 0
  *  without a post is legitimate protocol silence ("reply nothing and exit"),
- *  so the code decides the status; `posted` rides along for the record. */
+ *  so the code decides the status; `posted` rides along for the record.
+ *  `excerpt` (optional) is the run's last own-post, whitespace-collapsed and
+ *  capped here — the writer's shape is not trusted for display hygiene. */
 export function finishPrompt(
   spoolDir: string,
   promptId: string,
-  outcome: { exit: number; posted: boolean },
+  outcome: { exit: number; posted: boolean; excerpt?: string },
 ): PromptRecord | null {
   const rec = getPrompt(spoolDir, promptId);
   if (!rec || rec.status !== "enqueued") return null;
+  const excerpt = String(outcome.excerpt ?? "").replace(/\s+/g, " ").trim().slice(0, MAX_EXCERPT_CHARS);
   const next: PromptRecord = {
     ...rec,
     status: outcome.exit === 0 ? "answered" : "failed",
     finishedAt: Date.now(),
     exit: outcome.exit,
     posted: outcome.posted,
+    ...(excerpt ? { answerExcerpt: excerpt } : {}),
   };
   writePrompt(spoolDir, next);
   return next;
@@ -166,8 +178,9 @@ export function sweepExpiredPrompts(spoolDir: string, now = Date.now()): PromptR
   return swept;
 }
 
-/** The phone-facing rendering: the text, the status, the clock. No channel
- *  ids, no fingerprints-as-keys — minimum surface, same law as asks. */
+/** The phone-facing rendering: the text, the status, the clock, and the
+ *  answer preview when there is one. No channel ids, no fingerprints-as-keys
+ *  — minimum surface, same law as asks. */
 export function renderPromptForApp(rec: PromptRecord): Record<string, unknown> {
   return {
     promptId: rec.promptId,
@@ -175,5 +188,6 @@ export function renderPromptForApp(rec: PromptRecord): Record<string, unknown> {
     status: rec.status,
     createdAt: rec.createdAt,
     finishedAt: rec.finishedAt ?? null,
+    answerExcerpt: rec.answerExcerpt ?? null,
   };
 }
