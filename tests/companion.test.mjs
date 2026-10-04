@@ -384,3 +384,111 @@ test("CLI: companion --enroll with existing keys", () => {
   const store = defaultCompanionStore(keydir);
   assert.ok(fs.existsSync(store.enrollFile), "token persisted for the server to consume");
 });
+
+// --- round 4: asks on the phone — signed list/decide over the shared registry
+// The phone surface DECIDES (registry write with companion: provenance); it
+// never delivers (the gateway watcher stamps enqueuedAt and runs the trigger).
+test("asks routes: list pending, decide with provenance, races and replays stay honest", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(spool, { recursive: true });
+  const logs = [];
+  const listener = startCompanionServer({
+    bind: "127.0.0.1",
+    port: 0,
+    paths: p,
+    spoolDir: spool,
+    store,
+    log: (l) => logs.push(l),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+
+  // enroll a phone directly through the store (the QR path is covered above)
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath, sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+
+  try {
+    const { createPendingAsk, getAsk, decideAsk, listCompanionDecisions } = await import("../dist/asks.js");
+    const A = "187396435283542016";
+
+    // empty list
+    let res = await signed("GET", "/asks");
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).asks, []);
+
+    // two live asks + one already expired + one already click-decided
+    // (2ms apart so createdAt ordering is real, not a same-ms id tiebreak)
+    const live = createPendingAsk(spool, { question: "ship round 4?", channelId: "1", messageId: null, approvers: [A] });
+    await new Promise((r) => setTimeout(r, 2));
+    const lazy = createPendingAsk(spool, { question: "lazy one", channelId: "1", messageId: null, approvers: [A], onExpiry: "approve" });
+    createPendingAsk(spool, { question: "stale", channelId: "1", messageId: null, approvers: [A], ttlMs: -5_000 });
+    const clicked = createPendingAsk(spool, { question: "clicked", channelId: "1", messageId: null, approvers: [A] });
+    decideAsk(spool, clicked.askId, "denied", A);
+
+    res = await signed("GET", "/asks");
+    const listed = (await res.json()).asks;
+    assert.deepEqual(listed.map((a) => a.askId), [live.askId, lazy.askId], "only live pending asks, oldest first");
+    assert.equal(listed[1].lazy, true);
+    assert.equal(listed[0].channelId, undefined, "no channel ids on the wire");
+
+    // unsigned → 401
+    res = await fetch(base + "/asks");
+    assert.equal(res.status, 401);
+
+    // decide from the phone
+    res = await signed("POST", `/asks/${live.askId}/approve`);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).status, "approved");
+    const rec = getAsk(spool, live.askId);
+    assert.equal(rec.status, "approved");
+    assert.equal(rec.decidedBy, `companion:${phone.fingerprint}`, "provenance is the phone fingerprint");
+    assert.equal(listCompanionDecisions(spool).map((r) => r.askId).join(), live.askId, "awaiting watcher delivery");
+
+    // tap on an already-decided ask → 409, nothing changes
+    res = await signed("POST", `/asks/${live.askId}/deny`);
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).status, "approved", "the first decision stands");
+    assert.equal(getAsk(spool, live.askId).status, "approved");
+
+    // replay of the SAME signed request (same counter) → 403 before any handler
+    counter -= 1; // force reuse of the last counter value
+    const body = Buffer.from(JSON.stringify({}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage("POST", `/asks/${lazy.askId}/deny`, sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    res = await fetch(base + `/asks/${lazy.askId}/deny`, {
+      method: "POST",
+      headers: { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig, "content-type": "application/json" },
+      body,
+    });
+    assert.equal(res.status, 403, "replayed counter refused");
+    assert.equal(getAsk(spool, lazy.askId).status, "pending", "replay decided nothing");
+
+    // deny from the phone works the same
+    counter += 2; // skip past the burned value (gaps are fine, repeats never)
+    res = await signed("POST", `/asks/${lazy.askId}/deny`);
+    assert.equal(res.status, 200);
+    assert.equal(getAsk(spool, lazy.askId).status, "denied");
+
+    // unknown ask id → 404
+    res = await signed("POST", "/asks/no-such-ask/approve");
+    assert.equal(res.status, 404);
+  } finally {
+    listener.close();
+  }
+});

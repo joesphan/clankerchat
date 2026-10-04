@@ -53,6 +53,12 @@ export interface AskRecord {
   // says so up front, and any Deny click before expiry still wins. Default
   // (unset) remains fail-closed: expiry is NEVER approval.
   onExpiry?: "approve";
+  // Delivery stamp, set by the gateway watcher AFTER the decision run is
+  // enqueued (edit-message + trigger). Absent on records created before this
+  // field existed and on anything not yet delivered. The companion surface
+  // DECIDES but never DELIVERS — the watcher claims delivery exactly once via
+  // stampAskEnqueued, so a phone decision can never double-enqueue.
+  enqueuedAt?: number;
 }
 
 export function asksDir(spoolDir: string): string {
@@ -228,6 +234,43 @@ export function sweepExpiredAsks(spoolDir: string, now = Date.now()): AskRecord[
     }
   }
   return swept;
+}
+
+/** Stamp a decided ask as DELIVERED (decision run enqueued). Returns the
+ *  stamped record, or null when the ask is missing OR already stamped —
+ *  callers use the null-on-repeat shape as a claim: only one caller ever
+ *  proceeds per ask. The companion surface decides but never delivers; this
+ *  is the watcher's claim ticket. */
+export function stampAskEnqueued(spoolDir: string, askId: string): AskRecord | null {
+  const rec = getAsk(spoolDir, askId);
+  if (!rec || rec.status === "pending" || rec.enqueuedAt) return null;
+  const next: AskRecord = { ...rec, enqueuedAt: Date.now() };
+  const file = askFile(spoolDir, askId);
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
+  fs.renameSync(tmp, file);
+  return next;
+}
+
+/** Terminal asks decided from the companion (phone) surface that the watcher
+ *  has not yet delivered. decidedBy provenance: "companion:<phone fp>". */
+export function listCompanionDecisions(spoolDir: string): AskRecord[] {
+  return listPendingAsks(spoolDir).filter(
+    (r) => r.status !== "pending" && !r.enqueuedAt && typeof r.decidedBy === "string" && r.decidedBy.startsWith("companion:"),
+  );
+}
+
+/** The phone-facing rendering of a pending ask — the question and the clock,
+ *  nothing else (no channel ids, no approver ids; the phone doesn't need
+ *  them and untrusted-app surfaces get minimum surface area). */
+export function renderAskForApp(rec: AskRecord): Record<string, unknown> {
+  return {
+    askId: rec.askId,
+    question: rec.question,
+    createdAt: rec.createdAt,
+    expiresAt: rec.expiresAt,
+    lazy: rec.onExpiry === "approve",
+  };
 }
 
 /** The one-line status suffix appended to the ask message at decision time.
