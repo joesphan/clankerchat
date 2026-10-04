@@ -29,7 +29,8 @@ mechanics and routing, never law.
   bot. Lane injects are deliberate and never coalesce with Discord
   triggers; same-channel Discord triggers DO coalesce into one queued
   run (prompt-count economy).
-- Pool runs `MAX_CONCURRENT` (default 2) orchestrator processes.
+- Pool runs `MAX_CONCURRENT` (default 3, clamped 1–8) orchestrator
+  processes (src/daemon.ts loadConfig; corrected 2026-10-04).
 - Bare "status" (tagged, mentions stripped) answers from a canned card
   — zero model run. File-manifest injects whose text is the pure
   transfer notice archive without a run.
