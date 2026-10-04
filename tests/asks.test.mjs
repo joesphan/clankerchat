@@ -127,6 +127,34 @@ test("decideAsk: first decision wins; later clicks return the existing record un
   assert.equal(decideAsk(spool, "missing", "approved", APPROVER), null);
 });
 
+test("decideAsk cross-process claim (audit fix 12): a stale pending overwrite can't mint a second decision", () => {
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "q",
+    channelId: "1",
+    messageId: null,
+    approvers: [APPROVER],
+  });
+  // winner decides (say: the companion HTTP process — a phone tap)
+  const winner = decideAsk(spool, rec.askId, "approved", "phone-fp");
+  assert.equal(winner.decidedBy, "phone-fp");
+  // simulate the losing racer (the watcher process, button click) whose read
+  // of "pending" happened BEFORE the winner's write: its stale copy lands as
+  // the file. The pre-claim get→check→write would let ITS decideAsk succeed
+  // too — double decision run + double message edit.
+  const stale = JSON.parse(JSON.stringify(rec));
+  fs.writeFileSync(path.join(spool, "pending-asks", `${rec.askId}.json`), JSON.stringify(stale));
+  assert.equal(getAsk(spool, rec.askId).status, "pending", "stale overwrite in place");
+  const loser = decideAsk(spool, rec.askId, "denied", APPROVER);
+  // the winner's O_EXCL claim file blocks the loser: no second decision,
+  // no write — the record stays exactly the stale bytes the racer wrote
+  assert.equal(loser.status, "pending", "loser gets the record back, not a win");
+  const after = getAsk(spool, rec.askId);
+  assert.equal(after.status, "pending");
+  assert.equal(after.decidedBy, undefined);
+  assert.ok(fs.existsSync(path.join(spool, "pending-asks", `${rec.askId}.json.claim`)), "claim marker persists");
+});
+
 test("sweepExpiredAsks: overdue pending → expired and returned; fresh + decided stay untouched", () => {
   const spool = tmpSpool();
   const fresh = createPendingAsk(spool, { question: "fresh", channelId: "1", messageId: null, approvers: [APPROVER] });

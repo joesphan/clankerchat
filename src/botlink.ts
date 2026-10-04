@@ -893,14 +893,45 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
       }
       return;
     }
+    let rebindRetries = 3;
     try {
       const pem = fs.readFileSync(opts.hostKeyPath!, "utf8");
       parseKey(pem); // validate BEFORE swapping — a torn write never takes the lane down
       if (opts.authorizedKeysPath) allowedKeys = parseAuthorizedLines(opts.authorizedKeysPath);
       const old = server;
-      server = newServer(pem);
-      server.listen(boundPort, opts.listen.host);
-      old.close();
+      const next = newServer(pem);
+      // Rebind failure must not crash the daemon (audit finding 1): the
+      // startup 'error' listener was consumed by the bind promise, and
+      // try/catch around listen() catches nothing — EADDRINUSE from the
+      // close/bind race (or EMFILE) fires later as an 'error' EVENT, which
+      // with no listener is an uncaught exception: the process dies at
+      // exactly the moment zero-touch rotation promised no downtime. Bounded
+      // retries; old is already closed (same-tick, below) so the port is
+      // free for the retry. A swap that keeps failing logs loudly and leaves
+      // the process alive for the next key-file change or a restart.
+      next.once("error", (err: Error) => {
+        log(`botlink: rotation rebind failed: ${err.message}${rebindRetries > 0 ? " — retrying in 1s" : " — giving up; lane down until the next key change or restart"}`);
+        try {
+          next.close();
+        } catch {
+          /* already dead */
+        }
+        if (rebindRetries > 0) {
+          rebindRetries--;
+          setTimeout(() => {
+            const retry = newServer(pem);
+            retry.once("error", (e2: Error) => log(`botlink: rotation rebind retry failed: ${e2.message} — lane down until the next key change or restart`));
+            retry.once("listening", () => {
+              server = retry;
+              log("botlink: rotation rebind recovered — serving the rotated key");
+            });
+            retry.listen(boundPort, opts.listen.host);
+          }, 1_000).unref?.();
+        }
+      });
+      server = next;
+      next.listen(boundPort, opts.listen.host);
+      old.close(); // same-tick: releases the listen socket before the deferred bind runs
       log("botlink: host key file changed — serving the rotated key (listener rebuilt, no process restart)");
     } catch (err) {
       log(`botlink: host-key reload failed: ${(err as Error).message} — still serving the previous key`);

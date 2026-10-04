@@ -508,7 +508,18 @@ const SENDER_PREFIX = /^\*\*(.+?)\*\*: ?/;
 function withSender(sender: string | undefined, message: string): string {
   if (!sender) return message;
   const clean = sender.replace(/[*_`~|\\\n\r]/g, "").trim();
-  return clean ? `**${clean}**: ${message}` : message;
+  const composed = clean ? `**${clean}**: ${message}` : message;
+  // Composed length (audit finding 10): the tool's raw-message check runs
+  // BEFORE this prefix lands — a ~1995-char body with a long sender crossed
+  // Discord's cap only after composition and died as a raw 400 instead of
+  // the friendly split-it error. Single chokepoint: every send path composes
+  // through here.
+  if (composed.length > MAX_MESSAGE_LENGTH) {
+    throw new Error(
+      `Composed message is ${composed.length} chars (sender prefix included); Discord allows ${MAX_MESSAGE_LENGTH}. Shorten the message.`,
+    );
+  }
+  return composed;
 }
 
 function serializeMessage(m: RMessage) {
