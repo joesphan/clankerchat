@@ -55,8 +55,9 @@ react-native) — mine them before designing.
   — Container/Section/Text Display (types 9/10/17) would give ask cards real structure
   (question as text display, buttons as section accessory). VERIFY discord.js/raw-REST
   support for the IS_COMPONENTS_V2 message flag in our pinned versions before designing.
-- [ ] **Prompt search on the phone** (app-side): search box wired to GET
-  /prompts?q= (server half shipped — see Now section).
+- [x] ~~**Prompt search on the phone** (app-side)~~ SHIPPED: FIND card —
+  one-shot search (submit/button, not per-keystroke), results newest-first
+  with status + excerpt; signedFetch signs pathname-only so ?q= rides free.
 - [ ] **Ask expiry countdown edit**: watcher edits the ask message with a live-ish
   countdown once per minute while pending (one PATCH/min, stop at decision) — humans
   see the lazy-consensus fuse burning.
