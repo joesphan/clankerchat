@@ -531,17 +531,25 @@ export function startPairingListener(opts: {
 }): { close: () => void; port: number } {
   let live: PairingState = opts.state;
   let completed = false; // set the moment an exchange becomes confirmable
+  // Per-connection ownership (audit fix 7): `live`/`completed` are shared
+  // listener state, so the old drop() test (`!completed && live.peer`) let
+  // ANY second connection that dropped — LAN probe, port scanner, impatient
+  // re-dial — wipe a live half-exchange; the real initiator's phase 2 then
+  // failed "phase 2 before phase 1" and the ceremony died spuriously. Only
+  // the connection that STORED the exchange may wipe it.
+  let ownerSocket: net.Socket | null = null;
   const server = net.createServer((socket) => {
     let buffer = "";
     const drop = (why: string) => {
       opts.log(`pairing listener: ${sanitizePeerText(why)}`);
-      // Wipe ONLY an incomplete half-exchange: after a completed exchange,
-      // trailing garbage on the socket (or a later refused connection) must
-      // never destroy the confirmable state.
-      if (!completed && live.peer !== undefined) {
+      // Wipe ONLY an incomplete half-exchange owned by THIS connection:
+      // after a completed exchange, trailing garbage on the socket (or any
+      // later refused connection) must never destroy the confirmable state.
+      if (socket === ownerSocket && !completed && live.peer !== undefined) {
         // a half-exchange that failed phase 2 must not stay confirmable
         live = { ...live, status: "armed", peer: undefined, role: undefined };
         savePairingState(opts.paths, live);
+        ownerSocket = null;
       }
       socket.destroy();
     };
@@ -581,6 +589,7 @@ export function startPairingListener(opts: {
           if (!pinned) return drop("rotation: initiator prevBotPub is not pinned on this machine");
         }
         live = { ...live, status: "exchanged", role: "responder", peer: { ...peer, nonce: undefined, sig: undefined } };
+        ownerSocket = socket; // this connection owns the half-exchange until it completes
         savePairingState(opts.paths, live);
         // OUR commitment goes out bound to our nonce before their reveal.
         socket.write(
@@ -602,9 +611,12 @@ export function startPairingListener(opts: {
       }
       if (msg.phase === 2) {
         // Status lives across data events (phase 1 saved "exchanged") —
-        // check a const snapshot so the guard narrows properly.
+        // check a const snapshot so the guard narrows properly. Phase 2 must
+        // arrive on the OWNING connection (audit fix 7): the exchange is one
+        // TCP conversation; a reveal on a different socket is refused and —
+        // being non-owner — its drop must not wipe the real exchange.
         const snap = live;
-        if (snap.status !== "exchanged" || !snap.peer || snap.role !== "responder") {
+        if (socket !== ownerSocket || snap.status !== "exchanged" || !snap.peer || snap.role !== "responder") {
           return drop("phase 2 before phase 1");
         }
         const nonce = typeof msg.nonce === "string" ? msg.nonce : "";
@@ -762,7 +774,10 @@ export function stageAndCommit(p: KeydirPaths, plan: ConfirmPlan, backupStamp: s
   }
   fs.writeFileSync(
     journal,
-    JSON.stringify({ phase: "staged", backupStamp, changes: plan.changes }, null, 2),
+    // cutoverSelfKeys rides the journal (audit fix 8): recovery must know
+    // whether THIS commit planned key renames — a lingering old journal must
+    // never promote .next keys staged later by a fresh `pair --arm`.
+    JSON.stringify({ phase: "staged", backupStamp, changes: plan.changes, cutoverSelfKeys: plan.cutoverSelfKeys }, null, 2),
   );
   const backup = (file: string) => {
     if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak-${backupStamp}`);
@@ -803,10 +818,13 @@ export function stageAndCommit(p: KeydirPaths, plan: ConfirmPlan, backupStamp: s
   fs.rmSync(p.stageDir, { recursive: true, force: true });
 }
 
-/** Detect an interrupted commit from the journal and finish or restore. */
+/** Detect an interrupted commit from the journal and finish or restore.
+ *  Completing is the safe direction everywhere here: stageAndCommit only
+ *  runs after a human-verified SAS confirm, so the journal's staged phase
+ *  records ratified intent — recovery converges on that end-state. */
 export function rollbackInterruptedCommit(p: KeydirPaths): boolean {
   const journalPath = path.join(p.stageDir, "journal.json");
-  let journal: { phase?: string; backupStamp?: string };
+  let journal: { phase?: string; backupStamp?: string; cutoverSelfKeys?: boolean };
   try {
     journal = JSON.parse(fs.readFileSync(journalPath, "utf8")) as typeof journal;
   } catch {
@@ -815,14 +833,44 @@ export function rollbackInterruptedCommit(p: KeydirPaths): boolean {
   const stamp = journal.backupStamp;
   if (!stamp) return false;
   const staged = (name: string) => path.join(p.stageDir, name);
-  // Staged files that never went live: complete the rename (phase-1 crash
-  // AFTER backups were taken is indistinguishable, and completing is the
-  // safe direction because the journal only survives a staged commit).
-  if (fs.existsSync(staged("authorized_keys"))) {
-    fs.renameSync(staged("authorized_keys"), p.authorizedKeys);
-  }
-  if (fs.existsSync(staged("peer.hostkey"))) {
-    fs.renameSync(staged("peer.hostkey"), p.peerHostkey);
+  // Idempotent backup (audit fix 8): a pre-crash backup survives untouched;
+  // an active file about to be replaced with NO backup yet (crash between
+  // journal-write and its backup step) gets one under the same stamp.
+  const backupOnce = (file: string) => {
+    const bak = `${file}.bak-${stamp}`;
+    if (fs.existsSync(file) && !fs.existsSync(bak)) fs.copyFileSync(file, bak);
+  };
+  if (journal.phase !== "committed") {
+    // Staged files that never went live: complete the rename (phase-1 crash
+    // AFTER backups were taken is indistinguishable, and completing is the
+    // safe direction because the journal only survives a staged commit).
+    if (fs.existsSync(staged("authorized_keys"))) {
+      backupOnce(p.authorizedKeys);
+      fs.renameSync(staged("authorized_keys"), p.authorizedKeys);
+    }
+    if (fs.existsSync(staged("peer.hostkey"))) {
+      backupOnce(p.peerHostkey);
+      fs.renameSync(staged("peer.hostkey"), p.peerHostkey);
+    }
+    // Key cutover (audit fix 8): the four sequential renames ran AFTER the
+    // staged files were consumed, so a mid-cutover crash left a journal the
+    // old recovery treated as already-done — mixed active keys (new
+    // host_key + old bot_key), lane dead until manual repair. Complete the
+    // remaining renames exactly as stageAndCommit would have. Gated on the
+    // journal's OWN cutover flag so .next keys staged by a LATER arm are
+    // never promoted by a lingering older journal.
+    if (journal.cutoverSelfKeys === true) {
+      for (const [next, active] of [
+        [p.hostKeyNext, p.hostKey],
+        [p.hostKeyNext + ".pub", p.hostKey + ".pub"],
+        [p.botKeyNext, p.botKey],
+        [p.botKeyNext + ".pub", p.botKey + ".pub"],
+      ] as const) {
+        if (!fs.existsSync(next)) continue; // already moved pre-crash
+        backupOnce(active);
+        fs.renameSync(next, active);
+      }
+    }
   }
   fs.rmSync(p.stageDir, { recursive: true, force: true });
   return true;
