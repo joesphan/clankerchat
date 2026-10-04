@@ -106,7 +106,15 @@ async function sendMessage(
   const ref = typeof payload === "string" || !payload.reply ? undefined : { message_id: payload.reply.messageReference };
   try {
     return (await api().post(Routes.channelMessages(channelId), {
-      body: { ...body, message_reference: ref, allowed_mentions: ref ? { replied_user: false } : undefined },
+      // allowed_mentions, if PRESENT without parse/users/roles, suppresses
+      // EVERY mention in the message — Discord treats the object as the whole
+      // allowlist. Replying must silence only the replied-to user (anti
+      // ping-pong) while `<@id>` tags in the body still ping:
+      body: {
+        ...body,
+        message_reference: ref,
+        allowed_mentions: ref ? { parse: ["users", "roles"], replied_user: false } : undefined,
+      },
       files,
     })) as { id: string };
   } catch (err) {
