@@ -105,12 +105,17 @@ react-native) — mine them before designing.
   ON-DEVICE 2026-10-04 (see Done above).
 - [x] ~~Slash commands (/status, /ask) for humans in #clankerchat~~ SHIPPED
   2026-10-04 (see Done above).
-- [ ] Multi-machine machine-switch state: prompts/asks are per-machine; a "this prompt
-  was answered on the OTHER machine" cross-reference needs a shared registry shape.
-  → DESIGN DRAFTED 2026-10-04: docs/context/topics/multi-machine-prompts.md
-  (phase 0 = trivial peer line on the MACHINE card; phase 1 = route hint +
-  lane `prompt-outcome` echo verb, needs BOTH machines; open questions listed
-  for joesp-desktop). Owner green-lit; bilateral review before code.
+- [x] ~~Multi-machine machine-switch state: prompts/asks are per-machine~~
+  PHASE 0 SHIPPED 2026-10-04 (88f0fee, peer recency line on the status card)
+  + PHASE 1 SHIPPED OUR SIDE 2026-10-04 (0e5c4ea): `route:"peer"` prompt
+  records, lane `prompt-outcome` verb, 30-min routed budget, receive-side
+  echo via applyPeerPromptOutcome, app route toggle. Design decisions
+  owner-delegated (channel post 1556355104607707247): 15s-sweep delivery,
+  excerpt-only answers, 30-min expiry. Remaining: PEER PORTS THEIR HALF
+  (inject-consumer outcome emit + sweep route branch + canRouteToPeer) —
+  rides their merge per the fork law; first live routed prompt
+  pmtroute0001 sent 17:34Z (inject ack 1791135289748-17f1e7). Phase 2
+  (peer index view) deferred until routing shows real use.
 - [ ] Watcher-side own-post noise meter: count own posts per thread per hour, journal
   a NOISE line past a threshold — enforcement visibility for the quiet-discord law.
 

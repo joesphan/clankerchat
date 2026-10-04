@@ -112,6 +112,9 @@ app goes through the same `sanitizePeerText` discipline the tap block uses.
 | `GET /attempts` | render the live confirmable pairing state (tap-block fields + `attemptId` + `expiresAt`); `{}` when none |
 | `POST /attempts/:id/allow` `{sas}` | typed peer SAS → same commit path as `pair --confirm` (mismatch = refuse, nothing written); audit event appended with `via=companion:<phoneFp>` |
 | `POST /attempts/:id/deny` | clear pairing state, nothing written |
+| `POST /prompt` `{text, route?}` | write a prompt record (round 5); `route:"peer"` (multi-machine phase 1) routes it to the peer machine — unknown values or a lane-less machine are 400 at the door, never a silent expiry later |
+| `GET /prompts` `?q=` | lifecycle chips + `?q=` search (round 5 / 5.1); routed records render `route:"peer"` and their excerpt echoes back over the lane (30-min window) |
+| `GET /machine` | the machine card (round 6): pool, queues, lane verdict, peer recency |
 
 `attemptId` = sha256 of the pairing transcript — stable per exchange, so a
 late/replayed allow for an already-consumed attempt cannot alias onto a new
@@ -132,6 +135,12 @@ warning (phones cannot reach it; pass `--bind` / set the env like the lane).
 - **Allow sheet** — types the peer's 8 characters (same normalization as the
   CLI), confirm gesture, sends the signed allow.
 - **Deny** — one tap, signed.
+- **Prompt + route toggle** (round 5 + multi-machine phase 1) — composer
+  carries a "run on: this machine / peer machine" chip pair (cyan, visually
+  distinct from the blue machine-select chips). Peer routing is per-send
+  and resets to local after each prompt: deliberate asks route, casual
+  ones stay home. A routed chip's status line names the runner and the
+  30-min window; the answered preview arrives via the lane's outcome echo.
 - Dependencies: `@noble/ed25519` (pure-JS signatures), `expo-camera`,
   `expo-crypto`, `expo-secure-store`. No native modules → runs in Expo Go on
   both platforms unchanged.

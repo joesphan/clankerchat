@@ -3,7 +3,7 @@
  *
  * Discord is the human-readable log; botlink is the machine lane. One
  * daemon per machine (`botlink-server`) listens on SSH and accepts exactly
- * two verbs from the peer bot's dedicated key:
+ * three verbs from the peer bot's dedicated key:
  *
  *   status        → JSON health snapshot (uptime, spool depth, inject count)
  *   inject <json> → deliver a prompt payload to this machine's trigger layer
@@ -14,6 +14,13 @@
  *                   (≤2 MB, size+sha256 verified, leak-scanned both ends,
  *                   stored under a receiver-controlled path) — files cross
  *                   machines on this lane, never as Discord attachments.
+ *   prompt-outcome <json> → report a ROUTED phone prompt's outcome (phase 1,
+ *                   docs/context/topics/multi-machine-prompts.md): the
+ *                   asking machine's watcher claimed the record, sent the
+ *                   prompt as an inject, and owes its phone a terminal
+ *                   status. Lands as a file under prompt-outcomes/ that the
+ *                   receiver's 15s delivery sweep applies to the local
+ *                   record (exactly-once, same claim class as delivery).
  *
  * Auth model: publickey ONLY, one dedicated keypair per bot (never a human's
  * key), username pinned, host key pinned by fingerprint on the client side
@@ -32,6 +39,7 @@ import type { ParsedKey } from "ssh2";
 const { Client: SshClient, Server: SshServer, utils } = ssh2;
 import { z } from "zod";
 import { findLeakSignals, leakRefusal } from "./leaks.js";
+import { PROMPT_ID_RE } from "./prompts.js";
 
 export const BOTLINK_PORT_DEFAULT = 47421;
 export const BOTLINK_USER_DEFAULT = "clanker";
@@ -351,6 +359,26 @@ export const InjectPayload = z.object({
 });
 export type InjectPayload = z.infer<typeof InjectPayload>;
 
+/** `prompt-outcome` verb (multi-machine prompts phase 1, decided 2026-10-04):
+ *  the answering machine reports a routed phone prompt's outcome so the
+ *  ASKING machine's record resolves. Tiny by design — the excerpt is phone
+ *  DISPLAY data (same class as a local run's answer chip), never
+ *  instructions; the daemon leak-shape-checks it at the door and the
+ *  receiver re-checks at apply. promptId is caller-chosen, shape-bound to
+ *  the same pattern the registry uses (no path components). */
+export const PromptOutcomePayload = z.object({
+  promptId: z.string().regex(PROMPT_ID_RE),
+  exit: z.number().int().min(-128).max(255),
+  posted: z.boolean(),
+  excerpt: z.string().max(1600).optional(), // apply-side caps to the phone's 800-char chip
+});
+export type PromptOutcomePayload = z.infer<typeof PromptOutcomePayload>;
+
+/** Unconsumed outcome files the daemon will hold before refusing — the 15s
+ *  delivery sweep archives each after apply, so this only binds a peer stuck
+ *  in an echo loop against a dead receiver. */
+export const BOTLINK_MAX_OUTCOME_FILES = 100;
+
 /** Strip a sender-supplied name to a harmless basename: no separators, no
  *  control chars, no leading dots, bounded length. The receiver writes under
  *  <spool>/files/<inject-id>/<name> so traversal has nowhere to go even
@@ -585,7 +613,7 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
           session.on("shell", (_accept, reject) => void reject());
           session.on("exec", (accept, reject, info2) => {
             const verb = (info2?.command ?? "").trim().split(/\s+/)[0] ?? "";
-            if (verb !== "status" && verb !== "inject") {
+            if (verb !== "status" && verb !== "inject" && verb !== "prompt-outcome") {
               log(`botlink: refused verb "${verb}" from ${peerIp}`);
               return void reject();
             }
@@ -669,6 +697,76 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               if (++injects > maxInjects) {
                 stream.stderr.end("inject limit for this connection\n");
                 stream.exit(1);
+                stream.close();
+                return;
+              }
+              // prompt-outcome: parse → leak door → depth cap → atomic file.
+              // The daemon only LANDS the outcome; the receiving watcher's
+              // 15s sweep applies it to the prompt registry (decided
+              // 2026-10-04: same exactly-once claim class as delivery, no
+              // new loop, no new listener).
+              if (verb === "prompt-outcome") {
+                let outcome: PromptOutcomePayload;
+                try {
+                  outcome = PromptOutcomePayload.parse(JSON.parse(data));
+                } catch (err) {
+                  stream.stderr.end(`invalid outcome payload: ${(err as Error).message}\n`);
+                  stream.exit(1);
+                  stream.close();
+                  return;
+                }
+                // Receiver-side leak door (same law as arriving files): the
+                // excerpt is phone display data, but secret-shaped text
+                // never crosses this boundary regardless of what the far
+                // side checked.
+                if (outcome.excerpt) {
+                  const kinds = findLeakSignals(outcome.excerpt);
+                  if (kinds.length > 0) {
+                    log(`botlink: prompt-outcome REFUSED from ${peerIp} — leak shapes (${kinds.join(", ")}) in excerpt for ${outcome.promptId}`);
+                    stream.stderr.end(leakRefusal(kinds.map((k) => `${k} (in outcome excerpt)`)) + "\n");
+                    stream.exit(1);
+                    stream.close();
+                    return;
+                  }
+                }
+                const outDir = path.join(opts.spoolDir, "prompt-outcomes");
+                fs.mkdirSync(outDir, { recursive: true });
+                let pendingOutcomes = 0;
+                try {
+                  pendingOutcomes = fs.readdirSync(outDir).filter((f) => f.endsWith(".outcome.json")).length;
+                } catch {
+                  /* unreadable reads as 0 — the write below surfaces real trouble */
+                }
+                if (pendingOutcomes >= BOTLINK_MAX_OUTCOME_FILES) {
+                  log(`botlink: prompt-outcome REFUSED from ${peerIp} — ${pendingOutcomes} outcome(s) unconsumed (cap ${BOTLINK_MAX_OUTCOME_FILES}); receiver sweep is down`);
+                  stream.stderr.end(
+                    `outcome backlog full: ${pendingOutcomes} file(s) unconsumed, cap ${BOTLINK_MAX_OUTCOME_FILES} — the receiver is not applying outcomes; refused\n`,
+                  );
+                  stream.exit(1);
+                  stream.close();
+                  return;
+                }
+                const outcomeId = `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+                const outFile = path.join(outDir, `${outcomeId}.outcome.json`);
+                const outTmp = `${outFile}.tmp`;
+                fs.writeFileSync(
+                  outTmp,
+                  JSON.stringify(
+                    {
+                      id: outcomeId,
+                      received: new Date().toISOString(),
+                      ...outcome,
+                      authenticated_key_fp: authedKeyFp,
+                      peer_ip: peerIp,
+                    },
+                    null,
+                    2,
+                  ),
+                );
+                fs.renameSync(outTmp, outFile);
+                log(`botlink: prompt-outcome ${outcomeId} for ${outcome.promptId} from ${peerIp} (exit ${outcome.exit}${outcome.posted ? ", posted" : ""})`);
+                stream.write(JSON.stringify({ ok: true, id: outcomeId }) + "\n");
+                stream.exit(0);
                 stream.close();
                 return;
               }
@@ -1018,7 +1116,11 @@ export function resolveBotlinkPeerFromEnv(
 }
 
 /** Run one verb against the peer. Resolves with the verb's stdout. */
-export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", payload?: InjectPayload): Promise<string> {
+export function botlinkRequest(
+  peer: BotlinkPeer,
+  verb: "status" | "inject" | "prompt-outcome",
+  payload?: InjectPayload | PromptOutcomePayload,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     let key: ParsedKey;
     try {
@@ -1048,7 +1150,8 @@ export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", pay
     // File-carrying injects move ~2.8 MB of base64; give them double the
     // absolute deadline so a slow link fails on the SERVER's watchdog, not
     // on our own impatience (both fire well under a healthy tailnet's time).
-    const deadlineMs = verb === "inject" && payload?.file ? 60_000 : 30_000;
+    const hasFile = payload !== undefined && "file" in payload && payload.file !== undefined;
+    const deadlineMs = verb === "inject" && hasFile ? 60_000 : 30_000;
     timer = setTimeout(() => fail(`botlink verb "${verb}" timed out after ${deadlineMs / 1000}s without completing`), deadlineMs);
     conn
       .on("ready", () => {
@@ -1070,7 +1173,7 @@ export function botlinkRequest(peer: BotlinkPeer, verb: "status" | "inject", pay
                 : reject(new Error(errOut.trim() || `botlink verb failed (exit ${exitCode})`)),
             );
           });
-          if (verb === "inject" && payload) stream.end(JSON.stringify(payload) + "\n");
+          if (payload) stream.end(JSON.stringify(payload) + "\n"); // inject + prompt-outcome both carry a JSON body
           else stream.end();
         });
       })
