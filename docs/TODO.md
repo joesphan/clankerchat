@@ -148,3 +148,19 @@ react-native) — mine them before designing.
   withSender composed-length chokepoint, decideAsk O_EXCL cross-process
   claim). 109/109.
 - [x] Round 5.1 answer excerpts (a784022) · Round 6 pocket lane dashboard (d4c7d94)
+- [x] **Feature round 2026-10-04 #2 — status lines + image intake**
+  (peer-briefed via inject 1791138196284-3a05fe). STATUS LINES (1a15636):
+  shared run-progress.ts helpers — one editable "still working" line ≥4min,
+  5-min edits, finish-deleted; typing heartbeat pre-existed; watcher wired +
+  live. IMAGE INTAKE (8dfb5c1): attachments.ts — two-stage read because the
+  orchestrator's zero-file-tools law holds: spool download (caps 10MB/4,
+  sanitized names) → scoped vision pre-pass (claude -p --allowedTools Read,
+  describe-only, 90s cap) → DESCRIPTIONS only into the untrusted block;
+  image-only = prompt-shaped for owner/listen lines; coalescing merges
+  image sets; 2h TTL sweep. Live-smoked on a text-bearing PNG (read
+  accurately, framing self-enforced). 154/154, fork tip 8dfb5c1.
+  Routed-prompts phase 1 CLOSED bilateral same round: pmroute0002 answered
+  on outcome echo 18:10:50Z; pmtroute0001 honest-rot; my earlier gap report
+  corrected (their emit was machine-local — repo greps can't see it).
+  Open: Joe's companion app error ("app has erro" 18:07:48Z class,
+  notification issue) — awaiting error text/screenshot paste.
