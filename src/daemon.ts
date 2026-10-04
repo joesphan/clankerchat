@@ -45,6 +45,7 @@ import {
   type ButtonInteraction,
   type Interaction,
   type Message,
+  type MessageEditOptions,
   type User,
 } from "discord.js";
 import { spawn } from "node:child_process";
@@ -56,12 +57,17 @@ import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { advanceCursor, atomicWrite, ChannelBlocklist, isUnderRoot } from "./daemon-guard.js";
 import { findMassMentions } from "./leaks.js";
 import {
+  askClockLine,
   askDecisionLine,
+  buildAskCountdownEdit,
   buildDisabledAskComponents,
   decideAsk,
   getAsk,
+  isAskV2Message,
   listCompanionDecisions,
+  listPendingAsks,
   parseAskCustomId,
+  rebuildAskV2ForEdit,
   stampAskEnqueued,
   sweepExpiredAsks,
   type AskRecord,
@@ -1503,6 +1509,12 @@ async function main(): Promise<void> {
     void sweepExpiredAskMessages().catch((err) => log(`ask sweep error: ${errText(err)}`));
   }, 60_000).unref();
 
+  // Ask countdown sweep: the live "⏳ Xm left" line (legacy content edit /
+  // V2 clock slot), same 60s cadence — buttons never touched here.
+  setInterval(() => {
+    void sweepAskCountdowns().catch((err) => log(`ask countdown sweep error: ${errText(err)}`));
+  }, 60_000).unref();
+
   // Companion-decision sweep (round 4): deliver phone-decided asks at the
   // fork's 15s cadence — a pocket approval starts work fast.
   setInterval(() => {
@@ -1658,16 +1670,30 @@ function askSpool(): string {
   return process.env.CLANKER_BOTLINK_SPOOL ?? path.join(PROJECT_ROOT, "botlink-spool");
 }
 
+/** rebuildAskV2ForEdit returns portable plain JSON (the raw
+ *  APIMessageTopLevelComponent shape) — discord.js accepts raw API component
+ *  data on message edits, so this is one cast chokepoint for every V2 edit
+ *  site instead of five. */
+function askV2EditComponents(components: unknown[], line: string, opts: { disabled?: boolean }) {
+  return rebuildAskV2ForEdit(components, line, opts) as unknown as NonNullable<MessageEditOptions["components"]>;
+}
+
 /** Retire an ask's button row in place. A dangling ask (registry record
  *  gone) keeps its buttons clickable forever otherwise, and every click
  *  errors — peer-learned live 2026-10-04 after a dangling row was clicked
- *  three times. */
+ *  three times. Shape-forked (V2 cards round): a V2 card takes tree surgery
+ *  (note into the clock slot, row disabled) — content is disabled under the
+ *  flag, so the legacy string-append must never touch it. */
 async function retireAskButtons(interaction: ButtonInteraction, askId: string, note: string): Promise<void> {
   try {
-    await interaction.update({
-      content: `${interaction.message.content}\n${note}`,
-      components: buildDisabledAskComponents(askId),
-    });
+    await interaction.update(
+      isAskV2Message(interaction.message.components)
+        ? { components: askV2EditComponents(interaction.message.components, note, { disabled: true }) }
+        : {
+            content: `${interaction.message.content}\n${note}`,
+            components: buildDisabledAskComponents(askId),
+          },
+    );
     log(`ask ${askId}: dangling click — buttons retired in place`);
   } catch (err) {
     log(`ask ${askId}: retire-buttons edit failed: ${errText(err)}`);
@@ -1721,12 +1747,19 @@ async function handleAskInteraction(interaction: Interaction): Promise<void> {
   }
   log(`ask ${askId}: ${decided.status} by ${interaction.user.username} (${interaction.user.id})`);
   try {
-    // The message STAYS as the record: original content + decision line,
-    // buttons stripped. Stripping is the design, not a side effect.
-    await interaction.update({
-      content: `${interaction.message.content}\n**${askDecisionLine(decided, interaction.user.username)}**`,
-      components: [],
-    });
+    // The message STAYS as the record: original question + decision line,
+    // row DISABLED (not stripped — both shapes render the same decided card).
+    // V2 cards take tree surgery: decision line into the clock slot, buttons
+    // disabled; content is disabled under the flag and never sent.
+    const line = `**${askDecisionLine(decided, interaction.user.username)}**`;
+    await interaction.update(
+      isAskV2Message(interaction.message.components)
+        ? { components: askV2EditComponents(interaction.message.components, line, { disabled: true }) }
+        : {
+            content: `${interaction.message.content}\n${line}`,
+            components: buildDisabledAskComponents(askId),
+          },
+    );
   } catch (err) {
     log(`ask ${askId}: decision edit failed: ${errText(err)}`);
   }
@@ -1850,10 +1883,15 @@ async function sweepCompanionAskDecisions(): Promise<void> {
         const ch = await client.channels.fetch(rec.channelId, { cache: false });
         if (ch instanceof ThreadChannel || ch instanceof TextChannel) {
           const msg = await ch.messages.fetch(rec.messageId);
-          await msg.edit({
-            content: `${msg.content}\n**${askDecisionLine(rec, name)}**`,
-            components: buildDisabledAskComponents(rec.askId),
-          });
+          const line = `**${askDecisionLine(rec, name)}**`;
+          await msg.edit(
+            isAskV2Message(msg.components)
+              ? { components: askV2EditComponents(msg.components, line, { disabled: true }) }
+              : {
+                  content: `${msg.content}\n${line}`,
+                  components: buildDisabledAskComponents(rec.askId),
+                },
+          );
         }
       } catch (err) {
         log(`ask ${rec.askId}: companion-decision edit failed: ${errText(err)}`);
@@ -1880,12 +1918,17 @@ async function sweepExpiredAskMessages(): Promise<void> {
         const ch = await client.channels.fetch(rec.channelId, { cache: false });
         if (ch instanceof ThreadChannel || ch instanceof TextChannel) {
           const msg = await ch.messages.fetch(rec.messageId);
-          await msg.edit({
-            content: auto
-              ? `${msg.content}\n**${askDecisionLine(rec, "")}**`
-              : `${msg.content}\n_Expired — no decision within the ask TTL; expiry is never approval._`,
-            components: buildDisabledAskComponents(rec.askId),
-          });
+          const line = auto
+            ? `**${askDecisionLine(rec, "")}**`
+            : "_Expired — no decision within the ask TTL; expiry is never approval._";
+          await msg.edit(
+            isAskV2Message(msg.components)
+              ? { components: askV2EditComponents(msg.components, line, { disabled: true }) }
+              : {
+                  content: `${msg.content}\n${line}`,
+                  components: buildDisabledAskComponents(rec.askId),
+                },
+          );
           log(
             auto
               ? `ask ${rec.askId}: auto-approved on expiry (no Deny) — buttons disabled in place`
@@ -1897,6 +1940,37 @@ async function sweepExpiredAskMessages(): Promise<void> {
       }
     }
     if (auto) await enqueueAutoApproval(rec);
+  }
+}
+
+/** Live countdown (countdown round + V2 cards): every PENDING ask's card
+ *  PATCHes once a minute so humans see the fuse burning in-channel. Shape-
+ *  forked like every other edit site: legacy gets the sentinel-idempotent
+ *  "⏳ Xm left" content line with the button row passed back UNCHANGED (an
+ *  edit that dropped components would kill the ask); V2 cards get the clock
+ *  slot swapped via tree surgery with disabled left UNDEFINED — a tick can
+ *  never touch clickability, so it can never race a decision edit back to
+ *  enabled. The expiry sweep owns terminal state; this only decorates the
+ *  wait. */
+async function sweepAskCountdowns(): Promise<void> {
+  for (const rec of listPendingAsks(askSpool())) {
+    if (rec.status !== "pending" || !rec.messageId) continue;
+    try {
+      const ch = await client.channels.fetch(rec.channelId, { cache: false });
+      if (!(ch instanceof ThreadChannel) && !(ch instanceof TextChannel)) continue;
+      const msg = await ch.messages.fetch(rec.messageId);
+      if (isAskV2Message(msg.components)) {
+        const clock = askClockLine(rec);
+        if (clock === null) continue;
+        await msg.edit({ components: askV2EditComponents(msg.components, clock, {}) });
+      } else {
+        const next = buildAskCountdownEdit(msg.content, rec);
+        if (next === null) continue;
+        await msg.edit({ content: next.content, components: msg.components });
+      }
+    } catch (err) {
+      log(`ask ${rec.askId}: countdown edit failed: ${errText(err)}`);
+    }
   }
 }
 

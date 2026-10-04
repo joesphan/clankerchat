@@ -59,7 +59,9 @@ react-native) — mine them before designing.
   legacy forever); rebuildAskV2ForEdit does the tree surgery with
   disabled-undefined = never re-enable (countdown/decision race closed).
   Decision edits now DISABLE the row (was: remove) — both shapes render the
-  same decided card. 123/123.
+  same decided card. 123/123. joesp-desktop watcher port (merged bb068ec):
+  daemon edit sites forked (click/retire/companion/expiry) + the 60s
+  countdown loop (legacy sentinel line / V2 clock slot).
 - [x] ~~**Prompt search on the phone** (app-side)~~ SHIPPED: FIND card —
   one-shot search (submit/button, not per-keystroke), results newest-first
   with status + excerpt; signedFetch signs pathname-only so ?q= rides free.
@@ -68,7 +70,8 @@ react-native) — mine them before designing.
   decided/expired) + the watcher's 60s loop PATCHes each pending ask's message
   once a minute with the button row passed back unchanged; the expiry sweep
   owns terminal state, the countdown only decorates it.
-  (cherry-picked from fork 19144eb.)
+  (cherry-picked from fork 19144eb; our daemon-side 60s loop landed with the
+  V2 watcher port — the cherry-pick was library-only.)
 - [x] ~~**Doctor → phone**~~ SHIPPED: /machine serves `alerts` — the two
   FAIL lines a pocket owner can act on (stuck pending prompts >60s,
   phone-decided asks undelivered), same file scans as the CLI doctor,
