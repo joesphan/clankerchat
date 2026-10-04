@@ -31,6 +31,23 @@ react-native) — mine them before designing.
   query never breaks auth. App-side search box = next round.
 - [ ] **Phone-prompt history navigation**: SENT list is newest-20 only; a "load more"
   or per-prompt detail view (full excerpt, timestamps) once real usage shows the need.
+- [x] ~~**Slash commands (/status, /ask)**~~ SHIPPED 2026-10-04 (owner
+  green-lit): one grouped command `/clankerchat` (subcommands `status`, `ask`)
+  registered guild-scoped on every watcher boot — repo core in src/slash.ts
+  (spec + shared status-card renderer + registration; tests/slash.test.mjs),
+  gateway glue in the watcher. `ask` text is a human-priority trigger with
+  API-verified identity; leak/mass-mention tripwires refuse at the door;
+  `status` renders the same card as the typed fast-path, EPHEMERAL (channel
+  stays quiet). One-time portal step: re-auth the bot invite with
+  `scope=bot+applications.commands` (SETUP.md).
+- [x] ~~**Local notification when a prompt is answered**~~ SHIPPED 2026-10-04
+  (expo-notifications ~57.0.21): banner fires only on a poll-OBSERVED
+  transition into answered/failed — the first poll after app open seeds the
+  status map silently, so stale answers never spam on reopen. NO push
+  anywhere (owner call): local-only means the app process must be alive
+  (foreground or Android's brief background window); iOS suspension =
+  silence until reopen. Header law updated: the no-notifications clause is
+  now scoped to pairing/SAS material.
 
 ## Next (design first)
 
@@ -87,6 +104,10 @@ react-native) — mine them before designing.
   but a new bot surface to review. Only if humans actually want it.
 - [ ] Multi-machine machine-switch state: prompts/asks are per-machine; a "this prompt
   was answered on the OTHER machine" cross-reference needs a shared registry shape.
+  → DESIGN DRAFTED 2026-10-04: docs/context/topics/multi-machine-prompts.md
+  (phase 0 = trivial peer line on the MACHINE card; phase 1 = route hint +
+  lane `prompt-outcome` echo verb, needs BOTH machines; open questions listed
+  for joesp-desktop). Owner green-lit; bilateral review before code.
 - [ ] Watcher-side own-post noise meter: count own posts per thread per hour, journal
   a NOISE line past a threshold — enforcement visibility for the quiet-discord law.
 
