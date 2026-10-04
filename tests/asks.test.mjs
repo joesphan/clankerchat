@@ -168,3 +168,54 @@ test("askDecisionLine renders Approved/Denied with the decider's display name", 
   assert.match(line, /^Approved by fast335xi · 12:34:56Z$/);
   assert.equal(askDecisionLine({ status: "denied", decidedAt: 0 }, "x"), "Denied by x · 00:00:00Z");
 });
+
+// --- lazy consensus (round 3, owner 2026-10-04: "auto approve and set the duration") ---
+
+test("createPendingAsk persists onExpiry=approve and honors ttlMs; default records carry NEITHER", () => {
+  const spool = tmpSpool();
+  const lazy = createPendingAsk(spool, {
+    question: "proceed if nobody objects?",
+    channelId: "1",
+    messageId: null,
+    approvers: [APPROVER],
+    ttlMs: 5 * 60_000,
+    onExpiry: "approve",
+  });
+  assert.equal(getAsk(spool, lazy.askId).onExpiry, "approve"); // persisted, not just returned
+  assert.equal(lazy.expiresAt - lazy.createdAt, 5 * 60_000); // custom duration took
+  const strict = createPendingAsk(spool, {
+    question: "fail-closed default",
+    channelId: "1",
+    messageId: null,
+    approvers: [APPROVER],
+  });
+  assert.equal("onExpiry" in getAsk(spool, strict.askId), false, "default records carry no onExpiry key");
+});
+
+test("sweepExpiredAsks: lazy ask flips to approved (decidedBy auto-expiry); default stays expired — and a pre-expiry Deny wins", () => {
+  const spool = tmpSpool();
+  const lazy = createPendingAsk(spool, {
+    question: "lazy", channelId: "1", messageId: null, approvers: [APPROVER], ttlMs: 1, onExpiry: "approve",
+  });
+  const strict = createPendingAsk(spool, {
+    question: "strict", channelId: "1", messageId: null, approvers: [APPROVER], ttlMs: 1,
+  });
+  const deniedLazy = createPendingAsk(spool, {
+    question: "denied-lazy", channelId: "1", messageId: null, approvers: [APPROVER], ttlMs: 60_000, onExpiry: "approve",
+  });
+  decideAsk(spool, deniedLazy.askId, "denied", APPROVER); // silence-yes contract: Deny beats the timer
+  const swept = sweepExpiredAsks(spool, Date.now() + 10_000);
+  const byId = Object.fromEntries(swept.map((r) => [r.askId, r]));
+  assert.equal(byId[lazy.askId].status, "approved");
+  assert.equal(byId[lazy.askId].decidedBy, "auto-expiry"); // honest provenance: nobody clicked
+  assert.ok(byId[lazy.askId].decidedAt > 0);
+  assert.equal(byId[strict.askId].status, "expired"); // THE invariant: expiry is never approval by default
+  assert.equal(byId[strict.askId].decidedBy, undefined);
+  assert.ok(!byId[deniedLazy.askId], "a decided ask is not sweepable — the Deny already won");
+  assert.equal(getAsk(spool, deniedLazy.askId).status, "denied");
+});
+
+test("askDecisionLine: auto-expiry renders its own honest line (no clicker to name)", () => {
+  const rec = { status: "approved", decidedBy: "auto-expiry", decidedAt: Date.UTC(2026, 9, 4, 8, 29, 10) };
+  assert.equal(askDecisionLine(rec, "irrelevant-name"), "Auto-approved (no Deny before expiry) · 08:29:10Z");
+});
