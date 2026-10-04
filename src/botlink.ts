@@ -426,6 +426,11 @@ export interface BotlinkServerOptions {
   execTimeoutMs?: number; // per-exec watchdog: no payload-end by this → drop (default 30s)
   maxFileBytes?: number; // per-file cap for file-carrying injects (default 2 MB decoded)
   maxRawPayloadBytes?: number; // raw stdin accumulator cap BEFORE parsing (default 12 MB — headroom over one max file + envelope)
+  /** Rotation cutover (docs/one-tap-pairing.md): with the authorized_keys
+   *  PATH set, the daemon auto-revokes a `# rotating-from`-marked line the
+   *  first time its REPLACEMENT key authenticates successfully, and sweeps
+   *  stale grace lines at boot. Unset = legacy behavior (lines are static). */
+  authorizedKeysPath?: string;
   log?: (line: string) => void;
 }
 
@@ -462,6 +467,41 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   // peer could stream gigabytes of junk-JSON into memory. Refuse the channel
   // the moment the accumulator crosses the line.
   const maxRawPayloadBytes = opts.maxRawPayloadBytes ?? 12 * 1024 * 1024;
+
+  // Rotation cutover + grace sweep — pairing.ts imports this module, so the
+  // dependency is pulled lazily at the call sites (no static cycle).
+  let cutover: ((verifiedFingerprint: string) => Promise<void>) | null = null;
+  if (opts.authorizedKeysPath) {
+    void (async () => {
+      try {
+        const { sweepStaleRotation, stripRotatingLine } = await import("./pairing.js");
+        try {
+          const content = fs.readFileSync(opts.authorizedKeysPath!, "utf8");
+          const swept = sweepStaleRotation(content);
+          if (swept !== null) {
+            fs.writeFileSync(opts.authorizedKeysPath!, swept, { mode: 0o600 });
+            log("botlink: swept a stale rotation grace line (never authenticated, past TTL)");
+          }
+        } catch {
+          /* unreadable now — the cutover path retries on each auth */
+        }
+        cutover = async (fp: string) => {
+          try {
+            const content = fs.readFileSync(opts.authorizedKeysPath!, "utf8");
+            const next = stripRotatingLine(content, fp);
+            if (next !== null) {
+              fs.writeFileSync(opts.authorizedKeysPath!, next, { mode: 0o600 });
+              log(`botlink: rotation cutover — new key authenticated; removed the old rotating-from line (${fp})`);
+            }
+          } catch (err) {
+            log(`botlink: rotation cutover check failed: ${(err as Error).message}`);
+          }
+        };
+      } catch {
+        /* pairing.js unavailable (partial build?) — cutover stays a no-op */
+      }
+    })();
+  }
 
   // Unconsumed-spool depth, shared by the status snapshot and the inject cap.
   const countPending = () => {
@@ -518,6 +558,10 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
       });
       conn.on("ready", () => {
         log(`botlink: peer authenticated from ${peerIp}`);
+        // Rotation cutover: a successful auth on the NEW key retires the
+        // marked old line (docs/one-tap-pairing.md — rotation must restore
+        // trust; old credentials must not linger indefinitely).
+        if (cutover && authedKeyFp) void cutover(authedKeyFp);
         let injects = 0;
         conn.on("session", (acceptSession, rejectSession) => {
           if (!authed) return void rejectSession();

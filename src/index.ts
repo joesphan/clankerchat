@@ -43,7 +43,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { loadEnvFile } from "./env.js";
+import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal } from "./leaks.js";
 
@@ -835,7 +835,23 @@ function registerTools(server: McpServer): void {
   const botlinkPeer = (() => {
     const peer = process.env.CLANKER_BOTLINK_PEER; // host[:port]
     const keyPath = process.env.CLANKER_BOTLINK_KEY; // this bot's private key
-    const hostKey = process.env.CLANKER_BOTLINK_PEER_HOSTKEY; // pinned fingerprint/line
+    // Pinned peer host-key fingerprint: launch env wins (backward
+    // compatible); otherwise the pin file `pair --confirm` writes
+    // (botlink-keys/peer.hostkey) — that file IS the pairing output.
+    const hostKey =
+      process.env.CLANKER_BOTLINK_PEER_HOSTKEY?.trim() ||
+      (() => {
+        try {
+          const line = fs
+            .readFileSync(path.join(PROJECT_ROOT, "botlink-keys", "peer.hostkey"), "utf8")
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .find((l) => l.length > 0 && !l.startsWith("#"));
+          return line ?? undefined;
+        } catch {
+          return undefined;
+        }
+      })();
     if (!peer || !keyPath || !hostKey) return null;
     const [host, portStr] = peer.split(":");
     return {
