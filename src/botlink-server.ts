@@ -36,6 +36,16 @@
  *   node dist/botlink-server.js pair --status | pair --rollback
  *       Inspect pairing state / finish-or-clean an interrupted commit.
  *
+ *   node dist/botlink-server.js companion --enroll
+ *       Phone allow/deny for pairing confirmations (docs/companion-app.md):
+ *       print a single-use 10-minute QR the app scans to enroll (the phone
+ *       generates its own keypair; the machine pins only its public line).
+ *
+ *   node dist/botlink-server.js companion --serve [--port N] [--bind H]
+ *       The companion HTTP surface (default main port + 2): signed
+ *       GET /attempts, POST /attempts/:id/allow|deny. Allow reuses the
+ *       exact `pair --confirm` commit path (typed-SAS check included).
+ *
  *   node dist/botlink-server.js serve
  *       Listen and serve the two verbs (status / inject). Config from env:
  *         CLANKER_BOTLINK_LISTEN          host:port   (default 127.0.0.1:47421)
@@ -58,11 +68,12 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import qrcode from "qrcode-terminal";
+import { defaultCompanionStore, issueEnrollToken, startCompanionServer } from "./companion.js";
 import { appendInjectEvent, fingerprintOfPublicKey, generateBotKey, parseKey, renderInjectReport, startBotlinkServer } from "./botlink.js";
 import {
   buildConfirmPlan,
   clearPairingState,
-  deriveSas,
   freshNonce,
   keydirPaths,
   loadPairingState,
@@ -72,6 +83,7 @@ import {
   renderTapBlock,
   rollbackInterruptedCommit,
   sanitizePeerText,
+  sasOfState,
   savePairingState,
   stageAndCommit,
   startPairingListener,
@@ -227,15 +239,6 @@ function selfValuesOf(p: ReturnType<typeof keydirPaths>, mode: "first" | "rotate
   return { name, hostkeyFp: fingerprintOfPublicKey(hostPub), botPub };
 }
 
-/** SAS over a completed exchange, initiator-first per the canonical
- *  transcript — both sides derive the identical string. */
-function sasOf(s: PairingState): string | null {
-  if (s.status !== "exchanged" || !s.peer?.nonce) return null;
-  const selfSide = { ...s.self, nonce: s.nonce };
-  const peerSide = { hostkeyFp: s.peer.hostkeyFp, botPub: s.peer.botPub, nonce: s.peer.nonce };
-  return s.role === "initiator" ? deriveSas(selfSide, peerSide) : deriveSas(peerSide, selfSide);
-}
-
 async function cmdPair(args: string[]): Promise<void> {
   const keydir = argValue(args, "--keys") ?? path.join(PROJECT_ROOT, "botlink-keys");
   const p = keydirPaths(keydir);
@@ -253,7 +256,7 @@ async function cmdPair(args: string[]): Promise<void> {
   if (sub === "--status") {
     const s = loadPairingState(p);
     if (!s) return void console.log("pairing: no state (never armed, or consumed/expired).");
-    console.log(renderTapBlock(s, sasOf(s) ?? "(pending exchange)"));
+    console.log(renderTapBlock(s, sasOfState(s) ?? "(pending exchange)"));
     return;
   }
 
@@ -381,7 +384,7 @@ async function cmdPair(args: string[]): Promise<void> {
       console.error('botlink-server pair --confirm: no completed exchange — run "--arm" + peer "--dial" (or vice versa).');
       process.exit(1);
     }
-    const sas = sasOf(s);
+    const sas = sasOfState(s);
     if (sas === null) {
       console.error("botlink-server pair --confirm: exchange incomplete.");
       process.exit(1);
@@ -433,11 +436,88 @@ async function cmdPair(args: string[]): Promise<void> {
   process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// companion — phone allow/deny for pairing confirmations (docs/companion-app.md)
+// ---------------------------------------------------------------------------
+
+/** For the QR: the address a phone on the same network should dial. A
+ *  wildcard bind resolves to the first non-internal IPv4. */
+function lanHostForQr(bind: string): string {
+  if (bind === "" || bind === "0.0.0.0" || bind === "::" || bind === "[::]") {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const ni of list ?? []) {
+        if (ni.family === "IPv4" && !ni.internal) return ni.address;
+      }
+    }
+    return "127.0.0.1";
+  }
+  return bind;
+}
+
+function cmdCompanion(args: string[]): void {
+  const keydir = argValue(args, "--keys") ?? path.join(PROJECT_ROOT, "botlink-keys");
+  const p = keydirPaths(keydir);
+  const store = defaultCompanionStore(keydir);
+  const sub = args.find((a) => a.startsWith("--")) ?? "--serve";
+  const listenSpec = process.env.CLANKER_BOTLINK_LISTEN ?? `127.0.0.1:${PORT_DEFAULT}`;
+  const mainPort = Number(listenSpec.split(":")[1]) || PORT_DEFAULT;
+  const bind = argValue(args, "--bind") ?? (listenSpec.split(":")[0] || "127.0.0.1");
+  const port = Number(argValue(args, "--port")) || mainPort + 2;
+
+  if (sub === "--enroll") {
+    const host = lanHostForQr(bind);
+    const { token, expiresAt } = issueEnrollToken(store);
+    const payload = {
+      v: 1,
+      kind: "clanker-companion-enroll",
+      host,
+      port,
+      fp: fingerprintOfPublicKey(readPub(p.hostKey + ".pub", "host_key.pub")),
+      tkn: token,
+    };
+    console.error(`companion enrollment — phone scans this QR. Single-use, expires ${new Date(expiresAt).toISOString()}.`);
+    if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+      console.error(
+        `WARNING: companion bind resolves to loopback (${host}) — phones cannot reach it.\n` +
+          `Re-run with --bind <LAN address> (or point CLANKER_BOTLINK_LISTEN at the LAN) before enrolling.`,
+      );
+    }
+    console.error(`Eyeball-check on the phone: the machine fingerprint shown there must be\n  ${payload.fp}`);
+    // stderr for the secret-bearing artifact (stdout stays machine-readable).
+    qrcode.generate(JSON.stringify(payload), { small: true }, (code) => console.error("\n" + code));
+    return;
+  }
+
+  if (sub === "--serve") {
+    const { close } = startCompanionServer({
+      bind,
+      port,
+      paths: p,
+      spoolDir: defaultSpoolDir(),
+      store,
+      log: (line) => console.error(`companion: ${line}`),
+    });
+    console.error(`companion: serving on ${bind}:${port} — enroll phones with "companion --enroll".`);
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      process.on(signal, () => {
+        close();
+        process.exit(0);
+      });
+    }
+    setInterval(() => void 0, 1 << 30); // stay up like serve
+    return;
+  }
+
+  console.error(`botlink-server companion: unknown option "${sub}" (--enroll | --serve)`);
+  process.exit(1);
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === "keygen") cmdKeygen(rest);
 else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
 else if (cmd === "report") cmdReport(rest[0]);
 else if (cmd === "pair") void cmdPair(rest);
+else if (cmd === "companion") cmdCompanion(rest);
 else if (cmd === "serve" || cmd === undefined) cmdServe();
 else {
   console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | report | pair | serve)`);

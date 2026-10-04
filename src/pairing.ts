@@ -135,7 +135,7 @@ export function sanitizePeerText(s: string): string {
 // Transcript + SAS — length-delimited, role-bound, commit-then-reveal.
 // ---------------------------------------------------------------------------
 
-function lenDelim(...parts: string[]): Buffer {
+export function lenDelim(...parts: string[]): Buffer {
   const chunks: Buffer[] = [];
   for (const p of parts) {
     const b = Buffer.from(p, "utf8");
@@ -220,6 +220,29 @@ export function normalizeSasInput(s: string): string {
   return s.toUpperCase().replace(/[^A-Z2-7]/g, "");
 }
 
+/** SAS over a COMPLETED exchange, from persisted pairing state — the single
+ *  derivation shared by the CLI confirm, the tap screen, and the companion
+ *  app's allow path (initiator-first per the canonical transcript, so every
+ *  surface shows the identical string). Null until the reveal lands. */
+export function sasOfState(s: PairingState): string | null {
+  if (s.status !== "exchanged" || !s.peer?.nonce) return null;
+  const selfSide: SideValues = { hostkeyFp: s.self.hostkeyFp, botPub: s.self.botPub, nonce: s.nonce };
+  const peerSide: SideValues = { hostkeyFp: s.peer.hostkeyFp, botPub: s.peer.botPub, nonce: s.peer.nonce };
+  return s.role === "initiator" ? deriveSas(selfSide, peerSide) : deriveSas(peerSide, selfSide);
+}
+
+/** Stable selector for ONE completed exchange: sha256 of the same canonical
+ *  transcript the SAS covers. A late or replayed allow naming an old
+ *  attemptId can never alias onto a fresh exchange. */
+export function attemptIdOfState(s: PairingState): string | null {
+  if (s.status !== "exchanged" || !s.peer?.nonce) return null;
+  const selfSide: SideValues = { hostkeyFp: s.self.hostkeyFp, botPub: s.self.botPub, nonce: s.nonce };
+  const peerSide: SideValues = { hostkeyFp: s.peer.hostkeyFp, botPub: s.peer.botPub, nonce: s.peer.nonce };
+  const transcript =
+    s.role === "initiator" ? pairingTranscript(selfSide, peerSide) : pairingTranscript(peerSide, selfSide);
+  return crypto.createHash("sha256").update(transcript).digest("hex").slice(0, 16);
+}
+
 // ---------------------------------------------------------------------------
 // Rotation signatures — Ed25519 via the same ssh2 key handling the lane
 // already uses (no new crypto dependency, no second wire format).
@@ -252,6 +275,12 @@ export function signRotation(privatePem: string, a: SideValues, b: SideValues): 
 /** Verify a peer's rotation signature against a pinned public line. */
 export function verifyRotation(publicLine: string, a: SideValues, b: SideValues, sigB64: string): boolean {
   return verifyWith(publicLine, rotationSigningMessage(a, b), sigB64);
+}
+
+/** Generic Ed25519 verify over an arbitrary message (companion-app request
+ *  signatures reuse the lane's key handling — no second crypto stack). */
+export function verifyEd25519(publicLine: string, msg: Buffer, sigB64: string): boolean {
+  return verifyWith(publicLine, msg, sigB64);
 }
 
 // ---------------------------------------------------------------------------
