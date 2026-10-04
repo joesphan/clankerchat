@@ -182,3 +182,15 @@ react-native) — mine them before designing.
   URL+token). Crawl posture: unguessable subdomain + 192-bit path + uniform
   404 + noindex (d92e7db). REMAINING: owner pastes URL into Spark custom
   apps (web), notes credential fields if any.
+
+## Round — spark egress law (2026-10-04, d09a856)
+Tyler: "no request from discord from other users other than the user can go out to
+gemini… no email or anything can get out." Landed three independent layers in
+spark-mcp: spark-only record visibility (foreign = indistinguishable miss),
+scrubForEgress (emails/mentions/7+digit runs) under safeExcerpt on every
+human-shaped egress string, projectWatcherFacts telemetry-only machine_status.
+Watcher (machine-local) carries the run-side framing: spark answer excerpts
+ride to Google — machine facts and own words only. 167/167. Spark surface
+confirmed working end-to-end by Tyler (Google validator accepted path-only
+URL; @appname tag forces the tool connection in a Gemini prompt). Peer
+briefed: inject 1791141604139-5c9210 (cites 4e472a8 d92e7db 33ca049 d09a856).
