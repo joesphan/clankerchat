@@ -12,7 +12,10 @@
  *
  * What it must never do (by design, not by omission):
  *   - transmit the SAS anywhere — no copy, no share sheet, no notifications
- *     (the agents-never-relay-SAS law extends to apps; selectable={false}),
+ *     of pairing state (the agents-never-relay-SAS law extends to apps;
+ *     selectable={false}). Local notifications for PROMPT OUTCOMES are a
+ *     separate owner-green-lit surface (2026-10-04) and carry answer text
+ *     only — never pairing/SAS material.
  *   - arm pairings, touch the lane, or read anything but pairing state.
  *
  * Protocol (must byte-match src/companion.ts):
@@ -22,6 +25,7 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import * as Notifications from "expo-notifications";
 import {
   ActivityIndicator,
   AppState,
@@ -327,6 +331,26 @@ async function requirePresence(reason: string): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// Local notifications (owner green-lit 2026-10-04) — prompt outcomes only
+// ---------------------------------------------------------------------------
+// Fired ONLY on a poll-observed transition into answered/failed: the first
+// poll after the app opens SEEDS the status map without notifying, so an
+// answer that landed while the app was closed never spams a stale banner on
+// reopen. NO PUSH anywhere (push was rejected for pairing; this stays local):
+// the app process must be alive — foreground, or Android's brief
+// post-background window — for a notification to fire; iOS suspension
+// honestly means silence until the app is reopened. Banner text is the
+// answer excerpt / prompt text (display data, same as the SENT card).
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 
@@ -350,6 +374,8 @@ export default function App() {
   const [notice, setNotice] = useState<string>("");
   const [perm, requestPerm] = useCameraPermissions();
   const appState = useRef(AppState.currentState);
+  // PromptId → last status SEEN by this app session (notification transitions).
+  const seenPromptStatus = useRef<Map<string, string>>(new Map());
 
   const deriveIdentity = useCallback(async (theSeed: Uint8Array) => {
     const pub = await ed25519.getPublicKeyAsync(theSeed);
@@ -420,6 +446,42 @@ export default function App() {
       sub.remove();
     };
   }, [active, seed, phoneId]);
+
+  // Notification permission: ask once on mount. Denied (or Expo Go quirk) →
+  // scheduleNotificationAsync just no-ops into its catch; the in-app cards
+  // are unchanged either way.
+  useEffect(() => {
+    void (async () => {
+      try {
+        await Notifications.requestPermissionsAsync();
+      } catch {
+        /* no notification surface (desktop web preview) — fine */
+      }
+    })();
+  }, []);
+
+  // Answer notifications: fire when a KNOWN non-terminal prompt flips to
+  // answered/failed between two polls. First sight of an id only seeds the
+  // map (no banner) — stale answers from before the app opened stay quiet.
+  useEffect(() => {
+    for (const p of prompts) {
+      const before = seenPromptStatus.current.get(p.promptId);
+      if (
+        before !== undefined &&
+        before !== p.status &&
+        (p.status === "answered" || p.status === "failed")
+      ) {
+        void Notifications.scheduleNotificationAsync({
+          content: {
+            title: p.status === "answered" ? "Prompt answered" : "Prompt failed",
+            body: String(p.answerExcerpt ?? p.text ?? "").slice(0, 140),
+          },
+          trigger: null, // local, immediate
+        }).catch(() => {});
+      }
+      seenPromptStatus.current.set(p.promptId, p.status);
+    }
+  }, [prompts]);
 
   const onScanned = useCallback(
     async (data: string) => {
