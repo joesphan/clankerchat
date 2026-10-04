@@ -139,14 +139,25 @@ export function stampPromptEnqueued(spoolDir: string, promptId: string): PromptR
  *  without a post is legitimate protocol silence ("reply nothing and exit"),
  *  so the code decides the status; `posted` rides along for the record.
  *  `excerpt` (optional) is the run's last own-post, whitespace-collapsed and
- *  capped here — the writer's shape is not trusted for display hygiene. */
+ *  capped here — the writer's shape is not trusted for display hygiene.
+ *
+ *  Late-finish overwrite (2026-10-04 audit): a record the stuck sweep already
+ *  failed (failed + exit −1 — that stamp is unique to sweepStuckEnqueued; a
+ *  real spawn-error exit ALSO writes −1 but through THIS function, which is
+ *  once-per-run) is OVERWRITTEN by the real outcome if the run lands after
+ *  the 20-min boundary. The run finishing is a fact; the record should say
+ *  what actually happened, not what the timeout guessed. Genuinely failed
+ *  records with a real exit code are final — null, no overwrite. */
 export function finishPrompt(
   spoolDir: string,
   promptId: string,
   outcome: { exit: number; posted: boolean; excerpt?: string },
 ): PromptRecord | null {
   const rec = getPrompt(spoolDir, promptId);
-  if (!rec || rec.status !== "enqueued") return null;
+  if (!rec) return null;
+  const stuckSweepGuessed =
+    rec.status === "failed" && rec.exit === -1 && !rec.answerExcerpt;
+  if (rec.status !== "enqueued" && !stuckSweepGuessed) return null;
   const excerpt = String(outcome.excerpt ?? "").replace(/\s+/g, " ").trim().slice(0, MAX_EXCERPT_CHARS);
   const next: PromptRecord = {
     ...rec,
@@ -199,6 +210,36 @@ export function sweepStuckEnqueued(spoolDir: string, now = Date.now()): PromptRe
     }
   }
   return swept;
+}
+
+/** Hygiene sweep (2026-10-04 audit): delete TERMINAL prompt records older
+ *  than keepMs (default 7 days). Same class as sweepTerminalAsks — the
+ *  registry is file-per-prompt and a terminal record's only remaining reader
+ *  is the phone's history/search view; the Discord post is the permanent
+ *  record (the run's answer venue), so the registry is a convenience index,
+ *  not an archive. Bounded registry also bounds the poll path: every phone
+ *  poll and every ?q= search parses every JSON in the dir. Never touches
+ *  pending (still owed a claim) or enqueued (still owed an exit stamp).
+ *  Returns the ids removed. */
+export function sweepTerminalPrompts(
+  spoolDir: string,
+  now = Date.now(),
+  keepMs = 7 * 24 * 60 * 60 * 1000,
+): string[] {
+  const removed: string[] = [];
+  const weekAgo = now - keepMs;
+  for (const rec of listPhonePrompts(spoolDir)) {
+    if (rec.status === "pending" || rec.status === "enqueued") continue;
+    const ageFrom = rec.finishedAt ?? rec.createdAt;
+    if (ageFrom >= weekAgo) continue;
+    try {
+      fs.rmSync(promptFile(spoolDir, rec.promptId), { force: true });
+      removed.push(rec.promptId);
+    } catch {
+      /* unreadable/locked — next sweep retries */
+    }
+  }
+  return removed;
 }
 
 /** The phone-facing rendering: the text, the status, the clock, and the

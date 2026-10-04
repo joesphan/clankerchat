@@ -19,6 +19,7 @@ import {
   MAX_PENDING_PROMPTS,
   MAX_PROMPT_CHARS,
   PROMPT_TTL_MS,
+  sweepTerminalPrompts,
 } from "../dist/prompts.js";
 
 function tmp() {
@@ -166,4 +167,65 @@ test("answer excerpt (round 5.1): normalized, capped, absent when empty, on the 
   const silent = finishPrompt(dir, c.promptId, { exit: 0, posted: false, excerpt: "   \n\t  " });
   assert.equal(silent.answerExcerpt, undefined);
   assert.equal(renderPromptForApp(silent).answerExcerpt, null);
+});
+
+// --- registry hygiene + late-finish overwrite (2026-10-04 audit) -------------
+
+test("sweepTerminalPrompts: terminal records past 7d removed; live + fresh kept", () => {
+  const dir = tmp();
+  const now = Date.now();
+  const mk = (text) => createPhonePrompt(dir, { text, fp: "fp" });
+  const mkOld = (text, status, ageMs) => {
+    // hand-write an aged record: create through the real API (shape law), then
+    // rewrite timestamps so only age varies — no clock mocking machinery.
+    const rec = mk(text);
+    const file = path.join(dir, "pending-prompts", `${rec.promptId}.json`);
+    const aged = JSON.parse(fs.readFileSync(file, "utf8"));
+    aged.createdAt = now - ageMs;
+    aged.finishedAt = status === "pending" ? undefined : now - ageMs;
+    if (status === "enqueued") { aged.status = "enqueued"; aged.enqueuedAt = now - ageMs; aged.finishedAt = undefined; }
+    else if (status === "answered") { aged.status = "answered"; aged.exit = 0; aged.posted = true; }
+    else if (status === "failed") { aged.status = "failed"; aged.exit = 1; }
+    else if (status === "expired") { aged.status = "expired"; }
+    fs.writeFileSync(file, JSON.stringify(aged, null, 1) + "\n");
+    return rec.promptId;
+  };
+  const livePending = mk("still owed a claim");
+  const liveEnqueued = mkOld("still owed an exit stamp", "enqueued", 9 * 24 * 60 * 60 * 1000);
+  const freshAnswered = mkOld("answered yesterday — history chip", "answered", 24 * 60 * 60 * 1000);
+  const oldAnswered = mkOld("answered 9d ago — gone", "answered", 9 * 24 * 60 * 60 * 1000);
+  const oldFailed = mkOld("failed 9d ago — gone", "failed", 9 * 24 * 60 * 60 * 1000);
+  const oldExpired = mkOld("expired 9d ago — gone", "expired", 9 * 24 * 60 * 60 * 1000);
+
+  const removed = sweepTerminalPrompts(dir, now);
+  assert.deepEqual(new Set(removed), new Set([oldAnswered, oldFailed, oldExpired]));
+  const ids = new Set(listPhonePrompts(dir).map((r) => r.promptId));
+  assert.ok(ids.has(livePending.promptId), "pending never GC'd");
+  assert.ok(ids.has(liveEnqueued), "enqueued never GC'd");
+  assert.ok(ids.has(freshAnswered), "fresh terminal kept");
+  assert.ok(!ids.has(oldAnswered) && !ids.has(oldFailed) && !ids.has(oldExpired));
+});
+
+test("finishPrompt: a stuck-sweep guess (failed/-1) is overwritten by the real outcome; real failures are final", () => {
+  const dir = tmp();
+  // run finished just past the 20-min boundary: sweep guessed failed first
+  const late = createPhonePrompt(dir, { text: "slow run", fp: "fp" });
+  stampPromptEnqueued(dir, late.promptId);
+  const guessed = sweepStuckEnqueued(dir, Date.now() + STUCK_ENQUEUED_MS + 1000)[0];
+  assert.equal(guessed.status, "failed");
+  assert.equal(guessed.exit, -1);
+  const done = finishPrompt(dir, late.promptId, { exit: 0, posted: true, excerpt: "actually it worked" });
+  assert.equal(done.status, "answered", "the real outcome replaces the timeout's guess");
+  assert.equal(done.answerExcerpt, "actually it worked");
+  assert.equal(getPrompt(dir, late.promptId).status, "answered");
+
+  // a REAL failure carries its real code — final, never overwritten
+  const real = createPhonePrompt(dir, { text: "crashed", fp: "fp" });
+  stampPromptEnqueued(dir, real.promptId);
+  finishPrompt(dir, real.promptId, { exit: 3, posted: false });
+  assert.equal(finishPrompt(dir, real.promptId, { exit: 0, posted: true }), null, "real terminal outcome is final");
+  assert.equal(getPrompt(dir, real.promptId).exit, 3);
+
+  // answered is final too
+  assert.equal(finishPrompt(dir, late.promptId, { exit: 1, posted: false }), null);
 });
