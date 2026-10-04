@@ -52,6 +52,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
+import { botlinkRequest, type BotlinkPeer } from "./botlink.js";
 import { findMassMentions } from "./leaks.js";
 import {
   askDecisionLine,
@@ -593,6 +594,7 @@ interface Job {
   skipWake?: boolean; // fallback run: route cwd only, never wake
   noCoalesce?: boolean; // a distinct event (ask decision) — never superseded by a same-author re-send
   phonePrompt?: { id: string; anchorId: string }; // round 5: promptId riding to the exit stamp; anchor = newest root message at claim time, the posted-check reference
+  canary?: string; // round 6: this run's leak tripwire, kept past runClaude for the exit-hook excerpt recheck
 }
 
 interface RouteDecision {
@@ -1001,6 +1003,7 @@ async function dispatch(job: Job): Promise<void> {
 
     const canary = `cnry-${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
     activeCanaries.add(canary);
+    job.canary = canary; // settlePhonePrompt rechecks the excerpt against it after the run
     const run = await runClaude(args, cwd, buildWorkerPrompt(job, cwd, sandboxed, canary), config.timeoutMs);
     activeCanaries.delete(canary);
     const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
@@ -1035,6 +1038,7 @@ function enqueue(job: Job): void {
     // A claimed phone prompt can never run — stamp it failed now, or its chip
     // hangs on "enqueued" forever (the TTL rot only takes pending records).
     if (job.phonePrompt) finishPrompt(askSpool(), job.phonePrompt.id, { exit: 1, posted: false });
+    writeWatcherState(); // queue changed (a drop is a change)
     return;
   }
   // Coalesce rapid re-sends from the same author in the same thread: the
@@ -1051,6 +1055,7 @@ function enqueue(job: Job): void {
   }
   queue.push(job);
   log(`queued: "${job.threadName}" from ${job.from} (queue=${queue.length})`);
+  writeWatcherState(); // round 6: every queue change refreshes the dashboard's facts
 }
 
 function drain(): void {
@@ -1065,9 +1070,12 @@ function drain(): void {
     if (idx < 0) break; // only same-thread jobs left and concurrency budget spent
     const job = queue.splice(idx, 1)[0];
     activeJobs.push(job);
+    writeWatcherState(); // queued → active is a queue change
     void dispatch(job).finally(() => {
       const i = activeJobs.indexOf(job);
       if (i >= 0) activeJobs.splice(i, 1);
+      lastRunAt = new Date().toISOString(); // a dispatched trigger completed — "ran Xm ago"
+      writeWatcherState();
       drain();
     });
   }
@@ -1194,6 +1202,82 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
 }
 
 // ---------------------------------------------------------------------------
+// Watcher state (round 6) — facts source for the pocket lane dashboard
+// ---------------------------------------------------------------------------
+
+/** Last lane probe verdict; null until the first probe resolves (the phone
+ * renders that honestly as "lane: not probed yet"). */
+let laneFacts: { ok: boolean; bot: string | null; pending: number } | null = null;
+/** ISO time the last dispatched trigger completed (any outcome) — "ran Xm ago". */
+let lastRunAt: string | null = null;
+
+/** The lane peer for the heartbeat probe. Prefers full botlink env (the
+ * MCP-side shape); under `npm run daemon` only .env is loaded, so fall back
+ * to this machine's pinned defaults — the exact resolution tools/lane-send.mjs
+ * uses (hostkey from .env, bot_key from botlink-keys/). */
+function lanePeer(): BotlinkPeer | null {
+  const hostKey = process.env.CLANKER_BOTLINK_PEER_HOSTKEY?.trim();
+  if (!hostKey) return null; // lane unconfigured — nothing to probe with
+  try {
+    return {
+      host: process.env.CLANKER_BOTLINK_PEER_HOST ?? "100.64.0.1",
+      port: Number(process.env.CLANKER_BOTLINK_PEER_PORT ?? 47421),
+      username: process.env.CLANKER_BOTLINK_USER ?? "clanker",
+      privateKeyPem: fs.readFileSync(path.join(PROJECT_ROOT, "botlink-keys", "bot_key"), "utf8"),
+      expectedHostKey: hostKey,
+    };
+  } catch {
+    return null; // no bot key on disk — probe stays off, dashboard says so
+  }
+}
+
+/** Probe the peer botlink and fold the verdict into laneFacts. GOTCHA (the
+ * fork's, honored): botlinkRequest resolves the verb's RAW STDOUT STRING —
+ * parse before reading fields, or every probe reads undefined and the
+ * dashboard lies. */
+async function probeLane(): Promise<void> {
+  const peer = lanePeer();
+  if (!peer) return;
+  try {
+    const out = await botlinkRequest(peer, "status");
+    const st = JSON.parse(out.trim()) as { ok?: boolean; bot?: string; spool_pending?: number };
+    laneFacts = {
+      ok: st.ok === true,
+      bot: typeof st.bot === "string" ? st.bot : null,
+      pending: Number(st.spool_pending ?? 0),
+    };
+    log(`lane probe: ${laneFacts.bot ?? "peer"} ok=${laneFacts.ok} pending=${laneFacts.pending}`);
+  } catch (err) {
+    laneFacts = { ok: false, bot: laneFacts?.bot ?? null, pending: 0 };
+    log(`lane probe failed: ${errText(err)}`);
+  }
+}
+
+/** Publish the watcher's facts into the botlink spool: pool, queues, lane
+ * verdict, last-run, updated. Written atomically (tmp+rename) — botlink's
+ * status verb and companion's /machine read this file live and must never
+ * see a torn write. This is the round 6 contract the fork's readers serve. */
+function writeWatcherState(): void {
+  const snapshot: Record<string, unknown> = {
+    active: activeJobs.length,
+    queued_human: queue.filter((j) => !j.fromBot).length,
+    queued_bot: queue.filter((j) => j.fromBot).length,
+    max_concurrent: config.maxConcurrent,
+    updated: new Date().toISOString(),
+  };
+  if (laneFacts) snapshot.lane = laneFacts;
+  if (lastRunAt) snapshot.last_run_at = lastRunAt;
+  const file = path.join(askSpool(), "watcher-state.json");
+  const tmp = `${file}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    log(`watcher-state write failed: ${errText(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1272,6 +1356,15 @@ async function main(): Promise<void> {
   setInterval(() => {
     void sweepPhonePrompts(parent).catch((err) => log(`phone prompt sweep error: ${errText(err)}`));
   }, 15_000).unref();
+
+  // Watcher state (round 6): facts for the pocket lane dashboard — probe the
+  // lane once at boot, then refresh on the 120s presence tick; queue changes
+  // (enqueue/drain/dispatch-exit) write it immediately, so a dispatching peer
+  // or the phone never routes on a snapshot older than the last event.
+  void probeLane().finally(() => writeWatcherState());
+  setInterval(() => {
+    void probeLane().finally(() => writeWatcherState());
+  }, 120_000).unref();
 
   // CLANKER SPEC A3/A5 heartbeat: follow-ups + queue drain + watchdog feed.
   for (;;) {
@@ -1657,20 +1750,35 @@ async function sweepExpiredAskMessages(): Promise<void> {
 async function settlePhonePrompt(job: Job, exit: number, reason?: string): Promise<void> {
   if (!job.phonePrompt) return;
   let posted = false;
+  let excerpt: string | undefined;
   if (exit === 0) {
     try {
       const ch = await client.channels.fetch(job.threadId, { cache: false });
       if (ch instanceof TextChannel || ch instanceof ThreadChannel) {
         const fetched = await ch.messages.fetch({ limit: 25, after: job.phonePrompt.anchorId, cache: false });
-        posted = [...fetched.values()].some((m) => m.author.id === client.user?.id && !daemonMessageIds.has(m.id));
+        const own = [...fetched.values()].filter((m) => m.author.id === client.user?.id && !daemonMessageIds.has(m.id));
+        posted = own.length > 0;
+        // Round 5.1 exit-hook excerpt: the run's LAST own-post by snowflake
+        // (iteration order is not a promise), leak-rechecked before it rides.
+        // On trip we store NOTHING — an excerpt that fails the check must not
+        // reach the phone even truncated; Discord stays the record either way.
+        const last = own.sort((a, b) => Number(BigInt(b.id) - BigInt(a.id)))[0];
+        if (last) {
+          const trip = [...activeCanaries, ...(job.canary ? [job.canary] : [])].find((c) => last.content.includes(c));
+          if (trip) {
+            log(`LEAK TRIPWIRE: excerpt for phone prompt ${job.phonePrompt.id} contained a run canary — suppressed, store nothing`);
+          } else {
+            excerpt = last.content;
+          }
+        }
       }
     } catch {
       /* a fetch failure must not eat the stamp */
     }
   }
-  const fin = finishPrompt(askSpool(), job.phonePrompt.id, { exit, posted });
+  const fin = finishPrompt(askSpool(), job.phonePrompt.id, { exit, posted, ...(excerpt ? { excerpt } : {}) });
   log(
-    `phone prompt ${job.phonePrompt.id} ${fin ? fin.status : "already terminal"} (exit ${exit}, posted=${posted}${reason ? ` — ${reason}` : ""})`,
+    `phone prompt ${job.phonePrompt.id} ${fin ? fin.status : "already terminal"} (exit ${exit}, posted=${posted}${reason ? ` — ${reason}` : ""}${excerpt ? " +excerpt" : ""})`,
   );
 }
 
