@@ -14,11 +14,11 @@ react-native) — mine them before designing.
 
 ## Now (high value, low risk)
 
-- [ ] **Biometric gate on owner actions** (expo-local-authentication — SDK 57 page in
-  reference-docs): FaceID/fingerprint before Allow/Approve on the phone. The ask surface
-  is possession-gated today (the enrolled key); biometrics make it presence-gated.
-  Rejection/fallback behavior must fail CLOSED (no biometrics enrolled → button works,
-  because the key is still the trust root — decide this explicitly).
+- [x] ~~**Biometric gate on owner actions**~~ SHIPPED 4b91769: requirePresence()
+  before rotation Allow + ask Approve/Deny; key = trust root (fail-open on no
+  hardware/enrolled/API error), hard refusal only on a failed/canceled real
+  prompt; rotation-Deny ungated by design (friction-free rejection);
+  FaceID-in-Expo-Go degrades to key-possession (SDK limitation).
 - [x] ~~SecureStore for the phone signing key~~ — already done (K_SEED via
   expo-secure-store in App.tsx; verified 2026-10-04).
 - [ ] **Phone-prompt history navigation**: SENT list is newest-20 only; a "load more"
