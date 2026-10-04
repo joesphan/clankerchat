@@ -733,7 +733,14 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                 const safeName = sanitizeFileName(f.name);
                 const dest = path.join(opts.spoolDir, "files", id, safeName);
                 fs.mkdirSync(path.dirname(dest), { recursive: true });
-                fs.writeFileSync(dest, bytes);
+                // Atomic landing (audit finding 11): the watcher re-hashes
+                // this file against the manifest — a torn write surfaces as
+                // a HASH MISMATCH alarm, and a persistently-torn file was
+                // archived with no run and no consumed event while the
+                // sender already had its ACK.
+                const destTmp = `${dest}.tmp`;
+                fs.writeFileSync(destTmp, bytes);
+                fs.renameSync(destTmp, dest);
                 fileManifest = {
                   name: safeName,
                   size: f.size,
@@ -752,8 +759,15 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
               // files/<id>/), never the base64 — the spool stays an audit
               // artifact, not a blob store.
               const { file: _fileBlock, ...payloadRest } = payload;
+              // Atomic spool write (audit finding 11): the consumer's
+              // 3×120ms parse retries mask torn writes, but a persistently
+              // torn file was archived silently — no run, no consumed audit
+              // event — while the sender already had its ACK. Same-dir tmp +
+              // rename; the .tmp suffix never matches the consumer's
+              // `.inject.json` filter.
+              const fileTmp = `${file}.tmp`;
               fs.writeFileSync(
-                file,
+                fileTmp,
                 JSON.stringify(
                   {
                     id,
@@ -767,6 +781,7 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
                   2,
                 ),
               );
+              fs.renameSync(fileTmp, file);
               injectsTotal++;
               try {
                 // Await the audit entry BEFORE acking: the ACK must mean the

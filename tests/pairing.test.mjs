@@ -255,6 +255,82 @@ test("e2e reveal-mismatch aborts: nothing confirmable remains", async () => {
   }
 });
 
+test("audit fix 7: a non-owner connection dropping (or revealing) never kills a live half-exchange", async () => {
+  const { B, keysB } = e2eFixture();
+  const stateB = armedState({
+    name: "machine-b",
+    hostkeyFp: fingerprintOfPublicKey(keysB.host.publicLine),
+    botPub: keysB.bot.publicLine,
+  });
+  const { listener, logs } = await withListener(B, stateB);
+  try {
+    const nonce = freshNonce(); // the initiator's REAL nonce (reveal later)
+    // connection 1 (the owner): valid phase 1 → half-exchange stored
+    const owner = await new Promise((resolve, reject) => {
+      const sock = net.connect(listener.port, "127.0.0.1");
+      sock.on("error", reject);
+      let buf = "";
+      sock.on("data", (c) => {
+        buf += c.toString();
+        if (buf.includes("\n")) resolve(sock); // phase-1 reply landed
+      });
+      sock.write(
+        JSON.stringify({
+          cmd: "pair-hello",
+          phase: 1,
+          peer: {
+            name: "initiator",
+            hostkeyFp: "SHA256:" + "Z".repeat(43),
+            botPub: generateBotKey("initiator").publicLine,
+            commit: commitOf(nonce),
+          },
+        }) + "\n",
+      );
+    });
+    // connection 2 (scanner): garbage → drop — must NOT wipe the exchange
+    await new Promise((resolve) => {
+      const probe = net.connect(listener.port, "127.0.0.1");
+      probe.on("connect", () => {
+        probe.write("GET / HTTP/1.1\r\n\r\n"); // scanner-shaped, not JSON
+        setTimeout(resolve, 150);
+      });
+      probe.on("error", () => resolve());
+    });
+    let saved = JSON.parse(fs.readFileSync(B.state, "utf8"));
+    assert.equal(saved.status, "exchanged", "scanner drop did not wipe the half-exchange");
+    assert.ok(saved.peer, "peer values intact");
+    // connection 3 (impatient re-dial on a NEW socket): phase-2 reveal with
+    // the CORRECT nonce — refused (not the owning socket) AND non-wiping
+    await new Promise((resolve) => {
+      const interloper = net.connect(listener.port, "127.0.0.1");
+      interloper.on("connect", () => {
+        interloper.write(JSON.stringify({ cmd: "pair-hello", phase: 2, nonce }) + "\n");
+        interloper.end();
+        setTimeout(resolve, 150);
+      });
+      interloper.on("error", () => resolve());
+    });
+    assert.ok(logs.some((l) => l.includes("phase 2 before phase 1")), "non-owner reveal refused");
+    saved = JSON.parse(fs.readFileSync(B.state, "utf8"));
+    assert.equal(saved.status, "exchanged", "non-owner reveal did not wipe the half-exchange");
+    // the OWNER still completes phase 2 on its own socket — ceremony survives
+    const done = new Promise((resolve) => {
+      let buf = "";
+      owner.on("data", (c) => {
+        buf += c.toString();
+        if (buf.includes("\n")) resolve(buf); // phase-2 ack
+      });
+    });
+    owner.write(JSON.stringify({ cmd: "pair-hello", phase: 2, nonce }) + "\n");
+    await done;
+    saved = JSON.parse(fs.readFileSync(B.state, "utf8"));
+    assert.equal(saved.status, "exchanged");
+    assert.equal(saved.peer.nonce, nonce, "owner's reveal recorded — exchange completed");
+  } finally {
+    listener.close();
+  }
+});
+
 test("e2e rotation: signed exchange verifies against the pinned OLD key; bad sig aborts", async () => {
   const { A, B, keysA, keysB } = e2eFixture();
   // Both rotate: B stages .next keys; each side pins the other's OLD bot key.
@@ -470,6 +546,61 @@ test("journaled commit: interrupted phase is detected and finished or cleaned", 
   fs.writeFileSync(path.join(p.stageDir, "authorized_keys"), "staged-content\n");
   assert.equal(rollbackInterruptedCommit(p), true);
   assert.equal(fs.readFileSync(p.authorizedKeys, "utf8"), "staged-content\n");
+  assert.ok(!fs.existsSync(p.stageDir));
+});
+
+test("audit fix 8: a mid-cutover crash heals — no mixed active keys survive", () => {
+  const dir = tmp();
+  const p = keydirPaths(dir);
+  const oldKeys = writeKeys(p, "old-active");
+  const nextKeys = writeKeys({ ...p, hostKey: p.hostKeyNext, botKey: p.botKeyNext }, "next");
+  // Crash simulation: host_key (private + pub) already moved pre-crash, the
+  // bot_key pairs and the committed-journal write never ran.
+  fs.mkdirSync(p.stageDir, { recursive: true });
+  fs.copyFileSync(p.hostKey, p.hostKey + ".bak-mid8");
+  fs.renameSync(p.hostKeyNext, p.hostKey);
+  fs.renameSync(p.hostKeyNext + ".pub", p.hostKey + ".pub");
+  fs.writeFileSync(
+    path.join(p.stageDir, "journal.json"),
+    JSON.stringify({ phase: "staged", backupStamp: "mid8", cutoverSelfKeys: true }),
+  );
+  assert.equal(rollbackInterruptedCommit(p), true);
+  // healed: ALL actives are the .next pair, privates AND pub sidecars
+  assert.equal(fs.readFileSync(p.hostKey, "utf8"), nextKeys.host.privatePem + "\n");
+  assert.equal(fs.readFileSync(p.botKey, "utf8"), nextKeys.bot.privatePem + "\n");
+  assert.equal(readPub(p.botKey + ".pub"), nextKeys.bot.publicLine);
+  for (const f of [p.hostKeyNext, p.hostKeyNext + ".pub", p.botKeyNext, p.botKeyNext + ".pub"]) {
+    assert.ok(!fs.existsSync(f), `${f} consumed by the healed cutover`);
+  }
+  // the still-old actives got their backup before recovery replaced them
+  assert.equal(fs.readFileSync(p.botKey + ".bak-mid8", "utf8"), oldKeys.bot.privatePem + "\n");
+  assert.ok(!fs.existsSync(p.stageDir));
+});
+
+test("audit fix 8: a lingering journal never promotes .next keys staged by a LATER arm", () => {
+  const dir = tmp();
+  const p = keydirPaths(dir);
+  const active = writeKeys(p, "active");
+  const later = writeKeys({ ...p, hostKey: p.hostKeyNext, botKey: p.botKeyNext }, "later-arm");
+  // A first-pairing commit crashed after the journal write; the .next pair
+  // belongs to a rotation armed AFTER that crash — not this commit's intent.
+  fs.mkdirSync(p.stageDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(p.stageDir, "journal.json"),
+    JSON.stringify({ phase: "staged", backupStamp: "oldc" }), // no cutoverSelfKeys
+  );
+  assert.equal(rollbackInterruptedCommit(p), true);
+  assert.equal(fs.readFileSync(p.botKey, "utf8"), active.bot.privatePem + "\n", "active untouched");
+  assert.equal(fs.readFileSync(p.botKeyNext, "utf8"), later.bot.privatePem + "\n", "later arm intact");
+  // same for a COMMITTED journal that never got its stage-dir cleanup: the
+  // cutover flag may be true but phase says everything already moved
+  fs.mkdirSync(p.stageDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(p.stageDir, "journal.json"),
+    JSON.stringify({ phase: "committed", backupStamp: "donec", cutoverSelfKeys: true }),
+  );
+  assert.equal(rollbackInterruptedCommit(p), true);
+  assert.equal(fs.readFileSync(p.botKey, "utf8"), active.bot.privatePem + "\n", "committed journal: no promotion");
   assert.ok(!fs.existsSync(p.stageDir));
 });
 

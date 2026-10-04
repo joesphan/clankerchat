@@ -46,17 +46,6 @@ react-native) — mine them before designing.
   a copy and boots DEAF (alive, loud) instead of bricking. Guard logic lives
   in src/daemon-guard.ts (daemon.ts is an unimportable composition root) —
   tests in tests/daemon-guard.test.mjs, suite 116/116.
-- [ ] **pairing.ts audit findings (ours, ceremony-path — rare, human-supervised)**:
-  (7) startPairingListener drop() wipes on `!completed && live.peer !==
-  undefined` — any SECOND tcp connection dropping mid-exchange (LAN probe,
-  scanner) resets the in-flight ceremony; per-connection state, not shared;
-  (8) rotation cutover's four sequential key renames sit OUTSIDE the journal
-  recovery — crash mid-cutover leaves mixed keys (new host_key + old
-  bot_key) with the journal erased, lane dead until manual repair.
-- [ ] **botlink spool write atomicity (finding 11, LOW)**: `.inject.json` +
-  `files/<id>/<name>` written non-atomically; watcher's 3×120ms retries mask
-  torn reads but a persistently-torn file archives silently with no consumed
-  event while the sender got its ACK — tmp+rename at the daemon write sites.
 - [ ] **Components V2 ask cards** (Discord): reference `developers/components/reference.mdx`
   — Container/Section/Text Display (types 9/10/17) would give ask cards real structure
   (question as text display, buttons as section accessory). VERIFY discord.js/raw-REST
@@ -83,6 +72,17 @@ react-native) — mine them before designing.
 
 ## Done (strike-through recent)
 
+- [x] ~~**pairing.ts audit findings 7+8 + botlink spool atomicity 11**~~
+  SHIPPED (fork-1 audit round 2, our side): (7) listener tracks the OWNING
+  socket — a second connection dropping (scanner, LAN probe) or revealing
+  can never wipe a live half-exchange, and a non-owner phase 2 is refused
+  non-destructively; (8) rollbackInterruptedCommit now completes the four
+  cutover key renames (journal carries cutoverSelfKeys so a later arm's
+  .next is never promoted by a lingering older journal; idempotent
+  stamp-tied backups heal mid-cutover mixed keys); (11) `.inject.json` +
+  `files/<id>/<name>` land via same-dir tmp+rename — the .tmp suffix never
+  matches the consumer's filter, so a torn write can't archive silently.
+  112/112.
 - [x] Cross-fork audit round 1 (57fd25d + follow-up): fork-2's 7 findings ALL
   fixed (stuck-enqueued sweep, signedFetch counter serialization, enroll
   timeout, settle-once spawn finish, per-run posted marks, noCoalesce ask
