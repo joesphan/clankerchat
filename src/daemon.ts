@@ -207,7 +207,7 @@ function loadConfig(recoverFromCorruption = false): DaemonConfig {
     // quarantine a copy and boot DEAF (nothing triggers; companion, asks,
     // and the lane stay alive) — loud, alive, fixable. Reload path
     // (!ov reload): throw, in-memory config unchanged.
-    if (!recoverFromCorruption) fatal(`daemon.json is not valid JSON: ${errText(err)}`);
+    if (!recoverFromCorruption) throw new Error(`daemon.json is not valid JSON: ${errText(err)}`);
     deafBoot = true;
     parsed = {};
     const backup = `${CONFIG_FILE}.corrupt-${new Date().toISOString().replaceAll(":", "-")}`;
