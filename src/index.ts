@@ -96,19 +96,19 @@ function errTextOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function sendMessage(
-  channelId: string,
-  payload: string | {
-    content: string;
-    files?: { attachment: string; name: string }[];
-    reply?: { messageReference: string };
-  },
-): Promise<{ id: string }> {
+async function sendMessage(channelId: string, payload: SendPayload): Promise<{ id: string }> {
+  // ONE shared type (SendPayload) end-to-end: this seam used to duplicate the
+  // payload shape inline, and every duplicated field is a place a new key
+  // silently drops (allowed_mentions → their f624258; components → caught
+  // before the first live ask 2026-10-04 — the ask would have posted with NO
+  // buttons). The input side now can't drift; runtime forwarding below must
+  // still name each field explicitly — that's the part live checks cover.
   const body = typeof payload === "string" ? { content: payload } : { content: payload.content };
   const files = typeof payload === "string" || !payload.files
     ? undefined
     : payload.files.map((f) => ({ data: fs.readFileSync(f.attachment), name: f.name }));
   const ref = typeof payload === "string" || !payload.reply ? undefined : { message_id: payload.reply.messageReference };
+  const components = typeof payload === "string" ? undefined : payload.components;
   // allowed_mentions, if PRESENT without parse/users/roles, suppresses
   // EVERY mention in the message — Discord treats the object as the whole
   // allowlist. Replying must silence only the replied-to user (anti
@@ -123,16 +123,16 @@ async function sendMessage(
     : { parse: ["users"] };
   try {
     return (await api().post(Routes.channelMessages(channelId), {
-      body: { ...body, message_reference: ref, allowed_mentions: allowedMentions },
+      body: { ...body, message_reference: ref, allowed_mentions: allowedMentions, components },
       files,
     })) as { id: string };
   } catch (err) {
     // failIfNotExists parity: a deleted reply target degrades to a plain send.
-    // The fallback keeps the same explicit allowed_mentions — peer review
-    // (their f624258) flagged this path dropping it.
+    // The fallback keeps the same explicit allowed_mentions AND components —
+    // a degraded reply must not silently drop the ask's button row either.
     if (ref && /10008|Unknown Message/i.test(errTextOf(err))) {
       return (await api().post(Routes.channelMessages(channelId), {
-        body: { ...body, allowed_mentions: allowedMentions },
+        body: { ...body, allowed_mentions: allowedMentions, components },
         files,
       })) as { id: string };
     }
