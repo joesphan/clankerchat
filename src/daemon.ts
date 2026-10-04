@@ -80,6 +80,7 @@ import {
   sweepExpiredPrompts,
   STUCK_ENQUEUED_MS,
   sweepStuckEnqueued,
+  sweepTerminalPrompts,
   type PromptRecord,
 } from "./prompts.js";
 
@@ -1506,14 +1507,16 @@ async function main(): Promise<void> {
   });
 
   // Ask expiry sweep: disable expired asks' buttons in place, fail-closed.
-  // Registry hygiene rides the same pass (fork 1856fc1): terminal records
-  // older than 7d have no further readers — the Discord message is the
-  // human record. Pending and undelivered companion decisions are never
-  // removed (sweepTerminalAsks' own invariant).
+  // Registry hygiene rides the same pass (forks 1856fc1 + 65beffd): terminal
+  // records older than 7d have no further readers — the Discord message is
+  // the human record. Pending and undelivered companion decisions (asks) and
+  // pending/enqueued prompts are never removed (the sweeps' own invariants).
   setInterval(() => {
     void sweepExpiredAskMessages().catch((err) => log(`ask sweep error: ${errText(err)}`));
     const gc = sweepTerminalAsks(askSpool());
     if (gc.length > 0) log(`ask registry GC: ${gc.length} terminal record(s) older than 7d removed`);
+    const promptGc = sweepTerminalPrompts(askSpool());
+    if (promptGc.length > 0) log(`prompt registry GC: ${promptGc.length} terminal record(s) older than 7d removed`);
   }, 60_000).unref();
 
   // Ask countdown sweep: the live "⏳ Xm left" line (legacy content edit /
