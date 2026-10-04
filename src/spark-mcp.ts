@@ -264,6 +264,17 @@ export function createSparkListener(
   };
   return (req, res) => {
     try {
+      // Request audit (diagnostics for client-connect debugging): one line
+      // per request — method, whether the path matched, auth presence,
+      // resulting status, UA class. NEVER the path or token values.
+      const onPath = capabilityMatch(new URL(req.url ?? "/", "http://localhost").pathname, gate.capPath);
+      const hadAuth = Boolean(req.headers.authorization);
+      const ua = String(req.headers["user-agent"] ?? "?").slice(0, 48);
+      res.on("finish", () => {
+        console.log(
+          `req: ${req.method} path=${onPath ? "cap" : "other"} auth=${hadAuth ? "y" : "n"} → ${res.statusCode} ua="${ua}"`,
+        );
+      });
       // Crawl posture (owner ask): every response — 404s and MCP alike —
       // carries noindex; headers set before the SDK writes merge into its
       // response. Real invisibility is the uniform 404; this is belt.
