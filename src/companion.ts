@@ -550,6 +550,10 @@ export function startCompanionServer(opts: {
                 laneOk: lane ? Boolean(lane.ok) : null,
                 lanePeer: lane && typeof lane.bot === "string" ? lane.bot : null,
                 lanePending: lane ? Number(lane.pending ?? 0) : 0,
+                // Peer's last-run time, relayed by the watcher's lane heartbeat
+                // (multi-machine prompts phase 0): additive, null-honest.
+                lanePeerLastRunAt:
+                  lane && typeof lane.peerLastRunAt === "string" ? lane.peerLastRunAt : null,
                 lastRunAt: typeof raw.last_run_at === "string" ? raw.last_run_at : null,
                 updated: typeof raw.updated === "string" ? raw.updated : null,
                 stale: !(ageMs === ageMs && ageMs < 300_000), // NaN (no timestamp) or >5min → stale
