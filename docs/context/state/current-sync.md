@@ -18,5 +18,6 @@ cache-stability corollary. Keep it tiny.
   quarantine gate, cwd containment, sweepMissedRange, monotonic cursors,
   atomic config + deaf-not-dead boot; reload residual 6e64b85). Fork-2's
   7 findings shipped 57fd25d.
-- Peer owes: 16af9e1 pickup (shared files, plain merge). After that the
-  forks converge at 119/119 with zero open audit items.
+- Pickup done: 16af9e1 (our d28cce9) + 11f7ad3 (merge 0fd5217, plain,
+  cited SHA only — fork main runs ahead at 9f5af5a phone FIND port, not
+  yet tasked). Forks converged at 119/119, zero open audit items.
