@@ -132,6 +132,10 @@ function cmdServe(): void {
   const { close } = startBotlinkServer({
     listen: { host: host || "127.0.0.1", port: Number(portStr) || PORT_DEFAULT },
     hostKeyPem: fs.readFileSync(hostKeyPath, "utf8"),
+    // Rotation hot-reload: the daemon serves whatever the confirmed ceremony
+    // committed to this path — a phone-confirmed rotation takes effect with
+    // no process restart (owner 2026-10-04, "confirm and it keeps going").
+    hostKeyPath,
     authorizedPublicKeys: fs
       .readFileSync(authorizedPath, "utf8")
       .split(/\r?\n/)
@@ -309,6 +313,11 @@ async function cmdPair(args: string[]): Promise<void> {
         console.error("\n" + renderTapBlock(s, sas) + "\n");
         console.error("Exchange complete. Compare the two owners' SAS values, then run:");
         console.error("  npm run botlink -- pair --confirm        (each owner, locally)");
+        // Machine-readable event for a driving bot (owner-asked rotations,
+        // 2026-10-04): the human's ONLY surface is the phone app. The SAS is
+        // deliberately ABSENT — display-only by law; the bot must never
+        // relay it, the phone shows it.
+        if (args.includes("--json")) console.log(JSON.stringify({ event: "exchanged", mode: s.mode }));
         clearTimeout(ttl);
         setTimeout(() => process.exit(0), 250);
       },
@@ -318,6 +327,7 @@ async function cmdPair(args: string[]): Promise<void> {
       clearPairingState(p);
       listener.close();
       console.error(`botlink-server pair: TTL ${PAIRING_TTL_MS / 60000}min expired — state cleared, nothing written.`);
+      if (args.includes("--json")) console.log(JSON.stringify({ event: "expired" }));
       process.exit(1);
     }, PAIRING_TTL_MS);
     console.error(
@@ -325,6 +335,19 @@ async function cmdPair(args: string[]): Promise<void> {
         `The PEER runs:  npm run botlink -- pair --dial <this-host>:${listener.port}\n` +
         `Already-paired boxes: this is also how a rotation starts (--rotate).`,
     );
+    // stdout stays machine-readable with --json: a gateway bot spawns this
+    // detached and reads events off stdout (stderr keeps the human prose).
+    if (args.includes("--json")) {
+      console.log(
+        JSON.stringify({
+          event: "armed",
+          mode,
+          bind,
+          port: listener.port,
+          expires_at: new Date(Date.now() + PAIRING_TTL_MS).toISOString(),
+        }),
+      );
+    }
     setInterval(() => void 0, 1 << 30); // stay up like serve
     return;
   }
@@ -363,6 +386,8 @@ async function cmdPair(args: string[]): Promise<void> {
       console.error("\n" + renderTapBlock(done, sas) + "\n");
       console.error("Exchange complete. Compare the two owners' SAS values, then run:");
       console.error("  npm run botlink -- pair --confirm        (each owner, locally)");
+      // Same event stream as --arm --json (SAS stays display-only).
+      if (args.includes("--json")) console.log(JSON.stringify({ event: "exchanged", mode }));
     } catch (err) {
       console.error(`botlink-server pair: dial failed — ${(err as Error).message}`);
       console.error("Nothing was written; arm again if the TTL lapsed.");

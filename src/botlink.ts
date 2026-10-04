@@ -431,6 +431,16 @@ export interface BotlinkServerOptions {
    *  first time its REPLACEMENT key authenticates successfully, and sweeps
    *  stale grace lines at boot. Unset = legacy behavior (lines are static). */
   authorizedKeysPath?: string;
+  /** Rotation hot-reload (owner 2026-10-04, "confirm and it keeps going"):
+   *  with the host-key PATH set, the daemon mtime-polls the key files and,
+   *  when a confirmed rotation cutover rewrites them, serves the NEW host
+   *  key and re-parses authorized_keys in place — rebuild the SSH listener,
+   *  never restart the process. A partial/garbage rewrite is skipped (the
+   *  previous key keeps serving; the next poll retries). Unset = serve the
+   *  constructor's keys for the process lifetime (legacy behavior). */
+  hostKeyPath?: string;
+  /** Poll cadence for the hot-reload check (default 5s; tests tighten it). */
+  keyReloadIntervalMs?: number;
   log?: (line: string) => void;
 }
 
@@ -449,7 +459,7 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
   let liveConnections = 0;
   fs.mkdirSync(opts.spoolDir, { recursive: true });
 
-  const allowedKeys = opts.authorizedPublicKeys.map((line) => parseKey(line));
+  let allowedKeys = opts.authorizedPublicKeys.map((line) => parseKey(line));
   // Zero authorized keys = the lane is UP but trusts nobody (every auth is
   // refused). That's better ops than refusing to boot: the daemon comes up
   // before the peer's key has been exchanged, and self-tests still work.
@@ -512,8 +522,13 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
     }
   };
 
-  const server = new SshServer(
-    { hostKeys: [opts.hostKeyPem], ident: "clankerchat-botlink" },
+  // Rotation hot-reload target: the ssh2 server fixes its host key at
+  // construction, so serving a rotated key means building a new server on
+  // the same port. The handler body stays one closure — allowedKeys is a
+  // mutable binding refreshed by the reload path below.
+  const newServer = (hostKeyPem: string) =>
+    new SshServer(
+    { hostKeys: [hostKeyPem], ident: "clankerchat-botlink" },
     (conn, info) => {
       // info.ip's shape varies across ssh2 versions (string remoteAddress vs
       // [addr, family]) — accept either, never index a string by accident.
@@ -794,23 +809,106 @@ export function startBotlinkServer(opts: BotlinkServerOptions): { close: () => v
       });
       conn.on("error", (err) => log(`botlink: connection error from ${peerIp}: ${err.message}`));
     },
-  );
+    );
+  let server = newServer(opts.hostKeyPem);
   // Listen (port 0 = ephemeral) and surface the REAL bound port once the
   // listener is up, so tests and callers can connect without racing.
+  let boundPort = opts.listen.port;
   const listening = new Promise<void>((resolve, reject) => {
     server.once("listening", resolve);
     server.once("error", reject);
   });
   server.listen(opts.listen.port, opts.listen.host);
   const handle = {
-    close: () => server.close(),
+    close: () => {
+      if (reloadTimer) clearInterval(reloadTimer);
+      server.close();
+    },
     port: opts.listen.port,
     listening: listening.then(() => {
       const addr = server.address();
       handle.port = typeof addr === "object" && addr ? addr.port : handle.port;
+      boundPort = handle.port;
       log(`botlink: listening on ${opts.listen.host}:${handle.port} as "${opts.botName}" (${allowedKeys.length} peer key(s))`);
     }),
   };
+
+  // --- rotation hot-reload (owner 2026-10-04) -----------------------------
+  // The pairing confirm commits new key FILES; ssh2 fixed its host key at
+  // construction, so a running daemon would keep presenting the OLD key
+  // until a process restart. With hostKeyPath set, mtime-poll the files:
+  // authorized_keys-only change → re-parse the peer list in place; host-key
+  // change → validate the new PEM, build a fresh server on the same port,
+  // stop the old listener (established connections drain naturally —
+  // clients dial fresh per verb). A garbage/partial write skips the swap
+  // and retries on the next poll; the lane never wedges on a torn file.
+  const reloadPaths = [opts.hostKeyPath, opts.authorizedKeysPath].filter(
+    (p): p is string => typeof p === "string",
+  );
+  let lastMt = new Map<string, number>();
+  const snapshotMt = () => {
+    for (const p of reloadPaths) {
+      try {
+        lastMt.set(p, fs.statSync(p).mtimeMs);
+      } catch {
+        lastMt.set(p, -1);
+      }
+    }
+  };
+  const parseAuthorizedLines = (file: string) =>
+    fs
+      .readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith("#"))
+      .map((line) => parseKey(line));
+  const checkKeyFiles = () => {
+    let hostChanged = false;
+    let authChanged = false;
+    for (const p of reloadPaths) {
+      let m: number;
+      try {
+        m = fs.statSync(p).mtimeMs;
+      } catch {
+        m = -1;
+      }
+      if (m !== (lastMt.get(p) ?? -1)) {
+        if (p === opts.hostKeyPath) hostChanged = true;
+        else authChanged = true;
+        lastMt.set(p, m);
+      }
+    }
+    if (!hostChanged && !authChanged) return;
+    if (!hostChanged) {
+      try {
+        allowedKeys = parseAuthorizedLines(opts.authorizedKeysPath!);
+        log(`botlink: authorized_keys changed on disk — serving ${allowedKeys.length} peer key(s), no restart`);
+      } catch (err) {
+        log(`botlink: authorized_keys reload failed: ${(err as Error).message} — keeping the previous list`);
+      }
+      return;
+    }
+    try {
+      const pem = fs.readFileSync(opts.hostKeyPath!, "utf8");
+      parseKey(pem); // validate BEFORE swapping — a torn write never takes the lane down
+      if (opts.authorizedKeysPath) allowedKeys = parseAuthorizedLines(opts.authorizedKeysPath);
+      const old = server;
+      server = newServer(pem);
+      server.listen(boundPort, opts.listen.host);
+      old.close();
+      log("botlink: host key file changed — serving the rotated key (listener rebuilt, no process restart)");
+    } catch (err) {
+      log(`botlink: host-key reload failed: ${(err as Error).message} — still serving the previous key`);
+    }
+  };
+  snapshotMt();
+  let reloadTimer: NodeJS.Timeout | null = null;
+  if (reloadPaths.length > 0) {
+    // Either key surface being path-backed enables the watch — an
+    // authorized_keys-only config (no hostKeyPath) still refreshes peers.
+    reloadTimer = setInterval(checkKeyFiles, opts.keyReloadIntervalMs ?? 5_000);
+    reloadTimer.unref?.();
+  }
   return handle;
 }
 
@@ -824,6 +922,48 @@ export interface BotlinkPeer {
   username?: string; // default "clanker"
   privateKeyPem: string; // this bot's dedicated key
   expectedHostKey: string; // pinned: fingerprint (SHA256:…) or full public line — REQUIRED
+}
+
+/** First non-comment, non-empty line of a peer.hostkey pin file, or
+ *  undefined. The file is written ONLY by the pairing ceremony (CLI confirm
+ *  or phone Allow) — it is SAS-verified human output, never agent-writable
+ *  config. */
+export function readPinnedHostkey(file: string): string | undefined {
+  try {
+    const line = fs
+      .readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.length > 0 && !l.startsWith("#"));
+    return line;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Client config resolution, rotation-ready (owner 2026-10-04: a confirmed
+ *  rotation must reach RUNNING MCP servers without a session restart):
+ *  pin + private key are read from disk per call, never cached at process
+ *  start. Pin precedence: the ceremony's botlink-keys/peer.hostkey file
+ *  WINS over CLANKER_BOTLINK_PEER_HOSTKEY env — the file updates at every
+ *  confirm while env is a static bootstrap fallback that would silently go
+ *  stale. Returns null when the lane isn't configured. */
+export function resolveBotlinkPeerFromEnv(
+  env: { CLANKER_BOTLINK_PEER?: string; CLANKER_BOTLINK_KEY?: string; CLANKER_BOTLINK_PEER_HOSTKEY?: string; CLANKER_BOTLINK_USER?: string },
+  projectRoot: string,
+): BotlinkPeer | null {
+  const peer = env.CLANKER_BOTLINK_PEER;
+  const keyPath = env.CLANKER_BOTLINK_KEY;
+  const hostKey = readPinnedHostkey(path.join(projectRoot, "botlink-keys", "peer.hostkey")) ?? env.CLANKER_BOTLINK_PEER_HOSTKEY?.trim();
+  if (!peer || !keyPath || !hostKey) return null;
+  const [host, portStr] = peer.split(":");
+  return {
+    host,
+    port: portStr ? Number(portStr) : undefined,
+    username: env.CLANKER_BOTLINK_USER,
+    privateKeyPem: fs.readFileSync(path.resolve(keyPath), "utf8"),
+    expectedHostKey: hostKey,
+  };
 }
 
 /** Run one verb against the peer. Resolves with the verb's stdout. */

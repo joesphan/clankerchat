@@ -44,7 +44,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
-import { botlinkRequest, buildFileTransfer, type BotlinkPeer } from "./botlink.js";
+import { botlinkRequest, buildFileTransfer, resolveBotlinkPeerFromEnv, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "./leaks.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
@@ -865,44 +865,24 @@ function registerTools(server: McpServer): void {
   // receiving machine applies its own untrusted-input scrutiny.
   // -------------------------------------------------------------------------
 
-  const botlinkPeer = (() => {
-    const peer = process.env.CLANKER_BOTLINK_PEER; // host[:port]
-    const keyPath = process.env.CLANKER_BOTLINK_KEY; // this bot's private key
-    // Pinned peer host-key fingerprint: launch env wins (backward
-    // compatible); otherwise the pin file `pair --confirm` writes
-    // (botlink-keys/peer.hostkey) — that file IS the pairing output.
-    const hostKey =
-      process.env.CLANKER_BOTLINK_PEER_HOSTKEY?.trim() ||
-      (() => {
-        try {
-          const line = fs
-            .readFileSync(path.join(PROJECT_ROOT, "botlink-keys", "peer.hostkey"), "utf8")
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .find((l) => l.length > 0 && !l.startsWith("#"));
-          return line ?? undefined;
-        } catch {
-          return undefined;
-        }
-      })();
-    if (!peer || !keyPath || !hostKey) return null;
-    const [host, portStr] = peer.split(":");
-    return {
-      host,
-      port: portStr ? Number(portStr) : undefined,
-      username: process.env.CLANKER_BOTLINK_USER,
-      privateKeyPem: fs.readFileSync(path.resolve(keyPath), "utf8"),
-      expectedHostKey: hostKey,
-    } satisfies BotlinkPeer;
-  })();
-  const botlinkDisabled = (): string | null => {
-    if (!botlinkPeer) {
-      return (
-        "botlink is not configured on this instance. Set CLANKER_BOTLINK_PEER, " +
-        "CLANKER_BOTLINK_KEY and CLANKER_BOTLINK_PEER_HOSTKEY (see BOTLINK.md)."
-      );
+  // Rotation-ready client resolution (owner 2026-10-04: "confirm and it
+  // keeps going" — a phone-confirmed rotation must reach RUNNING MCP
+  // servers without a session restart). The pin + private key are read
+  // from disk PER VERB, never cached at process start; pin precedence is
+  // ceremony-file-over-env (see resolveBotlinkPeerFromEnv in botlink.ts).
+  const resolveBotlinkPeer = (): BotlinkPeer | null =>
+    resolveBotlinkPeerFromEnv(process.env, PROJECT_ROOT);
+  const botlinkDisabled = (): { msg: string; peer: BotlinkPeer | null } => {
+    const peer = resolveBotlinkPeer();
+    if (!peer) {
+      return {
+        msg:
+          "botlink is not configured on this instance. Set CLANKER_BOTLINK_PEER, " +
+          "CLANKER_BOTLINK_KEY and CLANKER_BOTLINK_PEER_HOSTKEY (see BOTLINK.md).",
+        peer: null,
+      };
     }
-    return null;
+    return { msg: "", peer };
   };
 
   server.registerTool(
@@ -918,9 +898,9 @@ function registerTools(server: McpServer): void {
     },
     () =>
       guard(async () => {
-        const disabled = botlinkDisabled();
-        if (disabled) throw new Error(disabled);
-        const out = await botlinkRequest(botlinkPeer!, "status");
+        const { msg, peer } = botlinkDisabled();
+        if (!peer) throw new Error(msg);
+        const out = await botlinkRequest(peer, "status");
         try {
           return JSON.parse(out);
         } catch {
@@ -960,8 +940,8 @@ function registerTools(server: McpServer): void {
     },
     ({ target, text, thread, task_kind, task_repo, task_branch, task_base, task_commit, task_diff_ref, task_acceptance, task_reply_to, task_correlation, task_deadline_soft, supersedes }) =>
       guard(async () => {
-        const disabled = botlinkDisabled();
-        if (disabled) throw new Error(disabled);
+        const { msg: injectDisabled, peer } = botlinkDisabled();
+        if (!peer) throw new Error(injectDisabled);
         // Quarantine applies to lane traffic too: never name a blocked venue,
         // even as a reply-thread hint for the peer.
         if (thread) assertNotBlocked(thread);
@@ -984,7 +964,7 @@ function registerTools(server: McpServer): void {
               ...(task_deadline_soft ? { deadline_soft: task_deadline_soft } : {}),
             }
           : undefined;
-        const out = await botlinkRequest(botlinkPeer!, "inject", {
+        const out = await botlinkRequest(peer, "inject", {
           source,
           target,
           text,
@@ -1022,8 +1002,8 @@ function registerTools(server: McpServer): void {
     },
     ({ file_path, target, note, thread }) =>
       guard(async () => {
-        const disabled = botlinkDisabled();
-        if (disabled) throw new Error(disabled);
+        const { msg: fileDisabled, peer } = botlinkDisabled();
+        if (!peer) throw new Error(fileDisabled);
         if (thread) assertNotBlocked(thread); // quarantined venues, lane edition
         // Same jail as send attachments: project-mode instances can only
         // ship files from inside their own root ("none" disables entirely).
@@ -1039,7 +1019,7 @@ function registerTools(server: McpServer): void {
           ...(thread ? { thread } : {}),
         });
         if ("error" in built) throw new Error(built.error);
-        const out = await botlinkRequest(botlinkPeer!, "inject", built.payload);
+        const out = await botlinkRequest(peer, "inject", built.payload);
         try {
           return JSON.parse(out);
         } catch {
