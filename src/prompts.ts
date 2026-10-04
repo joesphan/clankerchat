@@ -178,6 +178,29 @@ export function sweepExpiredPrompts(spoolDir: string, now = Date.now()): PromptR
   return swept;
 }
 
+/** An ENQUEUED record whose run never fired its exit hook (queue-overflow
+ *  drop, watcher crash between claim and exit, spawn failure) would hang the
+ *  phone's chip on "running" forever — every other sweep only touches
+ *  PENDING records, so "enqueued" is a one-way door whose only key is a live
+ *  run. RUN_TIMEOUT is 10min; 20min covers queue wait on top. Rotates to
+ *  failed so the phone says "ask again" instead of spinning. */
+export const STUCK_ENQUEUED_MS = 20 * 60 * 1000;
+export function sweepStuckEnqueued(spoolDir: string, now = Date.now()): PromptRecord[] {
+  const swept: PromptRecord[] = [];
+  for (const rec of listPhonePrompts(spoolDir)) {
+    if (rec.status === "enqueued" && (rec.enqueuedAt ?? rec.createdAt) + STUCK_ENQUEUED_MS <= now) {
+      const next: PromptRecord = { ...rec, status: "failed", finishedAt: now, exit: -1 };
+      try {
+        writePrompt(spoolDir, next);
+        swept.push(next);
+      } catch {
+        /* unreadable — next sweep retries */
+      }
+    }
+  }
+  return swept;
+}
+
 /** The phone-facing rendering: the text, the status, the clock, and the
  *  answer preview when there is one. No channel ids, no fingerprints-as-keys
  *  — minimum surface, same law as asks. */

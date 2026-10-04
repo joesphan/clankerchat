@@ -12,6 +12,8 @@ import {
   stampPromptEnqueued,
   finishPrompt,
   sweepExpiredPrompts,
+  sweepStuckEnqueued,
+  STUCK_ENQUEUED_MS,
   renderPromptForApp,
   MAX_EXCERPT_CHARS,
   MAX_PENDING_PROMPTS,
@@ -106,6 +108,29 @@ test("TTL sweep: overdue pending → expired; fresh ones untouched", async () =>
   assert.equal(getPrompt(dir, stale.promptId).status, "expired");
   assert.equal(getPrompt(dir, fresh.promptId).status, "pending");
   assert.deepEqual(listClaimablePrompts(dir).map((r) => r.promptId), [fresh.promptId], "expired never claimable");
+});
+
+test("stuck-enqueued sweep (audit fix 2): orphaned enqueued → failed; fresh enqueued + pending untouched", () => {
+  const dir = tmp();
+  // orphan: claimed but its run never stamped (queue drop / watcher crash
+  // between claim and exit / spawn failure) — age it past the stuck window
+  const orphan = createPhonePrompt(dir, { text: "orphan", fp: "fp" });
+  const claimed = stampPromptEnqueued(dir, orphan.promptId);
+  const doctored = JSON.parse(JSON.stringify(claimed));
+  doctored.enqueuedAt -= STUCK_ENQUEUED_MS + 10;
+  fs.writeFileSync(path.join(dir, "pending-prompts", `${orphan.promptId}.json`), JSON.stringify(doctored));
+  // fresh enqueued (a live run owns it) + plain pending — both must survive
+  const live = createPhonePrompt(dir, { text: "live", fp: "fp" });
+  stampPromptEnqueued(dir, live.promptId);
+  const pending = createPhonePrompt(dir, { text: "pending", fp: "fp" });
+
+  const swept = sweepStuckEnqueued(dir, claimed.enqueuedAt);
+  assert.deepEqual(swept.map((r) => r.promptId), [orphan.promptId]);
+  const rot = getPrompt(dir, orphan.promptId);
+  assert.equal(rot.status, "failed");
+  assert.equal(rot.exit, -1, "exit recorded — the phone can say the run never finished");
+  assert.equal(getPrompt(dir, live.promptId).status, "enqueued");
+  assert.equal(getPrompt(dir, pending.promptId).status, "pending");
 });
 
 test("renderPromptForApp: minimum surface — no fp, no ids beyond the prompt id", () => {
