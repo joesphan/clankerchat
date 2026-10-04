@@ -164,3 +164,12 @@ react-native) — mine them before designing.
   corrected (their emit was machine-local — repo greps can't see it).
   Open: Joe's companion app error ("app has erro" 18:07:48Z class,
   notification issue) — awaiting error text/screenshot paste.
+- [x] **Gemini Spark custom-app gateway (owner 2026-10-04)** — 4e472a8,
+  service clankerchat-spark LIVE on 127.0.0.1:8791 (bearer on, uniform
+  dead-host 404 incl. well-known probes, rate-gated; boot smoke: handshake
+  200 / everything else 404). Tools = phone-app blast radius (ask/result/
+  status/list on the proven prompt-record path, fp spark:<hash-head>).
+  cloudflared 2026.9.3 staged at ~/tools/cloudflared. AWAITING OWNER:
+  domain-on-Cloudflare answer + tunnel-login click + Spark dialog paste
+  (docs/SPARK.md has the runbook). Joe's companion app error: Tyler says
+  working — item closed, no screenshot needed.
