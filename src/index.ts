@@ -125,8 +125,13 @@ async function sendMessage(
     })) as { id: string };
   } catch (err) {
     // failIfNotExists parity: a deleted reply target degrades to a plain send.
+    // The fallback keeps the same explicit allowed_mentions — peer review
+    // (their f624258) flagged this path dropping it.
     if (ref && /10008|Unknown Message/i.test(errTextOf(err))) {
-      return (await api().post(Routes.channelMessages(channelId), { body, files })) as { id: string };
+      return (await api().post(Routes.channelMessages(channelId), {
+        body: { ...body, allowed_mentions: allowedMentions },
+        files,
+      })) as { id: string };
     }
     throw err;
   }
