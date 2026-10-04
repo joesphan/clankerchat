@@ -381,3 +381,39 @@ framing fix would have been dead locally if that step had been skipped).
   drift class on Joe's machine; the fingerprint+idle+exit+Restart=always
   pattern ports as-is (their idle = no active runs + no lane connections
   mid-ceremony).
+
+## Round 14 — boot-replay cursor: the restart dead-window is closed (deployment-side, 2026-10-04)
+
+Class: every watcher restart (manual, round-13 drift revival, crash-revival,
+reboot) has a dead window — RestartSec 5s + boot ~1.5s, longer after crashes —
+where arriving Discord messages were LOST forever. The gateway has no push
+cursor: a tag landing in the gap never triggered, and nobody knew.
+
+- Cursor store: `message-cursors.json` in the spool — per-watched-channel
+  last-seen snowflake, advanced at the TOP of the messageCreate handler
+  BEFORE any gate (a skipped message still counts as delivered — own posts,
+  bot-authored, and webhook skips are identical on replay, so the cursor must
+  move past them or they refetch forever). Atomic tmp+rename write.
+- Boot replay (ready handler, post-slash-registration): channels WITH a
+  cursor get one `fetch({after, limit: 50})`; missed messages re-enter the
+  SAME handler via `client.emit("messageCreate", m)` — gates, quarantine,
+  coalescing, ask idempotence all unchanged. Channels WITHOUT a cursor seed
+  from the newest message with NO back-replay (the round-10 audit-cursor
+  precedent: first contact never back-alerts). Saturated window (50 fetched)
+  logs honestly — older messages are NOT replayed.
+- Scope enumeration matches the live gate exactly: root channel + every
+  thread whose parentId is the root. GOTCHA fixed live: the per-channel
+  `channel.threads.fetchActive()` is unusable under our intents (non-iterable
+  result); `guild.channels.fetchActiveThreads()` + parentId filter is the
+  working shape (11 live threads under #clankerchat, incl. the epicNode
+  thread).
+- Ordering trade-off, stated honestly: cursor persists BEFORE processing
+  completes, so a crash mid-processing loses that one message (at-most-once
+  for in-flight) while the down-window replays (at-least-once for the gap).
+  The reverse order would double-process on every crash — this is the right
+  default.
+- Live-proven: watcher stopped → probe posted 17:14:02Z → boot 17:14:17Z →
+  `boot replay: 1 missed message(s) … re-processing` 17:14:18Z → cursor
+  advanced to the probe id exactly.
+- Peer note: same class on their daemon host — ports as-is (cursor file +
+  fetch-after on ready + emit into the same handler; same fetchActive trap).
