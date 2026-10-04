@@ -1380,7 +1380,7 @@ async function pollOnce(parent: TextChannel | NewsChannel, botUser: User): Promi
 
 /** Last lane probe verdict; null until the first probe resolves (the phone
  * renders that honestly as "lane: not probed yet"). */
-let laneFacts: { ok: boolean; bot: string | null; pending: number } | null = null;
+let laneFacts: { ok: boolean; bot: string | null; pending: number; peerLastRunAt: string | null } | null = null;
 /** ISO time the last dispatched trigger completed (any outcome) — "ran Xm ago". */
 let lastRunAt: string | null = null;
 /** Thread the last dispatched trigger ran in — the status card's "where". */
@@ -1415,15 +1415,22 @@ async function probeLane(): Promise<void> {
   if (!peer) return;
   try {
     const out = await botlinkRequest(peer, "status");
-    const st = JSON.parse(out.trim()) as { ok?: boolean; bot?: string; spool_pending?: number };
+    const st = JSON.parse(out.trim()) as {
+      ok?: boolean;
+      bot?: string;
+      spool_pending?: number;
+      load?: { last_run_at?: unknown };
+    };
     laneFacts = {
       ok: st.ok === true,
       bot: typeof st.bot === "string" ? st.bot : null,
       pending: Number(st.spool_pending ?? 0),
+      // peer's watcher last-run (their load.last_run_at) — machine-card phase 0
+      peerLastRunAt: typeof st.load?.last_run_at === "string" ? st.load.last_run_at : null,
     };
     log(`lane probe: ${laneFacts.bot ?? "peer"} ok=${laneFacts.ok} pending=${laneFacts.pending}`);
   } catch (err) {
-    laneFacts = { ok: false, bot: laneFacts?.bot ?? null, pending: 0 };
+    laneFacts = { ok: false, bot: laneFacts?.bot ?? null, pending: 0, peerLastRunAt: null };
     log(`lane probe failed: ${errText(err)}`);
   }
 }
