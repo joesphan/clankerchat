@@ -30,7 +30,10 @@ export function parseRow(obj) {
   if (!obj || typeof obj !== "object") return null;
   const tsRaw = obj.at ?? obj.ts; // live rows stamp `at`; accept both
   const ts = typeof tsRaw === "string" ? Date.parse(tsRaw) : Number(tsRaw);
-  const q = Number(obj.q_pct);
+  // STRICT: only a real number is a reading. Number(null) === 0, so a failed
+  // provider poll (q_pct:null) beside a successful token scan would otherwise
+  // enter the fit as a fake 0% — a manufactured drain-then-refill pair (r28 H1).
+  const q = typeof obj.q_pct === "number" ? obj.q_pct : NaN;
   const tok = obj.tok && typeof obj.tok === "object" ? obj.tok : null;
   if (!Number.isFinite(ts) || !Number.isFinite(q) || !tok) return null;
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);

@@ -77,6 +77,9 @@ test("describeResetEvent: fired reset classifies emptied vs partial, boot never 
   assert.equal(describeResetEvent(null, snap(3, "b")), null);
   assert.equal(describeResetEvent(snap(46, null), snap(3, "b")), null);
   assert.equal(describeResetEvent({ pct5h: null, resetAt: "a" }, snap(3, "b")), null);
+  // unparseable resetAt (vendor shape drift) = non-event, never a NaN jump (r28 L6)
+  assert.equal(describeResetEvent(snap(46, "2026-10-05T09:10:44.917Z"), snap(3, "not-a-date")), null);
+  assert.equal(describeResetEvent(snap(46, "not-a-date"), snap(3, "2026-10-05T14:10:44.917Z")), null);
 });
 
 test("resetEventLine: facts + quick read, HH:MM Z anchors", () => {
@@ -84,4 +87,7 @@ test("resetEventLine: facts + quick read, HH:MM Z anchors", () => {
   assert.equal(line, "5h window reset 09:10Z→14:10Z (+5.0h): q_pct 46→3 — window emptied (fixed-anchor behavior)");
   const partial = resetEventLine(describeResetEvent({ pct5h: 46, resetAt: "2026-10-05T09:10:44.917Z" }, { pct5h: 38, resetAt: "2026-10-05T14:10:44.917Z" }));
   assert.match(partial, /partial drain \(rolling behavior\)/);
+  // backwards jump prints a clean sign, never "+-0.3h" (r28 L6)
+  const back = resetEventLine(describeResetEvent({ pct5h: 46, resetAt: "2026-10-05T14:10:44.917Z" }, { pct5h: 44, resetAt: "2026-10-05T13:52:44.917Z" }));
+  assert.match(back, /\(-0\.3h\)/);
 });

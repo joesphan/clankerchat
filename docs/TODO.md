@@ -1190,3 +1190,48 @@ Refinements that fall out:
   via spawn ledger into real triggers (owner posts incl. pi4-shim thread,
   ggurov + joesphan prompts, 2 peer status injects) — known-legit class,
   nothing to kill.
+
+## Round 28 — r25-27 audit fixes, Experiment A verdict, lane discipline (2026-10-05, 10:47Z tick)
+
+1. **Audit of the r25-27 arc** (bounded read-only one-shot, detached per the
+   build law): 1 HIGH / 3 MED / 5 LOW. **Fixed this tick**: H1 —
+   `parseRow` read a fail-quiet `q_pct:null` row as a fake 0% (Number(null)===0),
+   injecting a manufactured drain-then-refill pair into the fit; strict
+   typeof guard now. M4 — the PROVISIONAL sign arm and the `--json`
+   `provisional` field had zero test coverage (only the n<10 arm fired in the
+   suite); both pinned, incl. a deterministic negative-weight construction.
+   L6 — unparseable `resetAt` yields `jumpMs:NaN` → now a non-event; backwards
+   jumps print `-0.3h`, never `+-0.3h`. **Filed for continuation**: M2 —
+   `daemon.ts` publishes a nested `token_window` shape while companion
+   consumes the fork watcher's flat shape (live producer is the flat one, so
+   the phone works today; align the daemon or accept-both in companion —
+   bilateral, touches their daemon). M3 — the delta-regression premise
+   (rolling local 5h) is an omitted sign-flipping regressor against the
+   fixed-anchor provider window; restrict fits to intra-anchor spans or clamp
+   the scan window to the last `reset_at` (subsumes the n=30 rerun question —
+   R² fell 0.45→0.229 because post-reset deltas are small and integer-grained;
+   the fit wants mid-window spread). L5 — daemon null-poll overwrites
+   last-good provider_quota while its log says "keeping last-good". L7 — no
+   min-jump gate against a vendor anchor-slide flood (theoretical under
+   fixed-anchor). L8 — substring fast-paths hard-code compact JSON. L9 —
+   per-Mtok column scaling for pivot-test margin at live magnitudes.
+2. **Experiment A (sidechain billing probe)**: one bounded haiku Task agent
+   (1 tool call, ~33.5k tok) at 10:55Z; rows 11:02Z/11:12Z show
+   `side_msgs`/`side_in` still 0 and the haiku models entry aged out
+   unchanged. Verdict: **Task-subagent transcripts live under the session
+   task dir (`/tmp/claude-1000/…/tasks/`), not `~/.claude/projects/` —
+   promptmeter structurally cannot see them; the sidechain split is dead code
+   as-built** (honestly zero until the meter walks task dirs). The provider
+   billed the agent regardless (q_pct 15→19 over the interval, confounded by
+   concurrent lanes — no per-class attribution possible from this n).
+3. **Lane discipline incident (10:58Z→11:20Z)**: a gateway correction
+   carrying epicEFI/shim facts went out over the clankerchat lane WITHOUT
+   naming the repo; the peer's gateway correctly verified the SHAs against
+   joesphan/clankerchat, found nothing, and flagged "divergent origin".
+   Orchestrator forensics nailed it: composition garble, not divergence
+   (cd6733c was the peer's own epicEFI/shim figure from their 08:53Z inject;
+   "df10ba" an inject-id suffix misparsed as a SHA). Retraction +
+   repo-qualified correction sent (inject 1791198910886-c5245f); both sides
+   confirmed at e763ed9, zero tree diff. Standing law (gateway memory):
+   every SHA in lane text is repo-qualified, every fact names its repo,
+   inject-id suffixes never appear bare.

@@ -113,13 +113,17 @@ export function describeResetEvent(prev: QuotaSnapshot | null, next: QuotaSnapsh
   if (!prev || !next) return null;
   if (typeof prev.pct5h !== "number" || typeof next.pct5h !== "number") return null;
   if (!prev.resetAt || !next.resetAt || prev.resetAt === next.resetAt) return null;
+  const jumpMs = Date.parse(next.resetAt) - Date.parse(prev.resetAt);
+  // An unparseable resetAt string (vendor shape drift) is a non-event, not a
+  // NaN jump that reaches the journal as "+NaNh" (r28 L6).
+  if (!Number.isFinite(jumpMs)) return null;
   return {
     oldPct: prev.pct5h,
     newPct: next.pct5h,
     drainPts: prev.pct5h - next.pct5h,
     oldResetAt: prev.resetAt,
     newResetAt: next.resetAt,
-    jumpMs: Date.parse(next.resetAt) - Date.parse(prev.resetAt),
+    jumpMs,
     verdict: next.pct5h <= 5 ? "emptied" : "partial",
   };
 }
@@ -129,7 +133,7 @@ export function describeResetEvent(prev: QuotaSnapshot | null, next: QuotaSnapsh
 export function resetEventLine(e: ResetEvent): string {
   const h = (iso: string) => `${iso.slice(11, 16)}Z`;
   return (
-    `5h window reset ${h(e.oldResetAt)}→${h(e.newResetAt)} (+${(e.jumpMs / 3_600_000).toFixed(1)}h): ` +
+    `5h window reset ${h(e.oldResetAt)}→${h(e.newResetAt)} (${e.jumpMs >= 0 ? "+" : ""}${(e.jumpMs / 3_600_000).toFixed(1)}h): ` +
     `q_pct ${Math.round(e.oldPct)}→${Math.round(e.newPct)} — ` +
     (e.verdict === "emptied" ? "window emptied (fixed-anchor behavior)" : "partial drain (rolling behavior)")
   );
