@@ -67,6 +67,28 @@ export function pairDeltas(rows) {
   return pairs;
 }
 
+/** Split rows into fixed-anchor spans: a break wherever reset_at CHANGES
+ *  between consecutive rows — the same `a.resetAt !== b.resetAt` boundary
+ *  pairDeltas flags isReset, nulls included (a null resetAt row can't be
+ *  paired across a boundary, so it splits off as a singleton and drops out
+ *  of fitting exactly as the old isReset exclusion dropped it). Within a span
+ *  the provider window is constant, so local deltas are pure burn — the
+ *  rolling-scan vs fixed-window mismatch never crosses a span (r28 M3).
+ *  Newest span is LAST. */
+export function splitSpans(rows) {
+  const spans = [];
+  let cur = [];
+  for (const r of rows) {
+    if (cur.length && cur[cur.length - 1].resetAt !== r.resetAt) {
+      spans.push(cur);
+      cur = [];
+    }
+    cur.push(r);
+  }
+  if (cur.length) spans.push(cur);
+  return spans;
+}
+
 /** Least squares y ~ 1 + x1..xn via normal equations + Gaussian elimination
  *  with partial pivoting. Returns {beta: [b0..bn], r2, n}. */
 export function lstsq(X, y) {
@@ -144,15 +166,9 @@ export function fitHypothesis(pairs, crMult) {
 
 const fmtCap = (cap) => (cap === null ? "n/a" : `${(cap / 1e6).toFixed(1)}M credits/5h (1 credit = 1 fresh-input tok)`);
 
-export function formatReport(rows, pairs, freeFit, hyps) {
+/** The fit block shared by every renderer (single-span report + span sections). */
+function fitBlock(freeFit, hyps) {
   const lines = [];
-  const first = rows[0];
-  const last = rows[rows.length - 1];
-  lines.push(`quota-fit — ${rows.length} rows, ${new Date(first.ts).toISOString()} → ${new Date(last.ts).toISOString()}`);
-  lines.push(`  steady pairs: ${pairs.filter((p) => !p.isReset).length}, reset pairs (excluded from fit): ${pairs.filter((p) => p.isReset).length}`);
-  for (const p of pairs.filter((x) => x.isReset)) {
-    lines.push(`  RESET EVENT ${p.dtMin.toFixed(0)}min: Δq ${(p.dq * 100).toFixed(0)}pts — window drained (natural experiment; needs both machines idle to read as a cap measurement)`);
-  }
   if (freeFit) {
     const [, bIn, bOut, bCr] = freeFit.beta;
     const unstable = bIn <= 0 || bOut <= 0 || bCr <= 0;
@@ -172,7 +188,50 @@ export function formatReport(rows, pairs, freeFit, hyps) {
     if (!h) continue;
     lines.push(`hypothesis cache=${h.crMult}×input: R²=${h.r2 === null ? "n/a" : h.r2.toFixed(3)} → CAP ${fmtCap(h.impliedCap)}`);
   }
+  return lines;
+}
+
+export function formatReport(rows, pairs, freeFit, hyps) {
+  const lines = [];
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  lines.push(`quota-fit — ${rows.length} rows, ${new Date(first.ts).toISOString()} → ${new Date(last.ts).toISOString()}`);
+  lines.push(`  steady pairs: ${pairs.filter((p) => !p.isReset).length}, reset pairs (excluded from fit): ${pairs.filter((p) => p.isReset).length}`);
+  for (const p of pairs.filter((x) => x.isReset)) {
+    lines.push(`  RESET EVENT ${p.dtMin.toFixed(0)}min: Δq ${(p.dq * 100).toFixed(0)}pts — window drained (natural experiment; needs both machines idle to read as a cap measurement)`);
+  }
+  lines.push(...fitBlock(freeFit, hyps));
   lines.push(`caveats: q_pct integer-grained (±0.5pt/row); peer machine's burn rides the intercept only while roughly constant; cc=0 on this backend (dropped).`);
+  return lines.join("\n");
+}
+
+/** Span-aware report (r28 M3): the headline is the NEWEST anchor window; older
+ *  spans get one summary line each. Reset events still come from the global
+ *  pair walk — spans never fabricate or hide them. */
+export function formatSpansReport(rows, globalPairs, spanResults) {
+  const lines = [];
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  const steady = globalPairs.filter((p) => !p.isReset).length;
+  lines.push(`quota-fit — ${rows.length} rows, ${new Date(first.ts).toISOString()} → ${new Date(last.ts).toISOString()}, ${spanResults.length} anchor window(s)`);
+  lines.push(`  steady pairs: ${steady}, reset pairs (span boundaries): ${globalPairs.filter((p) => p.isReset).length}`);
+  for (const p of globalPairs.filter((x) => x.isReset)) {
+    lines.push(`  RESET EVENT ${p.dtMin.toFixed(0)}min: Δq ${(p.dq * 100).toFixed(0)}pts — window drained (natural experiment; needs both machines idle to read as a cap measurement)`);
+  }
+  const newest = spanResults[spanResults.length - 1];
+  const spanLabel = (sp) => {
+    const a = new Date(sp.rows[0].ts).toISOString().slice(11, 16);
+    const b = new Date(sp.rows[sp.rows.length - 1].ts).toISOString().slice(11, 16);
+    return `${a}Z→${b}Z (anchor ${sp.rows[0].resetAt ? new Date(sp.rows[0].resetAt).toISOString().slice(11, 16) + "Z" : "?"}, ${sp.steadyPairs} pairs)`;
+  };
+  lines.push(`latest anchor window ${spanLabel(newest)}:`);
+  lines.push(...fitBlock(newest.freeFit, newest.hyps).map((l) => (l.startsWith("caveats") ? l : `  ${l}`)));
+  for (const sp of spanResults.slice(0, -1).reverse()) {
+    const f = sp.freeFit;
+    const label = f ? (f.n < 10 || f.beta.slice(1).some((b) => b <= 0) ? "PROVISIONAL" : "quotable") : "insufficient";
+    lines.push(`earlier window ${spanLabel(sp)}: ${label}${f && f.r2 !== null ? `, R²=${f.r2.toFixed(3)}, k_out=${(f.beta[2] * 1e6 * 100).toFixed(3)} pts/Mtok, n=${f.n}` : ""}`);
+  }
+  lines.push(`caveats: fits are INTRA-ANCHOR (r28 M3 — the local rolling scan never crosses a span boundary into the fit); q_pct integer-grained (±0.5pt/row); peer machine's burn rides the intercept only while roughly constant; cc=0 on this backend (dropped).`);
   return lines.join("\n");
 }
 
@@ -209,28 +268,51 @@ export function main(argv) {
     console.error(`quota-fit: ${rows.length} usable rows — need ≥2`);
     process.exit(1);
   }
-  const pairs = pairDeltas(rows);
-  const freeFit = fitFreeWeights(pairs);
-  const hyps = [fitHypothesis(pairs, 0), fitHypothesis(pairs, 0.1), fitHypothesis(pairs, 0.25)];
+  const globalPairs = pairDeltas(rows);
+  // r28 M3: fit per fixed-anchor span — inside a span the provider window is
+  // constant, so local deltas are pure burn; the rolling-scan mismatch never
+  // crosses a boundary into the fit.
+  const spanResults = splitSpans(rows)
+    .filter((sp) => sp.length >= 2) // singletons (e.g. a null-reset row) can't pair
+    .map((sp) => {
+    const pairs = pairDeltas(sp); // same-anchor rows: no reset pairs inside
+    return {
+      rows: sp,
+      steadyPairs: pairs.filter((p) => !p.isReset).length,
+      freeFit: fitFreeWeights(pairs),
+      hyps: [fitHypothesis(pairs, 0), fitHypothesis(pairs, 0.1), fitHypothesis(pairs, 0.25)],
+    };
+  });
+  const newest = spanResults[spanResults.length - 1];
   if (asJson) {
     // machine-readable: same numbers the report prints, for tick scripts and
-    // briefs — nothing derived here that the text path doesn't show.
+    // briefs — nothing derived here that the text path doesn't show. Top-level
+    // fields describe the NEWEST span; `spans` carries the rest.
     console.log(
       JSON.stringify({
         rows: rows.length,
         span: { from: new Date(rows[0].ts).toISOString(), to: new Date(rows[rows.length - 1].ts).toISOString() },
-        steadyPairs: pairs.filter((p) => !p.isReset).length,
-        resetPairs: pairs.filter((p) => p.isReset).length,
-        provisional: !freeFit || freeFit.n < 10 || freeFit.beta.slice(1).some((b) => b <= 0),
-        free: freeFit
-          ? { kIn: freeFit.beta[1], kOut: freeFit.beta[2], kCr: freeFit.beta[3], intercept: freeFit.beta[0], r2: freeFit.r2, n: freeFit.n }
+        steadyPairs: newest.steadyPairs,
+        resetPairs: globalPairs.filter((p) => p.isReset).length,
+        provisional: !newest.freeFit || newest.freeFit.n < 10 || newest.freeFit.beta.slice(1).some((b) => b <= 0),
+        free: newest.freeFit
+          ? { kIn: newest.freeFit.beta[1], kOut: newest.freeFit.beta[2], kCr: newest.freeFit.beta[3], intercept: newest.freeFit.beta[0], r2: newest.freeFit.r2, n: newest.freeFit.n }
           : null,
-        hypotheses: hyps.map((h) => (h ? { crMult: h.crMult, kIn: h.kIn, r2: h.r2, impliedCap: h.impliedCap } : null)),
+        hypotheses: newest.hyps.map((h) => (h ? { crMult: h.crMult, kIn: h.kIn, r2: h.r2, impliedCap: h.impliedCap } : null)),
+        spans: spanResults.map((sp) => ({
+          from: new Date(sp.rows[0].ts).toISOString(),
+          to: new Date(sp.rows[sp.rows.length - 1].ts).toISOString(),
+          steadyPairs: sp.steadyPairs,
+          provisional: !sp.freeFit || sp.freeFit.n < 10 || sp.freeFit.beta.slice(1).some((b) => b <= 0),
+          free: sp.freeFit
+            ? { kIn: sp.freeFit.beta[1], kOut: sp.freeFit.beta[2], kCr: sp.freeFit.beta[3], intercept: sp.freeFit.beta[0], r2: sp.freeFit.r2, n: sp.freeFit.n }
+            : null,
+        })),
       }),
     );
     return;
   }
-  console.log(formatReport(rows, pairs, freeFit, hyps));
+  console.log(formatSpansReport(rows, globalPairs, spanResults));
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
