@@ -76,6 +76,11 @@ export interface PromptMeterOptions {
   topN?: number;
   /** Override clock for tests. */
   now?: number;
+  /** Explicit window START (epoch ms), clamping `now - windowMs` — the
+   *  anchor-clamp (r28e): the provider's q_pct measures burn since the fixed
+   *  window anchor, so a calibration row's local sums must scan from the SAME
+   *  anchor or within-span deltas carry an aged-out pre-anchor term. */
+  since?: number;
 }
 
 /** Human-readable one-liner for status cards: "prompts 87/1600 (5%) · 17/hr · +1@02:15Z". */
@@ -310,7 +315,7 @@ export async function scanTokenUsage(opts: PromptMeterOptions = {}): Promise<Tok
   const windowMs = opts.windowMs ?? 5 * 3600 * 1000;
   const topN = opts.topN ?? 6;
   const root = opts.projectsRoot ?? path.join(process.env.HOME ?? "/home/tyler", ".claude", "projects");
-  const since = now - windowMs;
+  const since = opts.since ?? now - windowMs; // anchor-clamp (r28e) when given
 
   const mainline = emptySums();
   const sidechain = emptySums();

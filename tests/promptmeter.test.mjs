@@ -179,6 +179,28 @@ test("token meter: per-class sums, model split, sidechain split, window filter (
   assert.equal(t.byModel[1].sums.output, 20);
 });
 
+test("token meter: since clamp aligns the local window to the provider anchor (r28e)", async () => {
+  // Fixed-anchor law (two live fires): provider q_pct measures burn since the
+  // window anchor, while the default local scan ages over a rolling 5h — the
+  // mismatch that destabilized the midday span fit. A since= ANCHOR scan must
+  // drop burn that is inside the rolling 5h but BEFORE the anchor, and keep
+  // everything after it.
+  const root = tmpRoot();
+  const ANCHOR = Date.parse("2026-10-05T02:15:00Z"); // between IN and POST, inside the default 5h window (23:30Z cutoff)
+  const POST = "2026-10-05T02:30:00Z"; // after the anchor
+  writeProj(root, "-clamp", {
+    "a.jsonl": [
+      usageLine(IN, { input_tokens: 1000 }), // rolling-window yes, anchor-clamped NO
+      usageLine(POST, { input_tokens: 400 }),
+    ],
+  });
+  const rolling = await scanTokenUsage({ projectsRoot: root, now: NOW });
+  assert.equal(rolling.total.input, 1400, "default window sees both");
+  const clamped = await scanTokenUsage({ projectsRoot: root, now: NOW, since: ANCHOR });
+  assert.equal(clamped.total.input, 400, "pre-anchor burn aged out by the clamp");
+  assert.equal(clamped.total.messages, 1);
+});
+
 test("token meter: empty/missing root and mtime-stale files degrade to zeros", async () => {
   const t1 = await scanTokenUsage({ projectsRoot: "/nonexistent/definitely", now: NOW });
   assert.equal(t1.total.messages, 0);
