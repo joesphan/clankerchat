@@ -198,3 +198,47 @@ test("record caps oversized fields instead of throwing", () => {
   assert.equal(row.authorName.length, 100);
   mc.close();
 });
+
+test("established: empty channel false; rows true; boot-seed floor alone true (audit r22/F1 gate)", () => {
+  const { db } = tmpDb();
+  const mc = openMsgCache(db);
+  assert.equal(mc.established("1"), false, "nothing recorded, no floor → a lone MCP record would fabricate coverage");
+  mc.record(rec({ id: "100000000000000001" }));
+  assert.equal(mc.established("1"), true, "feed-written row = coverage established");
+  // Boot-seed shape: the watcher sets a floor with NO back-replay — a
+  // channel whose first cached message is still in flight. An MCP own-post
+  // above that floor is legitimately contiguous.
+  mc.setFloor("2", "100000000000000005");
+  assert.equal(mc.established("2"), true, "floor alone = seeded coverage");
+  assert.equal(mc.established("3"), false);
+  mc.close();
+});
+
+test("purgeChannel removes only that channel's rows and reports the count (audit r22/F5b)", () => {
+  const { db } = tmpDb();
+  const mc = openMsgCache(db);
+  mc.record(rec({ id: "100000000000000001", channelId: "A", content: "a1" }));
+  mc.record(rec({ id: "100000000000000002", channelId: "A", content: "a2" }));
+  mc.record(rec({ id: "100000000000000003", channelId: "B", content: "b1" }));
+  assert.equal(mc.purgeChannel("A"), 2);
+  assert.deepEqual(mc.list("A", undefined, 10), []);
+  assert.deepEqual(mc.list("B", undefined, 10).map((m) => m.content), ["b1"]);
+  assert.equal(mc.purgeChannel("A"), 0, "idempotent");
+  mc.close();
+});
+
+test("search channelIds filter scopes an unlocked sweep to the allowlist (audit r22/F3)", () => {
+  const { db } = tmpDb();
+  const mc = openMsgCache(db);
+  mc.record(rec({ id: "100000000000000001", channelId: "shim", content: "deploy in shim" }));
+  mc.record(rec({ id: "100000000000000002", channelId: "epic", content: "deploy in epic" }));
+  mc.record(rec({ id: "100000000000000003", channelId: "root", content: "deploy in root" }));
+  assert.equal(mc.search({ text: "deploy", channelIds: ["shim"] }).length, 1);
+  assert.deepEqual(
+    mc.search({ text: "deploy", channelIds: ["shim", "root"] }).map((m) => m.channelId).sort(),
+    ["root", "shim"],
+  );
+  assert.equal(mc.search({ text: "deploy", channelIds: ["shim"], channelId: "epic" }).length, 0, "explicit channel wins over the set");
+  assert.equal(mc.search({ text: "deploy", channelIds: [] }).length, 3, "empty set = no filter (defensive; callers refuse first)");
+  mc.close();
+});

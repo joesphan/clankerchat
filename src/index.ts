@@ -736,15 +736,24 @@ function registerTools(server: McpServer): void {
         // the watcher's copy is the only complete writer.
         if (!attachment) {
           try {
-            msgCache()?.record({
-              id: sent.id,
-              channelId: id,
-              authorId: await botUserId(),
-              authorName: process.env.CLANKER_NAME ?? "clankerchat",
-              isBot: true,
-              createdAtMs: Date.now(),
-              content,
-            });
+            const mc = msgCache();
+            // Audit r22/F1: record ONLY where the gateway feed has already
+            // established coverage. A lone row from this process in a channel
+            // the feed doesn't cover (a DM, a foreign channel) would set
+            // MIN(cached id) to our own post and every later "covered" read
+            // would return only our messages — the human's replies would be
+            // silently invisible until the 14-day prune.
+            if (mc?.established(id)) {
+              mc.record({
+                id: sent.id,
+                channelId: id,
+                authorId: await botUserId(),
+                authorName: process.env.CLANKER_NAME ?? "clankerchat",
+                isBot: true,
+                createdAtMs: Date.now(),
+                content,
+              });
+            }
           } catch {
             /* cache is an optimization, never a dependency */
           }
@@ -864,7 +873,22 @@ function registerTools(server: McpServer): void {
         // Same absolute quarantine as read/send targets: a blocked channel
         // id must never resolve content here either, even though blocked
         // content never enters the cache by construction (writer gates).
-        if (channel_id) assertNotBlocked(channel_id);
+        if (channel_id) {
+          assertNotBlocked(channel_id);
+          // Audit r22/F3: search must inherit the read/send funnel law —
+          // a locked instance never resolves a thread outside its pins,
+          // explicitly named or not.
+          assertThreadAllowed(channel_id);
+        }
+        // And an UNPINNED search on a locked instance must not sweep the
+        // shared cache across every other project's threads — scope it to
+        // the allowlist (empty allowlist refuses, mirroring every target).
+        const scoped = projectMode() ? allowedThreadIds() : undefined;
+        if (scoped && scoped.length === 0) {
+          throw new Error(
+            "clankerchat is locked (CLANKER_ROLE=project) but CLANKER_ALLOWED_THREADS is empty — refusing every target.",
+          );
+        }
         const mc = msgCache();
         if (!mc) {
           return {
@@ -878,6 +902,7 @@ function registerTools(server: McpServer): void {
         const rows = mc.search({
           text: q,
           ...(channel_id ? { channelId: channel_id } : {}),
+          ...(scoped ? { channelIds: scoped } : {}),
           sinceMs,
           ...(limit ? { limit } : {}),
         });
