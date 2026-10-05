@@ -1235,3 +1235,25 @@ Refinements that fall out:
    confirmed at e763ed9, zero tree diff. Standing law (gateway memory):
    every SHA in lane text is repo-qualified, every fact names its repo,
    inject-id suffixes never appear bare.
+
+### Round 28d (2026-10-05 13:35–14:00Z) — L7 + L8 closed, 255/255
+
+Audit arc status: **H1, M3, M4, L5, L6, L9 closed** (r28/r28b/r28c); **L7+L8
+closed here (034f610)**; remaining: M2 (daemon token_window nested vs
+companion flat wire-shape — bilateral, needs peer daemon in design) and the
+anchor-clamp (clamp the local scan to `last reset_at` so within-span aging
+never enters the fit — bilateral, peer informed in the r28b cite).
+
+- **L7 min-jump gate** (src/providerquota.ts): `|jumpMs| < 1h` → non-event,
+  both directions. Real fires are +5h; a vendor anchor slide (minutes per
+  poll) must not flood journal + phone from every 10-min sweep. The L6
+  sign-arm test re-pinned at −1.7h (its old −0.3h jump is now a non-event);
+  sub-hour slides got explicit null assertions.
+- **L8 fast-path tolerance** (src/promptmeter.ts): both per-line substring
+  pre-filters accepted only the compact serializer; a spaced-JSON writer
+  change would zero both meters silently. `lineHasType` helper accepts both
+  shapes; JSON.parse stays the gate. New spaced-fixture test pins
+  turns/sidechain/token sums.
+- Watcher restarted 13:59:08Z on the new dist (L7 live before the second
+  anchor fire at 14:10:45.872Z). Cite to peer: inject 1791208769299-c640f7
+  (covers 034f610 ⊃ db605cf, both pending their merge as of 13:57Z).
