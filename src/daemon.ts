@@ -1406,6 +1406,12 @@ async function dispatch(job: Job): Promise<void> {
       buildWorkerPrompt(job, cwd, sandboxed, canary, imageLines),
       config.timeoutMs,
     );
+    // Mid-job continuity (Joe 2026-10-05 "spawn fresh per message is
+    // unacceptable... multi-hour jobs need the same agent chain"): if the
+    // worker reported a still-working handoff, keep the session and requeue
+    // the follow-up on the SAME session id immediately rather than dropping
+    // to a fresh chain. The handoff shape is the worker's last line naming a
+    // pending continuation; parseSessionResult captured the id above.
     await status.finish();
     activeCanaries.delete(canary);
     const { sessionId: sessionIdOut, result } = parseSessionResult(run.stdout);
