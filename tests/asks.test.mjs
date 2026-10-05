@@ -182,7 +182,13 @@ test("sweepExpiredAsks: overdue pending → expired and returned; fresh + decide
     channelId: "1",
     messageId: null,
     approvers: [APPROVER],
-    ttlMs: 1,
+    // NOT ttlMs: 1 — this fixture needs decideAsk to WIN before any sweep,
+    // and on Windows FS latency >1ms laps a 1ms fuse first: the (correct)
+    // expiry backstop then refuses the decision, the record stays pending,
+    // and the sweep expires it (peer's round-17 verify caught the flake —
+    // 6/6 on their box). 60s can't lapse inside this test; sweep-exemption
+    // of decided records is what's asserted, not their ttl.
+    ttlMs: 60_000,
   });
   decideAsk(spool, decided.askId, "denied", APPROVER);
   const now = Date.now() + 10_000;
