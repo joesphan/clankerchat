@@ -174,7 +174,8 @@ export function formatReport(rows, pairs, freeFit, hyps) {
 }
 
 export function main(argv) {
-  const file = argv[0] ?? path.join(process.cwd(), "botlink-spool", "quota-history.jsonl");
+  const asJson = argv.includes("--json");
+  const file = argv.find((a) => !a.startsWith("--")) ?? path.join(process.cwd(), "botlink-spool", "quota-history.jsonl");
   let text;
   try {
     text = fs.readFileSync(file, "utf8");
@@ -200,6 +201,24 @@ export function main(argv) {
   const pairs = pairDeltas(rows);
   const freeFit = fitFreeWeights(pairs);
   const hyps = [fitHypothesis(pairs, 0), fitHypothesis(pairs, 0.1), fitHypothesis(pairs, 0.25)];
+  if (asJson) {
+    // machine-readable: same numbers the report prints, for tick scripts and
+    // briefs — nothing derived here that the text path doesn't show.
+    console.log(
+      JSON.stringify({
+        rows: rows.length,
+        span: { from: new Date(rows[0].ts).toISOString(), to: new Date(rows[rows.length - 1].ts).toISOString() },
+        steadyPairs: pairs.filter((p) => !p.isReset).length,
+        resetPairs: pairs.filter((p) => p.isReset).length,
+        provisional: !freeFit || freeFit.n < 10 || freeFit.beta.slice(1).some((b) => b <= 0),
+        free: freeFit
+          ? { kIn: freeFit.beta[1], kOut: freeFit.beta[2], kCr: freeFit.beta[3], intercept: freeFit.beta[0], r2: freeFit.r2, n: freeFit.n }
+          : null,
+        hypotheses: hyps.map((h) => (h ? { crMult: h.crMult, kIn: h.kIn, r2: h.r2, impliedCap: h.impliedCap } : null)),
+      }),
+    );
+    return;
+  }
   console.log(formatReport(rows, pairs, freeFit, hyps));
 }
 
