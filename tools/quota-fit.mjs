@@ -95,12 +95,23 @@ export function lstsq(X, y) {
   const n = y.length;
   const p = X[0].length;
   if (n < p + 1) return null; // underdetermined — caller decides how to report
+  // Column scaling before the normal equations (r28 L9): live token deltas
+  // put XᵀX entries near 1e18, where double roundoff (~1e2 absolute) makes
+  // the 1e-12 pivot test meaningless — a truly collinear column pivots at
+  // ~roundoff magnitude and sails through as solvable, yielding garbage
+  // betas instead of a refusal. Scale each non-intercept column to unit max
+  // (exact rescaling: collinearity preserved, betas unscaled after), and the
+  // pivot test operates where its threshold was designed to.
+  const colMax = new Array(p).fill(0);
+  for (let i = 0; i < n; i++) for (let j = 0; j < p; j++) colMax[j] = Math.max(colMax[j], Math.abs(X[i][j]));
+  for (let j = 1; j < p; j++) if (colMax[j] === 0) return null; // all-zero column = singular
+  const Xs = X.map((row) => row.map((v, j) => (j === 0 ? v : v / colMax[j])));
   // normal equations A = XᵀX, b = Xᵀy (X rows carry the implicit leading 1)
   const A = Array.from({ length: p }, () => new Array(p + 1).fill(0));
   for (let i = 0; i < n; i++) {
     for (let j = 0; j < p; j++) {
-      for (let k = j; k < p; k++) A[j][k] += X[i][j] * X[i][k];
-      A[j][p] += X[i][j] * y[i];
+      for (let k = j; k < p; k++) A[j][k] += Xs[i][j] * Xs[i][k];
+      A[j][p] += Xs[i][j] * y[i];
     }
   }
   for (let j = 0; j < p; j++) for (let k = 0; k < j; k++) A[j][k] = A[k][j];
@@ -121,6 +132,7 @@ export function lstsq(X, y) {
     for (let c = r + 1; c < p; c++) s -= A[r][c] * beta[c];
     beta[r] = s / A[r][r];
   }
+  for (let j = 1; j < p; j++) beta[j] /= colMax[j]; // unscale back to raw units
   const mean = y.reduce((s, v) => s + v, 0) / n;
   let ssRes = 0;
   let ssTot = 0;

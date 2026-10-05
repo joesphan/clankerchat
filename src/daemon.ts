@@ -1946,9 +1946,18 @@ let providerLine: string | null = null;
 
 async function sweepProviderQuota(): Promise<void> {
   try {
-    providerQuota = await pollProviderQuota();
-    providerLine = providerQuota ? quotaLine(providerQuota) : null;
-    log(`provider quota: ${providerLine ?? "unavailable (fail-quiet)"}`);
+    const next = await pollProviderQuota();
+    if (next) {
+      providerQuota = next;
+      providerLine = quotaLine(next);
+      log(`provider quota: ${providerLine}`);
+    } else {
+      // pollProviderQuota fails QUIET (returns null — the catch arm below is
+      // near-dead by design). Null must NOT overwrite last-good: one vendor
+      // 503 used to drop provider_quota from state + the card for a cycle
+      // while claiming "keeping last-good" (r28 L5).
+      log(`provider quota: unavailable (fail-quiet, keeping last-good)`);
+    }
   } catch (err) {
     log(`provider quota sweep failed (fail-quiet, keeping last-good): ${errText(err)}`);
   }

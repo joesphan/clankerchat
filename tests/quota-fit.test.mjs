@@ -117,7 +117,12 @@ test("report refuses to bless unstable signs as quotable", () => {
   const pairs = pairDeltas(noisy);
   const fit = fitFreeWeights(pairs);
   const report = formatReport(noisy, pairs, fit, []);
-  assert.match(report, /PROVISIONAL/, "small-n or wrong-sign output is labeled, never presented as constants");
+  // r28 L9: the scaled solver correctly REFUSES this design — its three
+  // smoothly-increasing token columns are quasi-collinear at machine
+  // precision, which the unscaled pivot test papered over with garbage
+  // signs. Either way the contract holds: labeled or refused, never
+  // presented as quotable constants.
+  assert.match(report, /PROVISIONAL|insufficient rows/, "small-n or wrong-sign output is labeled or refused, never presented as constants");
 });
 
 test("lstsq: collinear regressors refuse instead of garbage", () => {
@@ -128,6 +133,23 @@ test("lstsq: collinear regressors refuse instead of garbage", () => {
     [1, 5, 10],
   ]; // col 2 = 2×col 1 → singular
   assert.equal(lstsq(X, [1, 2, 3, 4]), null);
+});
+
+test("lstsq: live-magnitude collinear design still refuses (r28 L9 scaling)", () => {
+  // dIn ~1e5-1e6, dCr ~1e8-1e9 — the scale real rows produce, where XᵀX
+  // entries approach 1e18 and unscaled roundoff pivots at ~1e2: a truly
+  // collinear column (col3 = 2×col1) used to sail through the 1e-12 pivot
+  // test and return garbage betas instead of the refusal. Scaled columns
+  // put the pivot test back where its threshold means something.
+  const X = [];
+  const y = [];
+  for (let i = 0; i < 8; i++) {
+    const dIn = 120_000 * (1 + (i % 3));
+    const dOut = 30_000 * (1 + (i % 4));
+    X.push([1, dIn, dOut, 2 * dIn]); // col 3 = 2×col 1 → collinear
+    y.push(0.01 + 0.002 * (i % 3));
+  }
+  assert.equal(lstsq(X, y), null);
 });
 
 // r28 audit follow-ups: the strict q_pct guard, the n≥10 sign arm, and the
