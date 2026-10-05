@@ -697,6 +697,27 @@ export function startCompanionServer(opts: {
             const raw = JSON.parse(fs.readFileSync(path.join(spoolDir, "watcher-state.json"), "utf8")) as Record<string, unknown>;
             const ageMs = typeof raw.updated === "string" ? Date.now() - Date.parse(raw.updated) : NaN;
             const lane = (raw.lane ?? null) as Record<string, unknown> | null;
+            // Round 27c: the token-class meter's 5h window sums (round 25) —
+            // the phone gets the same facts the quota fit consumes. Null-
+            // honest like every other state read; numbers only out.
+            const tw = (raw.token_window ?? null) as Record<string, unknown> | null;
+            const numOrNull = (v: unknown) => {
+              const n = Number(v);
+              return Number.isFinite(n) && n >= 0 ? n : null;
+            };
+            const tokenWindow =
+              tw && typeof tw === "object"
+                ? {
+                    in: numOrNull(tw.in),
+                    out: numOrNull(tw.out),
+                    cacheRead: numOrNull(tw.cache_read),
+                    messages: numOrNull(tw.messages),
+                    sidechainMessages: numOrNull(tw.sidechain_messages),
+                    models: Array.isArray(tw.models)
+                      ? (tw.models as unknown[]).filter((m): m is string => typeof m === "string").slice(0, 3)
+                      : [],
+                  }
+                : null;
             // S-tier #5: the audit watch's live alert lines (bounded by the
             // writer) ride the card exactly when the watcher is alive to
             // classify them — a dead watcher shows its own staleness instead.
@@ -728,6 +749,7 @@ export function startCompanionServer(opts: {
                 // (multi-machine prompts phase 0): additive, null-honest.
                 lanePeerLastRunAt:
                   lane && typeof lane.peerLastRunAt === "string" ? lane.peerLastRunAt : null,
+                tokenWindow,
                 lastRunAt: typeof raw.last_run_at === "string" ? raw.last_run_at : null,
                 updated: typeof raw.updated === "string" ? raw.updated : null,
                 stale: !(ageMs === ageMs && ageMs < 300_000), // NaN (no timestamp) or >5min → stale

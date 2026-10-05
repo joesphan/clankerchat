@@ -242,7 +242,30 @@ interface MachineView {
   lanePaired: number;
   /** Doctor-subset FAIL lines (delivery health) — rendered in red. */
   alerts: string[];
+  /** 5h token-class window sums (round 25 meter, surfaced round 27) — the
+   *  same facts the quota fit consumes. Null before the watcher's first
+   *  sweep publishes token_window. */
+  tokenWindow: {
+    in: number | null;
+    out: number | null;
+    cacheRead: number | null;
+    messages: number | null;
+    sidechainMessages: number | null;
+    models: string[];
+  } | null;
 }
+
+/** Compact token counts for the machine card: 1.2B / 627.5M / 5k (never
+ *  scientific notation, never raw millions — a pocket reads these at a
+ *  glance or not at all). */
+const fmtTok = (n: number | null): string =>
+  n === null
+    ? "?"
+    : n >= 1e9
+      ? `${(n / 1e9).toFixed(1)}B`
+      : n >= 1e6
+        ? `${(n / 1e6).toFixed(1)}M`
+        : `${Math.round(n / 1e3)}k`;
 
 const K_SEED = "cc.seed";
 const K_MACHINES = "cc.machines";
@@ -261,7 +284,7 @@ async function saveJson(key: string, value: unknown): Promise<void> {
 // ---------------------------------------------------------------------------
 
 // Counter burn AND dispatch are SERIALIZED (audit fix 4 + round 19 B4,
-// marker seq-burn-v13): signedFetch is async, so two overlapping calls — the
+// marker tok-window-v14): signedFetch is async, so two overlapping calls — the
 // 2s poll tick colliding with an Approve tap, or a double-tap — could both
 // read counter N from SecureStore, both persist N+1, and both SIGN N+1; the
 // server correctly refuses the second as a replay (spurious 403 on a
@@ -1197,6 +1220,16 @@ export default function App() {
                   ? ` · ran ${Math.max(0, Math.round((Date.now() - Date.parse(machine.lastRunAt)) / 60000))}m ago`
                   : " · no runs yet"}
               </Text>
+              {machine.tokenWindow ? (
+                <Text style={s.muted} selectable={false}>
+                  5h tokens: {fmtTok(machine.tokenWindow.in)} in · {fmtTok(machine.tokenWindow.cacheRead)} cached ·{" "}
+                  {fmtTok(machine.tokenWindow.messages)} msgs
+                  {machine.tokenWindow.sidechainMessages
+                    ? ` · ${fmtTok(machine.tokenWindow.sidechainMessages)} sidechain`
+                    : ""}
+                  {machine.tokenWindow.models[0] ? ` · ${machine.tokenWindow.models[0]}` : ""}
+                </Text>
+              ) : null}
               <Text style={machine.laneOk === false ? s.err : s.ok}>
                 {machine.laneOk === null
                   ? "lane: not probed yet"
