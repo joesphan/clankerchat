@@ -1028,16 +1028,36 @@ NOT RECONCILED (do NOT wire these constants):
   06:46Z wall as a boundary anchor; peer's daemon-restart-pending poller
   adds their X share when live.
 
-OWNER DECISION ITEM (TOS, both machines): personal plans prohibit account
-sharing; two-machine single-key is policy-gray. Weeks of clean concurrent
-operation with official-client fingerprints on both sides = no active
-enforcement observed (zero 1308 since 10-03, zero 1313 ever). Reject the
-report's "serialize all requests" mitigation (destroys the bilateral
-architecture; unsupported by lived experience). Options: status-quo +
-1308/1313 watch, separate plan for peer, or Team plan. Tyler's call.
+OWNER DECISION ITEM (TOS, both machines): **DECIDED 2026-10-05 ~06:30Z —
+STATUS-QUO + WATCH** (Tyler, in-thread: "do what you think is best i do use
+it on multiple machines and multiple ip addresses bc i own multiple isps so
+if it was an issue it probably wouldve already been one"). Separate plan for
+peer = not a want now; Team plan = probably later. The watch is mechanical:
+429/1308/1313 tripwire in the live watcher (below).
+
+- TRIPWIRE SHIPPED (owner-ordered same hour, machine-local watch.mjs):
+  PROVIDER_QUOTA_RE scans orchestrator-run stderr STREAMING (stdio stderr
+  piped + re-emitted byte-identical to the journal — inherit visibility
+  unchanged), the vision pre-pass's captured stderr, and the quota poll's
+  own HTTP 429. One alarm path, deduped 1/hr: journal PROVIDER-QUOTA ALARM
+  line + phone warn notice + `quota_alarm` state flag. Never suppresses the
+  run (delivery law); 1308 text routes "5h pool exhausted" phrasing, 1313
+  class routes "surface to Tyler".
+- REMEMBER-STORM THIRD PATH killed same hour (relapse at 00:08/00:17 local):
+  session-start-hook.sh's consolidation trigger had NO config gate — every
+  session start in a project with past-day staging spawned a haiku
+  consolidation; the 10-04 kill (recovery + ndc_compression) never covered
+  it, and local midnight rolled Oct-4 staging to past-day. Fix: trigger
+  gated on features.consolidation (string-"false", default false) + all
+  past-day staging consumed to .done.md (injection glob still reads them).
+  Plugin-update caveat unchanged; memory file remember-storm-third-path.md
+  carries the re-kill recipe.
 
 PASSIVE TESTS RUNNING: peak inflection at 06:00Z today (Mon) — row climb
-rate before/after (baseline +3.4/10min pre-peak); reset behavior at
-09:10:44Z. Peer status: 24.2 port landed (46d95e3, merged our side f1cadbc,
-236/236, pushed) but their daemon restart pending (in-memory queue drop
-risk) — no local series their side yet.
+rate before/after (baseline +3.4/10min pre-peak; first in-peak reads +3,
++2 — no visible inflection yet, confounded by round-25 work); reset
+behavior at 09:10:44Z (reset_at still frozen at 06:13Z reading). Peer
+status: 24.2 port landed (46d95e3, merged f1cadbc) AND round-25 port
+already shipped their side (ec516d3 daemon token sweep, Windows
+projectsRoot; their merge 806145d of our 545309e reconverged both mains —
+zero tree diff; merged our side, fast-forward, pushed).
