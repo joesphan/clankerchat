@@ -792,3 +792,59 @@ shipped this round.
   verified search registration + the honest REST fallback (`source:"api"`
   while the cache is young — the fallback IS the proof covers() doesn't
   lie). Fast-path activates per-channel as history accumulates.
+
+## Round 22 — adversarial audit of the msgcache surface (2026-10-05)
+
+Round 21 shipped a cache; round 22 tried to break it. A background audit
+run (threat model: wrong-data-under-covers, quarantine breach, cache
+poisoning, resource exhaustion, send-path placement) returned 10 findings
+across msgcache.ts / index.ts / watch.mjs. Six fixed (318f08e), four LOW
+accepted+documented. Tests 221 → 224, all green; watcher drift-revived on
+the new dist + new watch.mjs at 03:43Z (first boot immediately proved F6:
+cursors seeded for all three ARCHIVED threads the old enumeration missed).
+
+Fixed (commit 318f08e, pushed fork main):
+- F1 HIGH own-record poisoning — an MCP send into a never-covered channel
+  planted a lone row → covers() claimed contiguous-from-MIN → "covered"
+  reads served only our own posts, hiding human replies up to 14d. Fix:
+  established(channelId) invariant; the send path records own posts only
+  where the feed already established coverage (rows held or boot-seed
+  floor). Peer note: mirror this gate when porting the gateway feed.
+- F2 HIGH permanent replay hole — failed boot-replay fetch (429/net/perm)
+  left a gap the advancing cursor papered over. Fix: snowflakeNow()
+  honesty floor ((now−2015epoch)<<22) on fetch failure; floors only need
+  to be a lower bound on future ids.
+- F3 HIGH search scoping — search bypassed the project-mode allowlist
+  (assertNotBlocked ran only for explicit channel_id) AND the blocklist
+  env was wired into ZERO live instance configs (the watcher's write-gate
+  was the only mechanical barrier). Fix: explicit channel → blocked+thread
+  asserts; unpinned search on locked instance scoped via channelIds
+  IN-clause; empty allowlist refuses every target. Deployment side:
+  CLANKER_BLOCKLIST_FILE wired into all 5 live MCP configs (2× .mcp.json,
+  3× ~/.claude.json project entries) against the watcher's existing
+  mtime-cached blocklist file — one source of truth.
+- F4 MED messageDeleteBulk listener (bulk purges used to keep rows
+  cached/served/searched up to 14d).
+- F5 MED blocklist hygiene — boot purge of blocked-after-caching venues
+  (blocklistIds() + purgeChannel()); F5c divergence (covered read returns
+  fewer rows than REST when per-message ids are quarantined) documented
+  DELIBERATE — silence law wins over byte-parity.
+- F6 MED archived threads — fetchArchived unioned into boot scope; on
+  enumeration failure, cursor-holding threads missing from the active set
+  get snowflakeNow() floors.
+
+Accepted LOW (documented, not fixed):
+- F7 covers()/list() non-atomic under a concurrent prune — worst case one
+  REST fallback or one short read; self-healing next call.
+- F8 openMsgCache caches a transient open failure for process lifetime —
+  cache-less until next restart; REST keeps serving.
+- F9 MCP own-record timestamp drift until the watcher re-records the same
+  id (INSERT OR REPLACE) — bounded by feed latency, display-only field.
+- F10 caps (4000/10) unreachable vs Discord's own 2000/10 — belt/suspenders.
+
+Audit's SOUND list (no action): snowflake CAST ordering everywhere,
+covers() honesty core, list() REST semantics, fail-quiet end-to-end, send
+own-record placement, watcher write-gate placement (forbiddenId BEFORE
+cacheRecord, ahead of all skip gates), floor honesty at boot, WAL +
+busy_timeout, no poisoning path past the new gate, resource bounded,
+deploy parity.
