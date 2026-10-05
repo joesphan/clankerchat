@@ -965,6 +965,25 @@ OPEN (owner dashboard checks, zero prompts):
   later as usage continues → rolling TTL confirmed (meter already models
   sliding; no code change either way).
 
+Calibration PRELIMINARY (first paired rows, 2026-10-05 05:02Z→05:12Z):
+- 13%→17% (+4pts/10min) while LOCAL turns FELL 459→450: quota is not
+  prompt-denominated — token-denominated confirmed by behavior, independent
+  of the API's TOKENS_LIMIT label.
+- 24h totals byte-identical across two polls despite the window sliding →
+  model-usage endpoint serves an hourly-bucketed snapshot; sub-hour deltas
+  are meaningless. quota/limit % is the only near-real-time signal.
+- Cap estimate: 2.38B tok/24h ≈ 16.5M/10min burn; +4%/10min observed ⇒ 5h
+  cap ≈ ~410M tokens (one interval, wide error bars — refine as rows
+  accumulate).
+- IMPLICATION (owner-gated, not wired): turn-count gating (PROMPT_CAP=1600)
+  mis-models the real constraint in BOTH directions — long-context sessions
+  eat quota far faster per turn than count suggests, tiny headless turns far
+  slower. Candidate successor once rows confirm: gate on provider pct
+  directly (provider_quota.pct, already polled) — behavior change, needs
+  owner go + both machines.
+- Row 1 (04:57Z) nulls = boot race + pre-fix TOKENS_LIMIT parse, both
+  already fixed; rows 2+ clean.
+
 Peer note: findings generalize to their machine (shared plan). Brief them
 with round 24 once experiments land — one consolidated cite, not a relay of
 the whole report.
