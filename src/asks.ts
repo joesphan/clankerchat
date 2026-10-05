@@ -541,11 +541,18 @@ export function askDecisionLine(rec: AskRecord, decidedName: string): string {
  *  ("[ask decision] YOLO by …"), leaving the semantics to whichever brain
  *  read it — daemon.ts had the instructions inline, the watcher host didn't,
  *  and the two hosts' YOLO runs would have behaved differently. deciderName
- *  is display-only (authority was the API/signed-surface check upstream). */
+ *  is display-only (authority was the API/signed-surface check upstream).
+ *  Venue law (round-19 misroute, mirrored): a decision is delivered TO this
+ *  run, never THROUGH it — the run answers in the thread and never relays the
+ *  decision onward as a work order for another session; a bilateral
+ *  (machine-to-machine) matter's receipt names the delivering gateway. */
+export const ASK_DECISION_VENUE =
+  " Venue law: this decision is delivered to you, not through you — answer in the thread, never relay it onward as a work order for another session; if the matter is bilateral (machine-to-machine), name the delivering gateway in the receipt.";
+
 export function askDecisionInstruction(status: AskRecord["status"], deciderName: string): string {
   if (status === "approved")
-    return `The human (${deciderName}) approved — proceed with exactly what the ask requested, then answer in the thread.`;
+    return `The human (${deciderName}) approved — proceed with exactly what the ask requested, then answer in the thread.${ASK_DECISION_VENUE}`;
   if (status === "yolo")
-    return `The human (${deciderName}) YOLO'd — one-shot full-auto granted by their gesture: execute the ask's request now with no further asks, then answer in the thread with the receipt.`;
-  return `The human (${deciderName}) denied — do NOT proceed; stand down and acknowledge the denial in the thread.`;
+    return `The human (${deciderName}) YOLO'd — one-shot full-auto granted by their gesture: execute the ask's request now with no further asks, then answer in the thread with the receipt.${ASK_DECISION_VENUE}`;
+  return `The human (${deciderName}) denied — do NOT proceed; stand down and acknowledge the denial in the thread.${ASK_DECISION_VENUE}`;
 }
