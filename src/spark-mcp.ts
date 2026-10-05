@@ -403,7 +403,12 @@ export async function main(): Promise<void> {
   loadEnvFile();
   const capPath = process.env.SPARK_MCP_PATH?.trim();
   const token = process.env.SPARK_MCP_TOKEN?.trim() || undefined;
-  const port = Number(process.env.SPARK_MCP_PORT ?? SPARK_DEFAULT_PORT);
+  // Same empty-string law as botlink parsePort (audit round 3, finding 3):
+  // Number("") === 0 would silently bind an ephemeral port; whitespace-only
+  // or non-numeric falls back to the default instead of NaN at listen().
+  const portSpec = process.env.SPARK_MCP_PORT?.trim();
+  const portNum = portSpec === undefined ? SPARK_DEFAULT_PORT : Number(portSpec);
+  const port = Number.isFinite(portNum) && portNum >= 0 && portNum < 65536 ? portNum : SPARK_DEFAULT_PORT;
   const spoolDir = process.env.CLANKER_SPOOL_DIR ?? `${process.cwd()}/botlink-spool`;
   if (!capPath || capPath.length < 16) {
     throw new Error("SPARK_MCP_PATH missing/too short in .env — generate 16+ bytes of hex; refusing to start open");

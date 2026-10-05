@@ -62,7 +62,14 @@ export function journalFile(spoolDir: string): string {
 }
 
 function genesisH(file: string): string {
-  return crypto.createHash("sha256").update(`clanker-journal:${path.basename(file)}`).digest("hex");
+  // Rotation-stable (audit round 3, finding 2): a rotated .1 was chained
+  // under its LIVE name — binding genesis to the current filename made every
+  // healthy rotation fail verification as a false tamper alarm. Bind to the
+  // journal's identity instead: strip the .1 suffix, so the live file and
+  // its rotated generation share the same deterministic, still-file-bound
+  // genesis.
+  const base = path.basename(file).replace(/\.1$/, "");
+  return crypto.createHash("sha256").update(`clanker-journal:${base}`).digest("hex");
 }
 
 function entryHash(prevH: string, entry: Omit<JournalEntry, "h">): string {
@@ -130,16 +137,29 @@ export function verifyJournalFile(file: string): JournalEntry[] {
   return out;
 }
 
-/** Newest-last tail of the live file (no rotation crawl) — bounded reads
- *  for dashboards/stat derivations. Missing file → empty. */
+/** Newest-last tail for dashboards/stat derivations. Reads the live file;
+ *  when a rotation just emptied it (live shorter than n), the rotated .1's
+ *  verified entries are prepended so the 24h stats window survives rotation
+ *  (audit round 3, finding 6 — a flood big enough to force rotation is
+ *  exactly the window the stats must NOT silently forget). Missing file →
+ *  empty; a BROKEN live chain → empty (untrusted, verifyJournalFile is the
+ *  loud path); a broken/absent .1 → live tail only. */
 export function readJournalTail(spoolDir: string, n: number): JournalEntry[] {
   if (n <= 0) return [];
+  let all: JournalEntry[];
   try {
-    const all = verifyJournalFile(journalFile(spoolDir));
-    return all.slice(-n); // n>0 — slice(-n) is the tail; -0 would be the whole file
+    all = verifyJournalFile(journalFile(spoolDir));
   } catch {
-    return []; // a broken chain still must not take down /machine — verifyJournalFile is the loud path
+    return [];
   }
+  if (all.length < n) {
+    try {
+      all = verifyJournalFile(`${journalFile(spoolDir)}.1`).concat(all);
+    } catch {
+      /* no rotated generation yet, or its chain is broken — live tail only */
+    }
+  }
+  return all.slice(-n); // n>0 — slice(-n) is the tail; -0 would be the whole file
 }
 
 /** Refusal/decision stats over a tail — feeds the phone's machine card.

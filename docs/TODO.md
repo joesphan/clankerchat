@@ -497,3 +497,73 @@ events belong in it.
   the delta is journaling the webhook + spoof skips on your trigger path and
   the stats/card plumbing. Same quarantine-ordering caveat applies wherever
   your skip gates sit.
+
+## Round 17 — audit round 3: sweep/decide race, rotation-stable chain, watcher hardening (2026-10-04)
+
+Two audit agents swept the rounds-12–16 code (repo + watcher). 15 findings,
+all triaged and fixed this round. Severity order: the ask-race kernel first,
+then parse/bind honesty, then the watcher's throw/liveness classes.
+
+- R1 (HIGH, asks.ts): sweepExpiredAsks did read-modify-write WITHOUT the
+  O_EXCL claim decideAsk takes — a phone DENY landing between listPendingAsks
+  and the write was flipped to approved/auto-expiry. The sweep now claim-gates
+  exactly like a deciding surface (loses to a live claim, releases its OWN
+  claim on write failure so the next sweep retries), and decideAsk treats
+  expiry as a hard boundary on EVERY deciding surface (companion tap, Discord
+  click, sweep): past the fuse, pending stays pending — the sweep owns it.
+  Claim files persist after decisions (decision-in-flight proof).
+- R2 (journal.ts): genesis was bound to the CURRENT filename — every healthy
+  rotation made .1 fail verification as a false tamper alarm. Genesis now
+  strips a trailing `.1` (journal-identity-bound, rotation-stable).
+- R6: readJournalTail prepends verified .1 entries when the live file is
+  shorter than n — the 24h stats window survives a rotation (a flood big
+  enough to rotate is exactly the window stats must not forget).
+- R3 (botlink-server.ts + spark-mcp.ts): `Number("") === 0` bound an
+  EPHEMERAL port silently on a templated `HOST:"$PORT"` with empty PORT.
+  parsePort (now EXPORTED, import-guard added so tests can import the CLI
+  module without dispatching cmdServe) treats empty/whitespace as UNSET;
+  spark-mcp port follows the same law.
+- R4: `listenSpec.split(":")[0] ?? "127.0.0.1"` was dead code — "" is not
+  nullish — so a ":47421" spec bound the pairing listener on `::` wildcard
+  while every other listener clamps to loopback. Now `||`.
+- R5 (companion.ts routes): POST /asks/:id gained the expiry pre-check (409
+  status:"expired" — the sweep owns it) and post-decideAsk provenance honesty
+  (a lost claim race answers 409 with the WINNER's verdict, never a fake 200
+  logging the decision as this phone's).
+- W1 (attachments.ts): `Array.isArray(msg.attachments)` is false for the
+  discord.js Collection — the whole image feature was dead code on the
+  watcher. attachmentList() normalizes Array | .toArray() | .values().
+- Watcher (~/tools, per-machine — recipe shared with the peer, not in this
+  tree): W2 transient-own-post guard (⏳ status line / salvage line / canned
+  status card no longer mark runs posted nor pollute phone excerpts — pure
+  isTransientOwnPost in watch-history.mjs); W3 refuse-before-claim on the
+  companion-decision and phone-prompt sweeps (full queue defers UNCLAIMED,
+  15s retry) + deferred auto-approval retry scan (60s) so a full bot queue
+  no longer shift-drops claimed jobs; W4 every timer body try/caught (a
+  repo-lib throw in an interval killed the watcher process) + finishPrompt
+  guarded at the exit handler + safePeerLabel at laneFacts capture (a
+  leak/mass-mention-shaped PEER-CONTROLLED bot name used to flow into posts
+  the watcher makes directly, bypassing send tripwires); W5 boot-replay
+  emit-time dedup (messages delivered live during the fetch await were
+  re-emitted → double runs); W6 noise-flood summary flushes on a one-shot
+  timer (a storm ending quiet never wrote its own evidence line); W7a
+  lastPoolActivity bumped at claim points (drift exit could land between
+  claim and enqueue, losing claimed deliveries); W8 companion decision edit
+  forks on V2 shape like every other terminal edit; W9 fs.watch error
+  handler, prepareImages mkdir guard (a spool failure no longer kills the
+  run pre-spawn with its claims), and a 30s SIGKILL-confirmation fallback
+  (a D-state child never emits exit → pool wedge). Plus two policy adds:
+  click-path expiry pre-check (honest "ask already expired" ephemeral) and
+  the forbidden-venue gate on the BUTTON path (quarantine law parity with
+  slash).
+- Tests: repo 197/197 (was 190 — sweep-claim race, expiry boundary, rotation
+  chain + tail spanning, attachmentList, parsePort, companion expired-tap
+  route); watcher 24/24 (isTransientOwnPost template + near-miss matrix).
+- Deploy: build → botlink[serve]+companion drift-revived at 17:59Z unattended
+  (third consecutive no-manual-restart deploy); watcher manually restarted
+  18:05 local (the guard watches dist/ only), clean boot.
+- Known coupling (round-18 candidate): isTransientOwnPost lives in the
+  local watch-history.mjs but matches strings RENDERED BY THE REPO
+  (run-progress.ts statusLine, slash.ts card header) — if those templates
+  change, the matcher must follow. The tests pin today's shapes; moving the
+  matcher into run-progress.ts would remove the drift risk.

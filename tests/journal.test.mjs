@@ -129,3 +129,31 @@ test("CLI: journal-verify proves the chain (and says so loudly when broken)", ()
   assert.equal(r.status, 1);
   assert.match(r.stderr, /chain broken/);
 });
+
+test("journal rotation (round 17): the .1 generation verifies standalone, and the tail spans generations", () => {
+  // Audit round 3, finding 2: genesis was bound to the CURRENT filename, so
+  // every healthy rotation produced a .1 whose first link could never
+  // recompute — journal-verify --all cried tamper on a clean file. Genesis
+  // now binds the journal's identity (suffix stripped), and readJournalTail
+  // pulls the rotated tail in when the live file is shorter than n, so the
+  // 24h stats window survives rotation (finding 6).
+  const dir = tmp();
+  appendJournal(dir, { ts: 1, kind: "interaction", detail: "one", outcome: "handled" });
+  appendJournal(dir, { ts: 2, kind: "noise", detail: "two" });
+  const file = journalFile(dir);
+  fs.renameSync(file, `${file}.1`); // exactly what appendJournal's rotation does
+  appendJournal(dir, { ts: 3, kind: "interaction", detail: "three", outcome: "refused" }); // fresh chain on live
+
+  const rotated = verifyJournalFile(`${file}.1`); // THREW before the genesis fix
+  assert.equal(rotated.length, 2);
+  assert.equal(verifyJournalFile(file).length, 1, "the live chain restarted clean");
+
+  // tail spanning: live (1 entry) shorter than n → .1 prepended
+  const tail = readJournalTail(dir, 3);
+  assert.deepEqual(tail.map((e) => e.detail), ["one", "two", "three"]);
+  // stats over the span see pre-rotation events
+  const stats = journalStats(tail, 4, 10_000);
+  assert.equal(stats.noise, 1, "pre-rotation noise still counted");
+  // n smaller than the live file stays live-only (no unnecessary .1 read)
+  assert.deepEqual(readJournalTail(dir, 1).map((e) => e.detail), ["three"]);
+});

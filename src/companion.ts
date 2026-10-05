@@ -422,8 +422,10 @@ export function startCompanionServer(opts: {
         // --- shared registry with provenance "companion:<fp>"; the gateway
         // --- watcher delivers (message edit + trigger run) and stamps
         // --- enqueuedAt — this surface never delivers, so no double path.
-        // --- decideAsk's pending-guard is the only gate: a tap racing the
-        // --- expiry sweep simply loses or wins cleanly, never both.
+        // --- Two-surface race law (audit round 3): every deciding path goes
+        // --- through decideAsk's kernel-atomic O_EXCL claim, and the expiry
+        // --- sweep claims too — a tap racing a click or the sweep loses or
+        // --- wins cleanly, never both, and never overwrites the other.
         if (method === "GET" && url.pathname === "/asks") {
           const now = Date.now();
           const asks = listPendingAsks(spoolDir)
@@ -444,6 +446,14 @@ export function startCompanionServer(opts: {
             log(`companion: ask ${askM[1]} tap arrived after ${existing.status} (${existing.decidedBy ?? "?"}) — nothing changed`);
             return json(res, 409, { error: `already ${existing.status}`, status: existing.status, decidedBy: existing.decidedBy ?? null });
           }
+          // Expiry is a hard boundary on every surface (audit round 3,
+          // finding 1): the GET above filters expired asks, but a stale card
+          // can still drive a POST — past the fuse the sweep owns the ask and
+          // no tap may approve what "buttons die at expiry" promised.
+          if (existing.expiresAt <= Date.now()) {
+            log(`companion: ask ${askM[1]} tap arrived AFTER expiry (sweep owns it) — nothing changed`);
+            return json(res, 409, { error: "ask expired — the expiry sweep owns it", status: "expired" });
+          }
           // Three-verb map (c2a7ebe contract): yolo = one-shot full-auto, NOT
           // a deny-else default — the binary map here would have silently
           // recorded YOLO taps as denials, the exact bug class caught on the
@@ -455,6 +465,13 @@ export function startCompanionServer(opts: {
             `companion:${v.phone.id}`,
           );
           if (!rec || rec.status === "pending") return json(res, 500, { error: "decision failed to record" });
+          if (rec.decidedBy !== `companion:${v.phone.id}`) {
+            // LOST the O_EXCL claim: a click or another surface decided first
+            // (audit round 3, finding 5 — this used to answer 200 and log the
+            // decision as THIS phone's). Report the winner's verdict honestly.
+            log(`companion: ask ${askM[1]} tap LOST the decision race to ${rec.decidedBy} (${rec.status}) — reporting theirs`);
+            return json(res, 409, { error: `already ${rec.status}`, status: rec.status, decidedBy: rec.decidedBy ?? null });
+          }
           log(`companion: ask ${askM[1]} ${rec.status} by ${v.phone.id} — delivery pending watcher sweep`);
           return json(res, 200, { status: rec.status, askId: rec.askId });
         }

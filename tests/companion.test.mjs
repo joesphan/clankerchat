@@ -982,3 +982,75 @@ test("prompt routes (round 5): send from the phone, list lifecycle, caps and aut
     listener.close();
   }
 });
+
+// --- round 17 (audit round 3, findings 1+5) --------------------------------
+// Expiry is a hard boundary on EVERY deciding surface. The GET /asks filter
+// already hides expired asks, but a stale card can still drive a POST: past
+// the fuse the sweep owns the ask — the route must answer 409/expired and
+// leave the record pending, never approve what "buttons die at expiry"
+// promised would die (the TOCTOU the sweep/decide race used to have).
+test("asks routes (round 17): a tap on an expired ask is refused, the record stays pending for the sweep", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(spool, { recursive: true });
+  const logs = [];
+  const listener = startCompanionServer({
+    bind: "127.0.0.1",
+    port: 0,
+    paths: p,
+    spoolDir: spool,
+    store,
+    log: (l) => logs.push(l),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+
+  try {
+    const { createPendingAsk, getAsk } = await import("../dist/asks.js");
+    // Expired while UNDECIDED, and — the sharper edge — an approve-on-expiry
+    // ask: the old route would have run decideAsk and recorded "approved"
+    // (or flipped an in-flight phone DENY) past the fuse.
+    const stale = createPendingAsk(spool, { question: "late tap", channelId: "1", messageId: null, approvers: ["1"], ttlMs: -1_000 });
+    const staleApprove = createPendingAsk(spool, { question: "late tap, lazy", channelId: "1", messageId: null, approvers: ["1"], ttlMs: -1_000, onExpiry: "approve" });
+
+    const res = await signed("POST", `/asks/${stale.askId}/approve`);
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.status, "expired");
+    assert.ok(body.error.includes("expired"), "the error names expiry, not a generic conflict");
+
+    const res2 = await signed("POST", `/asks/${staleApprove.askId}/approve`);
+    assert.equal(res2.status, 409, "an approve-on-expiry ask is STILL sweep-owned after the fuse");
+    assert.equal((await res2.json()).status, "expired");
+
+    assert.equal(getAsk(spool, stale.askId).status, "pending", "the sweep owns expiry, not the tap");
+    assert.equal(getAsk(spool, staleApprove.askId).status, "pending");
+    assert.ok(logs.some((l) => l.includes("AFTER expiry")), "the refusal is logged for the security trail");
+
+    // Fresh ask still decides normally through the same route (guard did not
+    // over-fire and wedge the surface).
+    const fresh = createPendingAsk(spool, { question: "on time", channelId: "1", messageId: null, approvers: ["1"], ttlMs: 60_000 });
+    const res3 = await signed("POST", `/asks/${fresh.askId}/deny`);
+    assert.equal(res3.status, 200);
+    assert.equal(getAsk(spool, fresh.askId).status, "denied");
+  } finally {
+    listener.close();
+  }
+});

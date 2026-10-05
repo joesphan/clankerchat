@@ -346,6 +346,13 @@ export function decideAsk(
   const rec = getAsk(spoolDir, askId);
   if (!rec) return null;
   if (rec.status !== "pending") return rec;
+  // Expiry is a hard boundary on EVERY deciding surface (audit round 3,
+  // finding 1): past the fuse the sweep owns the ask — a late tap or click
+  // must never approve what "buttons die at expiry" promised would die.
+  // Return the still-pending record unchanged; callers report it honestly
+  // (the companion route and click handler pre-check this for a clean
+  // "expired" answer, this is the backstop at the single choke point).
+  if (rec.expiresAt <= Date.now()) return rec;
   const file = askFile(spoolDir, askId);
   const claim = `${file}.claim`;
   let claimed = false;
@@ -369,22 +376,42 @@ export function decideAsk(
  *  flip to approved with decidedBy "auto-expiry" — any Deny before expiry
  *  already won via decideAsk, so this only fires on true silence. Returns
  *  every record transitioned this pass so the caller can edit its message
- *  and (for auto-approvals) enqueue the decision run. */
+ *  and (for auto-approvals) enqueue the decision run.
+ *
+ *  Claim-gated since audit round 3 (finding 1): the old read-modify-write
+ *  could OVERWRITE a decision that landed between listPendingAsks and the
+ *  write — proven live as a phone DENY silently flipped to an auto-expiry
+ *  APPROVAL with the message re-edited. The sweep now takes the same O_EXCL
+ *  claim decideAsk does: a lost claim means a live decision (tap, click)
+ *  holds the ask and the sweep skips it entirely. Deny-before-expiry wins
+ *  on every interleaving. */
 export function sweepExpiredAsks(spoolDir: string, now = Date.now()): AskRecord[] {
   const swept: AskRecord[] = [];
   for (const rec of listPendingAsks(spoolDir)) {
     if (rec.status === "pending" && rec.expiresAt <= now) {
+      const file = askFile(spoolDir, rec.askId);
+      const claim = `${file}.claim`;
+      try {
+        fs.closeSync(fs.openSync(claim, "wx", 0o600));
+      } catch {
+        continue; // a live decision holds the claim — it wins, the sweep skips
+      }
       const next: AskRecord = rec.onExpiry === "approve"
         ? { ...rec, status: "approved", decidedBy: "auto-expiry", decidedAt: now }
         : { ...rec, status: "expired" };
-      const file = askFile(spoolDir, rec.askId);
       try {
         const tmp = `${file}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
         fs.renameSync(tmp, file);
         swept.push(next);
       } catch {
-        /* unreadable/locked — next sweep retries */
+        /* unreadable/locked — release our own claim so the next sweep
+           retries (only a crash mid-window leaves it held, same as decideAsk) */
+        try {
+          fs.rmSync(claim, { force: true });
+        } catch {
+          /* nothing more to do — the record stays pending, next sweep retries */
+        }
       }
     }
   }

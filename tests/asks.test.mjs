@@ -470,3 +470,54 @@ test("ask registry hygiene: terminal records GC at 7d; undelivered companion dec
     assert.ok(fs.existsSync(path.join(dir, `${id}.json`)), `${id} kept`);
   }
 });
+
+// --- audit round 3 (2026-10-04): claim-gated sweep + expiry boundary ------
+
+test("sweep claim (round 17): a decision holding the claim is never overwritten by expiry", () => {
+  // The HIGH race: sweepExpiredAsks used to read-modify-write WITHOUT the
+  // O_EXCL claim decideAsk takes — a deny landing between listPendingAsks
+  // and the write got silently flipped to approved/auto-expiry. The held
+  // claim (a live decideAsk mid-flight) now makes the sweep skip entirely.
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "race", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000, onExpiry: "approve",
+  });
+  // simulate decideAsk mid-flight: claim taken, record still pending
+  fs.closeSync(fs.openSync(path.join(spool, "pending-asks", `${rec.askId}.json.claim`), "wx", 0o600));
+  const swept = sweepExpiredAsks(spool, Date.now() + 5_000);
+  assert.equal(swept.length, 0, "held claim → the sweep skips this ask");
+  assert.equal(getAsk(spool, rec.askId).status, "pending", "the in-flight decision's record is untouched");
+});
+
+test("sweep claim (round 17): unclaimed expired asks still sweep, claim file lands beside the record", () => {
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "clean expiry", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000,
+  });
+  const swept = sweepExpiredAsks(spool, Date.now() + 5_000);
+  assert.equal(swept.length, 1);
+  assert.equal(swept[0].status, "expired");
+  assert.ok(
+    fs.existsSync(path.join(spool, "pending-asks", `${rec.askId}.json.claim`)),
+    "the sweep's own claim persists — no second transition, ever",
+  );
+});
+
+test("decideAsk expiry boundary (round 17): no deciding surface acts past the fuse", () => {
+  const spool = tmpSpool();
+  const stale = createPendingAsk(spool, {
+    question: "late", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000,
+  });
+  const out = decideAsk(spool, stale.askId, "approved", APPROVER);
+  assert.equal(out.status, "pending", "returned unchanged — refused, not decided");
+  assert.equal(getAsk(spool, stale.askId).status, "pending", "nothing recorded past the fuse");
+  // pre-expiry decisions keep working (regression)
+  const early = createPendingAsk(spool, {
+    question: "on time", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: 60_000,
+  });
+  assert.equal(decideAsk(spool, early.askId, "denied", APPROVER).status, "denied");
+});

@@ -840,3 +840,22 @@ test("status surfaces watcher load while fresh, omits it when absent or stale", 
   const stale = JSON.parse(await botlinkRequest(peer, "status"));
   assert.equal(stale.load, undefined, "stale watcher-state.json must be omitted");
 });
+
+// --- round 17 (audit round 3, finding 3) -----------------------------------
+// parsePort: `Number("") === 0` meant a templated `HOST:"$PORT"` with an
+// empty PORT silently bound an ephemeral port. Empty/whitespace is UNSET.
+// The dynamic import doubles as the import-guard regression: an unguarded
+// botlink-server.js would dispatch cmdServe() here and kill this process.
+test("parsePort (round 17): empty string is UNSET, not port 0; explicit values survive", async () => {
+  const { parsePort } = await import("../dist/botlink-server.js");
+  assert.equal(typeof parsePort, "function", "module must be import-safe and export parsePort");
+  assert.equal(parsePort("", 47421), 47421, "empty string must take the default");
+  assert.equal(parsePort("   ", 47421), 47421, "whitespace-only must take the default");
+  assert.equal(parsePort(undefined, 47421), 47421, "undefined must take the default");
+  assert.equal(parsePort("0", 47421), 0, "explicit :0 is an ephemeral-bind REQUEST, not a fallback trigger");
+  assert.equal(parsePort(" 47422 ", 47421), 47422, "numeric with surrounding whitespace parses");
+  assert.equal(parsePort("99999", 47421), 47421, "out-of-range falls back, never NaN at listen()");
+  assert.equal(parsePort("not-a-port", 47421), 47421, "non-numeric falls back");
+  assert.equal(parsePort("65535", 47421), 65535, "top of range is valid");
+  assert.equal(parsePort("-1", 47421), 47421, "negative falls back");
+});

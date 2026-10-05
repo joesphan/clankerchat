@@ -97,10 +97,16 @@ const PORT_DEFAULT = 47421;
  *  a fallback trigger. The old `Number(x) || default` shape sent an explicit
  *  ":0" to the DEFAULT port — colliding with the live listener there
  *  (caught live by the round-15 drift tests: a test server on ":0" tried to
- *  take the production lane port 47421). */
-function parsePort(spec: string | undefined, dflt: number): number {
-  const n = Number(spec);
-  return spec !== undefined && Number.isFinite(n) && n >= 0 && n < 65536 ? n : dflt;
+ *  take the production lane port 47421). Empty/whitespace is UNSET, not a
+ *  port: `Number("") === 0` would otherwise bind an ephemeral port silently
+ *  while the startup line never says which (audit round 3, finding 3 — a
+ *  templated `HOST:"$PORT"` with PORT empty is the real-world shape).
+ *  Exported for direct unit tests. */
+export function parsePort(spec: string | undefined, dflt: number): number {
+  const s = spec?.trim();
+  if (s === undefined || s === "") return dflt;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 && n < 65536 ? n : dflt;
 }
 
 function cmdKeygen(args: string[]): void {
@@ -376,7 +382,11 @@ async function cmdPair(args: string[]): Promise<void> {
     savePairingState(p, state);
     const listenSpec = process.env.CLANKER_BOTLINK_LISTEN ?? "127.0.0.1:47421";
     const mainPort = parsePort(listenSpec.split(":")[1], 47421);
-    const bind = argValue(args, "--bind") ?? listenSpec.split(":")[0] ?? "127.0.0.1";
+    // `??` was dead code here: split()["" for ":47421"] is a STRING (never
+    // nullish), so the loopback fallback never fired and a spec like
+    // ":47421" bound the key-exchange listener on "" = :: wildcard while
+    // every other listener clamps to loopback (audit round 3, finding 4).
+    const bind = argValue(args, "--bind") || listenSpec.split(":")[0] || "127.0.0.1";
     const port = parsePort(argValue(args, "--port"), mainPort + 1);
     const listener = startPairingListener({
       bind,
@@ -642,13 +652,17 @@ function cmdCompanion(args: string[]): void {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
-if (cmd === "keygen") cmdKeygen(rest);
-else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
-else if (cmd === "report") cmdReport(rest[0]);
-else if (cmd === "pair") void cmdPair(rest);
-else if (cmd === "companion") cmdCompanion(rest);
-else if (cmd === "serve" || cmd === undefined) cmdServe();
-else {
-  console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | report | pair | serve)`);
-  process.exit(1);
+// Import guard (same shape as spark-mcp): when this file is IMPORTED (tests
+// pulling parsePort) rather than run as the CLI, the dispatch must not fire.
+if (process.argv[1]?.endsWith("botlink-server.js")) {
+  if (cmd === "keygen") cmdKeygen(rest);
+  else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
+  else if (cmd === "report") cmdReport(rest[0]);
+  else if (cmd === "pair") void cmdPair(rest);
+  else if (cmd === "companion") cmdCompanion(rest);
+  else if (cmd === "serve" || cmd === undefined) cmdServe();
+  else {
+    console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | report | pair | serve)`);
+    process.exit(1);
+  }
 }
