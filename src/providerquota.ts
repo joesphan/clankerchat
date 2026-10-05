@@ -80,6 +80,61 @@ export function parseQuota(
 
 const ALLOWED_HOSTS = ["api.z.ai", "open.bigmodel.cn", "dev.bigmodel.cn"];
 
+// Round 27d: a reset_at discontinuity between consecutive polls is a natural
+// experiment the quota fit consumes — how much of the 5h window actually
+// drains when the vendor's anchor fires. Classification is repo-side (both
+// machines want the same verdict); journal/notice glue is host-local.
+
+export interface QuotaSnapshot {
+  pct5h: number | null;
+  resetAt: string | null;
+}
+
+export interface ResetEvent {
+  oldPct: number;
+  newPct: number;
+  /** Points of quota drained across the reset (old − new). */
+  drainPts: number;
+  oldResetAt: string;
+  newResetAt: string;
+  /** How far the anchor moved. ~5h jump after a frozen stretch = fixed
+   *  cadence; continuous sliding = rolling. Negative = vendor quirk, recorded. */
+  jumpMs: number;
+  /** emptied = window drained to near-zero (fixed-anchor behavior);
+   *  partial = only the aged-out share left (rolling behavior). A machine
+   *  burning THROUGH the reset refills instantly — the label is the
+   *  observation, the jumpMs is the discriminator. */
+  verdict: "emptied" | "partial";
+}
+
+/** Null when nothing changed or either side lacks the fields — a missing
+ *  prev (boot, first poll) is never a false event. */
+export function describeResetEvent(prev: QuotaSnapshot | null, next: QuotaSnapshot | null): ResetEvent | null {
+  if (!prev || !next) return null;
+  if (typeof prev.pct5h !== "number" || typeof next.pct5h !== "number") return null;
+  if (!prev.resetAt || !next.resetAt || prev.resetAt === next.resetAt) return null;
+  return {
+    oldPct: prev.pct5h,
+    newPct: next.pct5h,
+    drainPts: prev.pct5h - next.pct5h,
+    oldResetAt: prev.resetAt,
+    newResetAt: next.resetAt,
+    jumpMs: Date.parse(next.resetAt) - Date.parse(prev.resetAt),
+    verdict: next.pct5h <= 5 ? "emptied" : "partial",
+  };
+}
+
+/** One line for the journal + phone notice — facts first, quick read second,
+ *  so the watcher and daemon flavors never drift in interpretation. */
+export function resetEventLine(e: ResetEvent): string {
+  const h = (iso: string) => `${iso.slice(11, 16)}Z`;
+  return (
+    `5h window reset ${h(e.oldResetAt)}→${h(e.newResetAt)} (+${(e.jumpMs / 3_600_000).toFixed(1)}h): ` +
+    `q_pct ${Math.round(e.oldPct)}→${Math.round(e.newPct)} — ` +
+    (e.verdict === "emptied" ? "window emptied (fixed-anchor behavior)" : "partial drain (rolling behavior)")
+  );
+}
+
 export interface ProviderQuotaOptions {
   /** Override clock for tests. */
   now?: number;

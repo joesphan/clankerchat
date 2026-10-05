@@ -513,9 +513,39 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     // wire shape is fixed — nothing else rides out
     assert.deepEqual(
       Object.keys(m).sort(),
-      ["active", "alerts", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePeerLastRunAt", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "updated"],
+      ["active", "alerts", "laneHealthMs", "laneOk", "lanePaired", "lanePeer", "lanePeerLastRunAt", "lanePending", "lastRunAt", "maxConcurrent", "queuedBot", "queuedHuman", "stale", "tokenWindow", "updated"],
     );
+    assert.equal(m.tokenWindow, null, "no token_window in state → null-honest, never a fake zero");
     assert.deepEqual(m.alerts, [], "healthy spool → no alerts");
+
+    // round 27c: token_window sums ride the card (string-guarded models,
+    // numbers out; malformed fields → null, never a crash). Busy pool fields
+    // preserved — the deferred-queue case below reads them from THIS state.
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({
+        active: 1,
+        queued_human: 0,
+        queued_bot: 2,
+        max_concurrent: 2,
+        token_window: {
+          in: 22_494_139,
+          out: 3_822_257,
+          cache_read: 606_725_632,
+          cache_creation: 0,
+          messages: 5049,
+          sidechain_messages: 0,
+          models: ["glm-5.3:623102k", 42, "claude-haiku-4-5:9940k"],
+        },
+        updated: new Date().toISOString(),
+      }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const mt = (await res.json()).machine;
+    assert.equal(mt.tokenWindow.in, 22_494_139);
+    assert.equal(mt.tokenWindow.cacheRead, 606_725_632);
+    assert.equal(mt.tokenWindow.messages, 5049);
+    assert.deepEqual(mt.tokenWindow.models, ["glm-5.3:623102k", "claude-haiku-4-5:9940k"], "non-string model rows drop");
 
     // doctor-subset escalation: a prompt pending >60s turns the card red —
     // and with THIS fixture's busy fresh watcher-state (round 19, A6), the
@@ -576,6 +606,36 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     res = await signed("GET", "/machine");
     const m3 = (await res.json()).machine;
     assert.ok(m3.alerts.some((a) => /1 refused interaction/.test(a)), "journal refusal stat rides the card");
+
+    // Round 27: the provider-quota tripwire (429/1308/1313) rides the same
+    // red-line surface from the watcher's quota_alarm state flag, stamp
+    // included so a lingering alarm reads with its age.
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({
+        active: 0,
+        quota_alarm: {
+          source: "orchestrator run",
+          detail: "429 [1308] Usage limit reached for 5 hour",
+          at: "2026-10-05T06:25:12.345Z",
+        },
+        updated: new Date().toISOString(),
+      }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const mq = (await res.json()).machine;
+    const qline = mq.alerts.find((a) => /PROVIDER QUOTA/.test(a));
+    assert.ok(qline, "tripwire alert rides the card");
+    assert.match(qline, /06:25Z — orchestrator run: 429 \[1308\] Usage limit reached/);
+
+    // malformed flag → guarded, never breaks the card
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({ active: 0, quota_alarm: { detail: 42 }, updated: new Date().toISOString() }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const mg = (await res.json()).machine;
+    assert.ok(!mg.alerts.some((a) => /PROVIDER QUOTA/.test(a)), "non-string source is dropped silently");
   } finally {
     listener.close();
   }

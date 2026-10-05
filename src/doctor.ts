@@ -25,7 +25,7 @@ export interface DoctorLine {
  *  counter arrival order == burn order; also composite history cursor,
  *  live-copy dedupe, sub-fetch error surfacing, double-scan guard) — only
  *  round-19 bundles carry it. */
-export const BUNDLE_MARKER = "seq-burn-v13";
+export const BUNDLE_MARKER = "tok-window-v14";
 
 function tcpReachable(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
   return new Promise((resolve) => {

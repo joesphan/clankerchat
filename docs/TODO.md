@@ -988,6 +988,111 @@ Peer note: findings generalize to their machine (shared plan). Brief them
 with round 24 once experiments land — one consolidated cite, not a relay of
 the whole report.
 
+## Round 26 — Gemini deep-research #3 verdicts (orchestrator→session pipeline, 2026-10-05)
+
+Report digested against our live stack. Biggest meta-finding: the report's
+top recommendations describe a system we ALREADY RUN (router-executor split,
+composed work orders, acceptance criteria, untrusted-quote-as-data,
+externalized memory over compaction) — validated more than novel.
+
+ALREADY-ALIGNED (no action; report confirms the architecture):
+- Router-executor topology (orchestrator eats the messy Discord context;
+  coding sessions get framed work orders) — our prompt-improver role since
+  2026-10-04. Report Priority 2 = our status quo.
+- Stable-prefix cache economics — client-enforced by construction in Claude
+  Code (tools+system+CLAUDE.md prefix, messages append); our own token rows
+  prove it (cache-read 27:1). Compaction lossiness — why round records live
+  in TODO.md + memory files, not conversation. Opera-style persistent notes
+  = our OPEN-items-with-resolution-criteria pattern.
+- One-work-order-per-run + coalescing (report's "one big spec beats
+  iterative small prompts" — same conclusion, already shipped round ~5).
+
+ADOPTED (cheap, wired this round — orchestrator CLAUDE.md, machine-local):
+- Ambiguity taxonomy checklist (report §1: terminology 33.5% / output
+  format 21.4% / collection semantics 11.5% / edge cases 9.2% — benchmark
+  prevalence, directional not literal): one line in the interpret step so
+  the orchestrator checks the four classes it under-detects.
+- Negative acceptance criteria (EARS "If <condition>, then NOT…" kernel):
+  "done when…" gains the unwanted-behavior case in composed prompts.
+
+REJECTED (with standing reasons — do not re-litigate without new evidence):
+- Sub-agents for context isolation (report §4): round-24 standing verdict —
+  deny Task/Agent on the spawn surface. On a token-billed shared pool,
+  isolation-by-spawn is isolation-by-payment; a subagent's fresh prefix
+  costs more than the parent pollution it saves.
+- SWE-PRM process supervision (§5): an evaluator per trajectory segment is
+  the worst possible shape under prompt economics. Rejected outright.
+- rubric.yaml LLM-judge gates (§5): we have real test suites (238/238
+  class); execution beats judgment on our repos. Kernel noted for any
+  future testless repo.
+- Tree-sitter repo maps (§3): sessions explore directly; repos small;
+  maps decay vs reality. REVISIT TRIGGER: token_window by-project shows a
+  session's cache-read ratio collapsing during exploration (the round-25
+  meter is now the instrument that would prove the need).
+- "Coding session never sees raw Discord text" (§4): deliberately REVERSED
+  here — the verbatim quote rides every relay marked as data (fidelity +
+  ratification law: claims must be checkable against the human's exact
+  words). Our composition carries instruction load; the quote preserves
+  auditability. Stronger than the report's sterilization.
+- Agentless topology (§2): our sessions' value IS agentic exploration under
+  jail+tests; diff-surgical edits are already enforced by tool design
+  (Edit = search/replace). Kernel already shipped as coalescing + context
+  anchors.
+
+NOT RECONCILED (do NOT wire — flagged for phase-2 fit):
+- ★ The two reports CONTRADICT each other on cache price: report #2 (GLM
+  docs) says cache ≈ 25% of fresh-input cost; report #3 (Anthropic
+  mechanics) says 10% (90% discount). 2.5x apart. Neither verified on our
+  backend; the round-25 least-squares fit settles it from our own rows.
+- Report #3's cache mechanics (cache_control breakpoints, 20-block lookback,
+  5-min default TTL / 1h at 2x write premium) are ANTHROPIC-API-specific;
+  our z.ai backend's cache implementation is opaque (observed: cache-creation
+  billed as 0, cache-read works at scale). Not actionable through the Claude
+  Code client anyway — client owns caching. Principle absorbed, mechanics
+  rejected-as-unverifiable.
+- GEARS as a named standard: untraceable; treat as report-coined branding
+  over the real EARS syntax. Benchmark stats (63% guessing, pp gains
+  tables) are directional context from other stacks, not our telemetry.
+
+Peer note: findings generalize to their daemon's relay framing; brief
+DEFERRED past 10:00Z (peak window 06-10Z = 1x burn — bias lane-spawning
+communication off-peak).
+
+## Round 27 — tripwire on the phone, phase-2 fit tool, token line (2026-10-05)
+
+Owner ask: "continue working any other improvements we can do?" — three
+peak-window-safe improvements (all zero-prompt, local), shipped 41b5de4 →
+53006b2 → 7044b47, 246/246, all deployed by drift-revive:
+
+- **27a — provider-quota tripwire on the phone card** (41b5de4): the
+  round-25 tripwire's `quota_alarm` flag now rides /machine `alerts` —
+  same red ⚠ surface as doctor/journal/audit lines, no app change
+  needed. Source + 160-char detail + HH:MM Z stamp (a lingering alarm
+  reads with its age, never as "happening now"); string-guarded,
+  malformed flags drop silently. End-to-end: watcher stderr scan →
+  journal + notice + card line, one deduped path per hour.
+- **27b — `npm run quota-fit`** (53006b2, tools/quota-fit.mjs + 8 tests):
+  phase 2 of the calibration. DELTA regression of provider q_pct on our
+  token-class sums (both windows age out over the same rolling 5h →
+  deltas linear, peer's constant share lands in the intercept);
+  free-weight fit settles the report-#2 (cache=25%) vs #3 (10%)
+  contradiction from our own rows; constrained fits give implied CAP per
+  weighting; reset_at discontinuities excluded from the fit and reported
+  as the drain natural experiment. Two test-design lessons baked in:
+  synthetic deltas must vary INDEPENDENTLY (affine-in-i deltas make the
+  whole design rank-2), and live rows stamp `at` not `ts`. Self-flags
+  PROVISIONAL under 10 pairs or unstable signs — the current 6-pair fit
+  correctly refuses to print quotable constants.
+- **27c — 5h token line on the phone** (7044b47): token_window serves
+  through /machine as numbers (null-honest pre-sweep), the MACHINE card
+  renders `5h tokens: 22.5M in · 606.7M cached · 5.0k msgs · glm-5.3:…`.
+  Bundle marker tok-window-v14.
+
+Pending on data, not code: rows accumulate every ~10min sweep; the fit
+turns quotable at ≥10 steady pairs; the 09:10:44Z reset_at read settles
+fixed-vs-rolling (error-text forensics already say rolling); peer brief
+on rounds 25-27 deferred past 10:00Z (peak window).
+
 ## Round 25 — Gemini deep-research #2 verdicts (GLM quota mechanics, 2026-10-05)
 
 CONFIRMED (cross-validated against local telemetry):
@@ -1028,16 +1133,36 @@ NOT RECONCILED (do NOT wire these constants):
   06:46Z wall as a boundary anchor; peer's daemon-restart-pending poller
   adds their X share when live.
 
-OWNER DECISION ITEM (TOS, both machines): personal plans prohibit account
-sharing; two-machine single-key is policy-gray. Weeks of clean concurrent
-operation with official-client fingerprints on both sides = no active
-enforcement observed (zero 1308 since 10-03, zero 1313 ever). Reject the
-report's "serialize all requests" mitigation (destroys the bilateral
-architecture; unsupported by lived experience). Options: status-quo +
-1308/1313 watch, separate plan for peer, or Team plan. Tyler's call.
+OWNER DECISION ITEM (TOS, both machines): **DECIDED 2026-10-05 ~06:30Z —
+STATUS-QUO + WATCH** (Tyler, in-thread: "do what you think is best i do use
+it on multiple machines and multiple ip addresses bc i own multiple isps so
+if it was an issue it probably wouldve already been one"). Separate plan for
+peer = not a want now; Team plan = probably later. The watch is mechanical:
+429/1308/1313 tripwire in the live watcher (below).
+
+- TRIPWIRE SHIPPED (owner-ordered same hour, machine-local watch.mjs):
+  PROVIDER_QUOTA_RE scans orchestrator-run stderr STREAMING (stdio stderr
+  piped + re-emitted byte-identical to the journal — inherit visibility
+  unchanged), the vision pre-pass's captured stderr, and the quota poll's
+  own HTTP 429. One alarm path, deduped 1/hr: journal PROVIDER-QUOTA ALARM
+  line + phone warn notice + `quota_alarm` state flag. Never suppresses the
+  run (delivery law); 1308 text routes "5h pool exhausted" phrasing, 1313
+  class routes "surface to Tyler".
+- REMEMBER-STORM THIRD PATH killed same hour (relapse at 00:08/00:17 local):
+  session-start-hook.sh's consolidation trigger had NO config gate — every
+  session start in a project with past-day staging spawned a haiku
+  consolidation; the 10-04 kill (recovery + ndc_compression) never covered
+  it, and local midnight rolled Oct-4 staging to past-day. Fix: trigger
+  gated on features.consolidation (string-"false", default false) + all
+  past-day staging consumed to .done.md (injection glob still reads them).
+  Plugin-update caveat unchanged; memory file remember-storm-third-path.md
+  carries the re-kill recipe.
 
 PASSIVE TESTS RUNNING: peak inflection at 06:00Z today (Mon) — row climb
-rate before/after (baseline +3.4/10min pre-peak); reset behavior at
-09:10:44Z. Peer status: 24.2 port landed (46d95e3, merged our side f1cadbc,
-236/236, pushed) but their daemon restart pending (in-memory queue drop
-risk) — no local series their side yet.
+rate before/after (baseline +3.4/10min pre-peak; first in-peak reads +3,
++2 — no visible inflection yet, confounded by round-25 work); reset
+behavior at 09:10:44Z (reset_at still frozen at 06:13Z reading). Peer
+status: 24.2 port landed (46d95e3, merged f1cadbc) AND round-25 port
+already shipped their side (ec516d3 daemon token sweep, Windows
+projectsRoot; their merge 806145d of our 545309e reconverged both mains —
+zero tree diff; merged our side, fast-forward, pushed).
