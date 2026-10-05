@@ -716,3 +716,79 @@ the last owner law enforced purely by behavior.
 
 Peer note: default-off on merge — zero behavior change their side unless
 they set the env, which the standing mirror recommendation already covers.
+
+## Round 21 — owner architecture triage: message cache + read fast-path + search (2026-10-05)
+
+Trigger: Tyler's phone-prompted improvement list (5 items, two chunks).
+Every item got a file:line-grounded verdict; the one that cleared the bar
+shipped this round.
+
+- ITEM 1 (zero-latency reads via local cache + rich search) — WORTH
+  BUILDING, SHIPPED: `src/msgcache.ts` — SQLite (node:sqlite DatabaseSync,
+  WAL, busy_timeout 2000) at `<spool>/msgcache.db`. Fed by the watcher's
+  gateway feed (single chokepoint inside the cursor block, post-quarantine:
+  own posts, bot posts, and webhooks all cached — exactly what REST read
+  returns) + `messageUpdate`/`messageDelete` maintenance listeners (ask
+  cards edit constantly) + the MCP process's own send/edit/delete surfaces
+  (read-after-write consistency; attachment sends defer to the watcher's
+  complete copy since the REST response lacks CDN urls). FAIL-QUIET by
+  design: openMsgCache → null on machines without node:sqlite (loaded via
+  createRequire so a missing builtin throws catchably instead of breaking
+  the ESM graph) — cache is an optimization, never a dependency.
+  - read fast-path (index.ts): when `covers()` PROVABLY covers the query,
+    serve from disk (`source:"cache"`, consumer-identical shape incl.
+    attachments + sender parsing); any doubt → REST (`source:"api"`).
+    HONEST COVERAGE: contiguous start = MIN(cached id) per channel — the
+    live probe caught the original design's lie (no floor row ≠ full
+    history: pre-cursor channels start mid-history, and an old `after`
+    would have been "covered" and served a partial slice). Gap floors from
+    SATURATED boot-replay windows only ever RAISE that start; prune (14d,
+    at boot) walks it forward naturally.
+  - NEW `search` MCP tool: q/channel_id?/hours(≤336)/limit — cache-only,
+    case-insensitive substring with LIKE metachar escaping, newest-first
+    excerpts, quarantine-checked channel ids, honest "cache unavailable"
+    answer on sqlite-less machines. Costs zero Discord rate-limit budget.
+  - SNOWFLAKE LAW: ids are TEXT keys but every SQL comparison/order casts
+    to INTEGER — lexicographic snowflake ordering flips across digit
+    lengths ("999…" > "1000…"). MIN comes back CAST to TEXT because raw
+    INTEGER snowflakes exceed 2^53 as JS numbers. JS-side floor math uses
+    BigInt.
+  - 12 tests (numeric cross-length ordering, covers honesty incl. the
+    mid-history trap, LIKE escaping, persistence, caps). 221/221.
+- ITEM 2 (>2MB artifacts via SSH lane + artifact:// URIs) — EXISTS /
+  NOT-A-FIT: bot_file (49e97cf) already ships ≤2MB files sha256-verified
+  over the lane; repo content crosses via git. The URI-indirection delta
+  would munge receiver-visible provenance (auto-swapping URIs into local
+  paths rewrites what the receiving agent believes it read) for a need
+  that hasn't materialized — no artifact has ever hit the cap.
+- ITEM 3 (reaction-based claim_task locks) — NOT-A-FIT for this topology:
+  nothing polls the thread (the tag-watcher spawns once per trigger;
+  Tyler's "agents polling" premise is the polling-era shape). Collision
+  avoidance here = the routing law (one lane per session), O_EXCL claim
+  files for in-machine races, and lane briefs for bilateral division.
+  Trigger condition for revisiting: if bilateral duplicate rounds appear
+  (both machines shipping the same backlog item), a 🔒 reaction lock is
+  the right shape and cheap — react tool exists, add the emoji to the
+  whitelist + render reaction state in spawn context.
+- ITEM 4 (Rust-native daemon) — NOT-NOW, bilateral decision if ever:
+  measured, the claimed bottleneck isn't one (three node services total
+  ~112MB RSS on this box; no CPU profile shows runtime overhead; no
+  persistent SSH tunnels — connections are per-verb). The ed25519 +
+  hash-chain + botlink surface is exactly the deepest-tested code (221
+  tests); a rewrite re-walks all of it, twice, across two OSes (peer =
+  Windows 11). Revisit trigger: a constrained deployment target (router/
+  Pi-class) where 100MB matters.
+- ITEM 5 (prompt-injection firewall in the read pipeline) — SPLIT VERDICT:
+  the semantic filter is not-a-fit (an LLM call per poll violates the
+  prompt-count law; heuristic stripping of imperative/code content would
+  mangle our OWN posts — asks and instructions are legitimately imperative
+  text we must read verbatim). The mechanical layer already exists at the
+  trigger layer (UNTRUSTED_DATA markers, identity law, webhook/spoof
+  tripwires since 5ff2d74) and now ALSO at the read surface: the tool
+  description carries the untrusted-data law, and search results state it
+  too. Defense stays framing + tripwires, never content rewriting.
+- Deploy: watcher restarted on new dist 03:02Z (feed live, WAL active,
+  boot-replay seeded through the handler); production-path MCP probe
+  verified search registration + the honest REST fallback (`source:"api"`
+  while the cache is young — the fallback IS the proof covers() doesn't
+  lie). Fast-path activates per-channel as history accumulates.
