@@ -1257,3 +1257,22 @@ never enters the fit — bilateral, peer informed in the r28b cite).
 - Watcher restarted 13:59:08Z on the new dist (L7 live before the second
   anchor fire at 14:10:45.872Z). Cite to peer: inject 1791208769299-c640f7
   (covers 034f610 ⊃ db605cf, both pending their merge as of 13:57Z).
+
+### Round 28e (2026-10-05 14:55–15:02Z) — anchor-clamp shipped (4c0067b), live-caught caller bug fixed in the mirror
+
+- Repo: `scanTokenUsage` gains `since` (PromptMeterOptions override) — a
+  calibration row's tok sums scan from the provider window's START so Δq and
+  Δtok measure the identical interval (kills the within-span aging term; the
+  midday span's R²=0.112 sign instability was its signature). Clamp test
+  pinned; 256/256 (drift serve flake load-coupled at 7.93, green isolated).
+- **Live-caught bug in the machine-local mirror**: the first clamped rows
+  (14:57Z, 15:00Z) wrote tok=0 — the clamp used `reset_at` itself, but
+  nextResetTime is the window END (future mid-span); the window starts at
+  `reset_at − 5h`. Fixed in watch.mjs, verified live at 15:01:41Z (tok_in
+  1.55M, msgs 619 from the 14:10:48Z start). Semantics for any mirror: clamp
+  = max(now−5h, reset_at−5h).
+- The 14:57Z row also proves the dist-drift guard self-revived the watcher
+  onto the r28e rebuild mid-tick — first live confirmation of that path.
+- Rows from 15:01:41Z onward carry aligned sums; earlier spans keep rolling
+  semantics (fits never cross spans, so old spans stay internally consistent).
+  First fully-clamped span = the 19:10:48Z anchor.
