@@ -1943,6 +1943,14 @@ async function main(): Promise<void> {
       `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; EVENT-DRIVEN (gateway)`,
   );
 
+  // Discord presence (the green-dot "Playing ..." status). Bots cannot set a
+  // custom profile STATUS line (user-account endpoint, 403 for bots) — the
+  // bot-equivalent is presence activity + online status.
+  me.user.setPresence({
+    status: "online",
+    activities: [{ name: "the overseer — tag = task", type: 0 }], // ActivityType.Playing
+  });
+
   // Slash tree (fork 3e8c6ab): guild-scoped bulk overwrite, idempotent per
   // boot. Members only SEE the commands once the app carries the
   // applications.commands scope (SETUP.md re-auth); registration succeeds
