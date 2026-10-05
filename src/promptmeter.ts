@@ -133,6 +133,13 @@ async function* walkTranscriptsInWindow(root: string, since: number): AsyncGener
   }
 }
 
+/** Line pre-filter for the per-line hot loop: JSON.parse is the semantic gate,
+ *  this substring is only the CPU shave. Hard-coding the compact form silently
+ *  zeroed the meter under a spaced serializer (`"type": "user"`); accept both
+ *  shapes (r28 L8). */
+const lineHasType = (line: string, type: string): boolean =>
+  line.includes(`"type":"${type}"`) || line.includes(`"type": "${type}"`);
+
 async function scanFile(p: string, since: number): Promise<FileAcc> {
   const acc: FileAcc = { turns: 0, sidechain: 0, compact: 0, oldestTurnTs: null };
   try {
@@ -141,7 +148,7 @@ async function scanFile(p: string, since: number): Promise<FileAcc> {
       crlfDelay: Infinity,
     });
     rl.on("line", (line: string) => {
-      if (!line.includes('"type":"user"')) return;
+      if (!lineHasType(line, "user")) return;
       let o: any;
       try {
         o = JSON.parse(line);
@@ -316,7 +323,7 @@ export async function scanTokenUsage(opts: PromptMeterOptions = {}): Promise<Tok
         crlfDelay: Infinity,
       });
       rl.on("line", (line: string) => {
-        if (!line.includes('"type":"assistant"')) return;
+        if (!lineHasType(line, "assistant")) return;
         let o: any;
         try {
           o = JSON.parse(line);

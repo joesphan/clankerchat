@@ -117,6 +117,11 @@ export function describeResetEvent(prev: QuotaSnapshot | null, next: QuotaSnapsh
   // An unparseable resetAt string (vendor shape drift) is a non-event, not a
   // NaN jump that reaches the journal as "+NaNh" (r28 L6).
   if (!Number.isFinite(jumpMs)) return null;
+  // Real fires are +5h jumps. A vendor anchor SLIDE (minutes per poll — the
+  // dead rolling hypothesis) must not turn every 10-min poll into a journal +
+  // phone event flood (r28 L7); under sliding, q_pct simply never empties,
+  // which is the honest signal.
+  if (Math.abs(jumpMs) < 3_600_000) return null;
   return {
     oldPct: prev.pct5h,
     newPct: next.pct5h,
