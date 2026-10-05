@@ -52,6 +52,7 @@ import {
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import {
@@ -70,6 +71,8 @@ import { appendJournal, dailyDigestText, journalFile, journalStats, verifyJourna
 import { appendNotice, listNotices } from "./notices.js";
 import { classifyAudit, filterAuditSince, type AuditLike } from "./audit.js";
 import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
+import { promptsLine, scanPromptUsage, type PromptWindowStats } from "./promptmeter.js";
+import { pollProviderQuota, quotaLine, type ProviderQuota } from "./providerquota.js";
 import {
   askClockLine,
   askDecisionInstruction,
@@ -1879,6 +1882,50 @@ async function sweepDailyDigest(): Promise<void> {
   log(`daily digest notice filed (${today} boundary, chain ${chainOk ? "OK" : "BROKEN"})`);
 }
 
+// Round 23 port (machine-local, card scope): the prompt-count meter sweep.
+// The fork ships the meter + card renderer; the PRODUCER is per-machine (the
+// peer runs his from ~/tools/watch.mjs). Boot + 10-min cadence, zero prompt
+// cost (pure transcript stream), fail-quiet — a meter must never take the
+// watcher down. projectsRoot is passed EXPLICITLY because the library's
+// default (HOME ?? /home/tyler) is Linux-shaped and empty on Windows.
+let promptWindow: PromptWindowStats | null = null;
+let promptLine: string | null = null;
+
+async function sweepPromptUsage(): Promise<void> {
+  const cap = Number(process.env.CLANKER_PROMPT_CAP) || 1600;
+  const softPct = Number(process.env.CLANKER_PROMPT_GATE_PCT) || 0.85;
+  try {
+    promptWindow = await scanPromptUsage({
+      projectsRoot: path.join(os.homedir(), ".claude", "projects"),
+      cap,
+      softPct,
+    });
+    promptLine = promptsLine(promptWindow);
+    log(`prompt window: ${promptLine}`);
+  } catch (err) {
+    log(`prompt sweep failed (fail-quiet, keeping last-good): ${errText(err)}`);
+  }
+  writeWatcherState(); // publish prompt_window (or refresh without one)
+}
+
+// Round 24.2 producer (machine-local port, owner "install"+"go"
+// 2026-10-05): vendor 5h-quota poll beside the local prompt proxy. Boot +
+// 10-min cadence, fail-quiet, token only ever an Authorization header to the
+// allowlisted vendor origin (see providerquota.ts laws).
+let providerQuota: ProviderQuota | null = null;
+let providerLine: string | null = null;
+
+async function sweepProviderQuota(): Promise<void> {
+  try {
+    providerQuota = await pollProviderQuota();
+    providerLine = providerQuota ? quotaLine(providerQuota) : null;
+    log(`provider quota: ${providerLine ?? "unavailable (fail-quiet)"}`);
+  } catch (err) {
+    log(`provider quota sweep failed (fail-quiet, keeping last-good): ${errText(err)}`);
+  }
+  writeWatcherState(); // publish provider_quota (or refresh without one)
+}
+
 /** Publish the watcher's facts into the botlink spool: pool, queues, lane
  * verdict, last-run, updated. Written atomically (tmp+rename) — botlink's
  * status verb and companion's /machine read this file live and must never
@@ -1887,13 +1934,39 @@ function writeWatcherState(): void {
   const snapshot: Record<string, unknown> = {
     active: activeJobs.length,
     queued_human: queue.filter((j) => !j.fromBot).length,
-    queued_bot: queue.filter((j) => j.fromBot).length,
+    queued_bot: queue.filter((j) => !j.fromBot).length,
     max_concurrent: config.maxConcurrent,
     updated: new Date().toISOString(),
   };
   if (laneFacts) snapshot.lane = laneFacts;
   if (lastRunAt) snapshot.last_run_at = lastRunAt;
   if (auditAlerts.length > 0) snapshot.audit_alerts = auditAlerts.map((a) => a.text);
+  if (promptWindow) {
+    snapshot.prompt_window = {
+      at: new Date(promptWindow.now).toISOString(),
+      cap: promptWindow.cap,
+      turns: promptWindow.turns,
+      sidechain: promptWindow.sidechain,
+      burn_per_hr: +promptWindow.burnPerHour.toFixed(2),
+      pct_of_cap: +(100 * promptWindow.pctOfCap).toFixed(1),
+      hot: promptWindow.hot,
+      active_sessions: promptWindow.activeSessions,
+      spam_suspects: promptWindow.spamSuspects,
+      by_project: promptWindow.byProject,
+    };
+  }
+  if (providerQuota) {
+    // reset_at rides every row: whether it slides forward under load (rolling
+    // TTL vs fixed window) is the calibration question the series answers.
+    snapshot.provider_quota = {
+      at: new Date(providerQuota.now).toISOString(),
+      pct_5h: providerQuota.pct5h,
+      reset_at: providerQuota.resetAt,
+      mcp_pct: providerQuota.mcpPct,
+      calls_24h: providerQuota.calls24h,
+      tokens_24h: providerQuota.tokens24h,
+    };
+  }
   const file = path.join(askSpool(), "watcher-state.json");
   try {
     atomicWrite(file, JSON.stringify(snapshot, null, 2));
@@ -1961,6 +2034,16 @@ async function main(): Promise<void> {
   } catch (err) {
     log(`slash registration failed: ${errText(err)} — commands unavailable this boot`);
   }
+
+  // Round 23 (machine-local port): boot + 10-min prompt-meter sweep →
+  // prompt_window in watcher-state.json + the status card's promptsLine.
+  void sweepPromptUsage();
+  setInterval(() => void sweepPromptUsage(), 10 * 60_000).unref();
+
+  // Round 24.2 (machine-local port): same cadence, vendor 5h-quota poll →
+  // provider_quota in watcher-state.json + the status card's quotaLine.
+  void sweepProviderQuota();
+  setInterval(() => void sweepProviderQuota(), 10 * 60_000).unref();
 
   // CLANKER SPEC A1: one REST catch-up at boot, then the gateway is the only
   // trigger source — no idle polling, no cursor crawls, no swallowed history.
@@ -2381,6 +2464,11 @@ function statusFacts(): StatusFacts {
     servicesLine:
       `lane ${laneFacts ? (laneFacts.ok ? "ok" : "down") : "not probed"} · ` +
       `fullAuto=${config.fullAuto} · wake=${config.wake} · up since ${START_ISO}`,
+    // Round 23: rendered only after the first sweep — absent reads as
+    // "not measured" upstream, never a fake zero (fork contract).
+    promptsLine: promptLine ?? undefined,
+    // Round 24.2: same absent-pre-poll contract for the vendor meter.
+    quotaLine: providerLine ?? undefined,
   };
 }
 

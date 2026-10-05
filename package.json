@@ -23,7 +23,7 @@
     "test:companion": "node --test tests/companion.test.mjs",
     "test:asks": "node --test tests/asks.test.mjs",
     "test:daemon-guard": "node --test tests/daemon-guard.test.mjs",
-    "test": "node --test tests/botlink.test.mjs tests/guards.test.mjs tests/leaks.test.mjs tests/pairing.test.mjs tests/companion.test.mjs tests/rotation.test.mjs tests/asks.test.mjs tests/prompts.test.mjs tests/daemon-guard.test.mjs tests/context.test.mjs tests/slash.test.mjs tests/multi-machine.test.mjs tests/run-progress.test.mjs tests/attachments.test.mjs tests/spark-mcp.test.mjs tests/journal.test.mjs tests/audit.test.mjs tests/notices.test.mjs tests/drift.test.mjs tests/msgcache.test.mjs tests/promptmeter.test.mjs"
+    "test": "node --test tests/botlink.test.mjs tests/guards.test.mjs tests/leaks.test.mjs tests/pairing.test.mjs tests/companion.test.mjs tests/rotation.test.mjs tests/asks.test.mjs tests/prompts.test.mjs tests/daemon-guard.test.mjs tests/context.test.mjs tests/slash.test.mjs tests/multi-machine.test.mjs tests/run-progress.test.mjs tests/attachments.test.mjs tests/spark-mcp.test.mjs tests/journal.test.mjs tests/audit.test.mjs tests/notices.test.mjs tests/drift.test.mjs tests/msgcache.test.mjs tests/promptmeter.test.mjs tests/providerquota.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
