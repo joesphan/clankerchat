@@ -34,6 +34,8 @@ import {
   askClockLine,
   isAskV2Message,
   rebuildAskV2ForEdit,
+  lazyConsensusRefused,
+  LAZY_CONSENSUS_REFUSAL,
 } from "../dist/asks.js";
 
 function tmpSpool() {
@@ -592,4 +594,48 @@ test("decideAsk expiry boundary (round 17): no deciding surface acts past the fu
     approvers: [APPROVER], ttlMs: 60_000,
   });
   assert.equal(decideAsk(spool, early.askId, "denied", APPROVER).status, "denied");
+});
+
+// --- lazy-consensus revocation (owner law 2026-10-04; round 20 mechanical) ----
+
+test("lazy refusal: env set → mint refused BEFORE any side effect; fail-closed default unaffected", () => {
+  const spool = tmpSpool();
+  const prev = process.env.CLANKER_NO_LAZY_CONSENSUS;
+  process.env.CLANKER_NO_LAZY_CONSENSUS = "1";
+  try {
+    // helper is the single source both surfaces share
+    assert.equal(lazyConsensusRefused("approve"), true);
+    assert.equal(lazyConsensusRefused("expire"), false);
+    assert.equal(lazyConsensusRefused(undefined), false);
+
+    assert.throws(
+      () => createPendingAsk(spool, { question: "go?", channelId: "1", messageId: null, approvers: [APPROVER], onExpiry: "approve" }),
+      new RegExp(LAZY_CONSENSUS_REFUSAL.slice(0, 30).replace(/[()\\]/g, "\\$&")),
+    );
+    // refusal precedes mkdir + write: nothing landed
+    assert.equal(fs.existsSync(path.join(spool, "asks")), false);
+
+    // the law kills lazy consensus, not asks: default fail-closed mint still works
+    const rec = createPendingAsk(spool, { question: "go?", channelId: "1", messageId: null, approvers: [APPROVER] });
+    assert.equal(rec.status, "pending");
+    assert.equal(rec.onExpiry, undefined);
+  } finally {
+    if (prev === undefined) delete process.env.CLANKER_NO_LAZY_CONSENSUS;
+    else process.env.CLANKER_NO_LAZY_CONSENSUS = prev;
+    fs.rmSync(spool, { recursive: true, force: true });
+  }
+});
+
+test("lazy refusal: env unset → upstream behavior unchanged (peer compatibility)", () => {
+  const spool = tmpSpool();
+  const prev = process.env.CLANKER_NO_LAZY_CONSENSUS;
+  delete process.env.CLANKER_NO_LAZY_CONSENSUS;
+  try {
+    assert.equal(lazyConsensusRefused("approve"), false);
+    const rec = createPendingAsk(spool, { question: "go?", channelId: "1", messageId: null, approvers: [APPROVER], onExpiry: "approve" });
+    assert.equal(rec.onExpiry, "approve"); // peers who haven't revoked keep the feature
+  } finally {
+    if (prev !== undefined) process.env.CLANKER_NO_LAZY_CONSENSUS = prev;
+    fs.rmSync(spool, { recursive: true, force: true });
+  }
 });

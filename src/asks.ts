@@ -276,6 +276,21 @@ export function newAskId(): string {
   return `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
 }
 
+/** Owner law 2026-10-04 (permanent): asks originating here NEVER approve by
+ *  silence. Behavioral for one day; this makes it mechanical. Env-gated so
+ *  the shared lib stays upstream-shaped for peers who haven't revoked it:
+ *  CLANKER_NO_LAZY_CONSENSUS=1 refuses every lazy-consensus mint at the
+ *  chokepoint. Exported so the MCP handler can refuse BEFORE posting the
+ *  card — a refusal after channel.send would orphan a live "silence counts
+ *  as yes" card with no registry entry behind it (the exact promise this
+ *  law kills), clickable-but-dead until someone taps it. */
+export const LAZY_CONSENSUS_REFUSAL =
+  "ask refused: lazy consensus is revoked on this machine (owner law 2026-10-04) — silence never approves. Mint a fail-closed ask (omit on_expiry) or ask the human directly.";
+
+export function lazyConsensusRefused(onExpiry?: string): boolean {
+  return onExpiry === "approve" && process.env.CLANKER_NO_LAZY_CONSENSUS === "1";
+}
+
 export function createPendingAsk(
   spoolDir: string,
   rec: Omit<AskRecord, "askId" | "createdAt" | "expiresAt" | "status" | "onExpiry"> & {
@@ -284,6 +299,7 @@ export function createPendingAsk(
     onExpiry?: "approve";
   },
 ): AskRecord {
+  if (lazyConsensusRefused(rec.onExpiry)) throw new Error(LAZY_CONSENSUS_REFUSAL);
   // One clock read for both stamps: createdAt/expiresAt differ by EXACTLY
   // the ttl (tests assert this; two Date.now() calls drifted ±ms on a
   // scheduler tick and flaked the suite).

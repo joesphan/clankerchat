@@ -46,7 +46,15 @@ import { z } from "zod";
 import { loadEnvFile, PROJECT_ROOT } from "./env.js";
 import { botlinkRequest, buildFileTransfer, resolveBotlinkPeerFromEnv, type BotlinkPeer } from "./botlink.js";
 import { findLeakSignals, leakRefusal, findMassMentions, massMentionRefusal } from "./leaks.js";
-import { newAskId, buildAskV2Components, askClockLine, ASK_V2_FLAG, createPendingAsk } from "./asks.js";
+import {
+  newAskId,
+  buildAskV2Components,
+  askClockLine,
+  ASK_V2_FLAG,
+  createPendingAsk,
+  lazyConsensusRefused,
+  LAZY_CONSENSUS_REFUSAL,
+} from "./asks.js";
 import { listContext, readContext, searchContext } from "./context.js";
 
 const MAX_MESSAGE_LENGTH = 2000; // Discord hard limit per message
@@ -1111,7 +1119,7 @@ function registerTools(server: McpServer): void {
           .enum(["expire", "approve"])
           .optional()
           .describe(
-            "expire (DEFAULT, fail-closed): unanswered = expired, never approval. approve (lazy consensus): unanswered = approved — the message says so up front and any Deny before expiry still wins. Use approve ONLY for asks where silence genuinely means yes; gates and secret-class asks never.",
+            "expire (DEFAULT, fail-closed): unanswered = expired, never approval. approve (lazy consensus): unanswered = approved — the message says so up front and any Deny before expiry still wins. Use approve ONLY for asks where silence genuinely means yes; gates and secret-class asks never. Some machines revoke approve entirely (the refusal says so) — on refusal, re-ask without it (fail-closed).",
           ),
         channel_id: z.string().optional().describe("Channel or thread ID (snowflake). Defaults like `send`."),
         thread_name: z.string().min(1).optional().describe("Thread name to resolve, like `send`."),
@@ -1134,6 +1142,10 @@ function registerTools(server: McpServer): void {
         }
         const ttlMin = expires_minutes ?? 60;
         const lazy = on_expiry === "approve";
+        // Owner law 2026-10-04: refuse BEFORE any side effect — the card must
+        // never post if its registry entry cannot be minted (chokepoint also
+        // refuses, for every non-MCP minting surface).
+        if (lazyConsensusRefused(on_expiry)) throw new Error(LAZY_CONSENSUS_REFUSAL);
         // Lazy consensus must be legible ON the ask itself: a human skimming
         // the thread has to know silence consents without reading any docs.
         const askText = lazy
