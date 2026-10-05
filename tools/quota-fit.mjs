@@ -183,6 +183,14 @@ export function main(argv) {
     console.error(`quota-fit: cannot read ${file}`);
     process.exit(1);
   }
+  // the writer rotates at 4MB to a single .old — prepend it when present so
+  // the fit never silently loses months of rows (rows stay chronological
+  // across the boundary: rotation preserves order, gaps stay ~one sweep)
+  try {
+    text = fs.readFileSync(`${file}.old`, "utf8") + text;
+  } catch {
+    /* no rotated prefix — normal case */
+  }
   const rows = text
     .split("\n")
     .filter((l) => l.trim())
