@@ -10,7 +10,10 @@ react-native) — mine them before designing.
 - No Claude session restarts to deliver — everything lands in the service layer
   (watcher/daemon/companion/metro) or repo code.
 - Clanker↔clanker work rides botlink; Discord is human-eyes only.
-- Prompt COUNT is the cost unit (Tyler's law) — efficiency wins are real wins.
+- TOKENS are the cost unit (corrected 2026-10-05: z.ai 5h TOKENS_LIMIT,
+  fixed-anchor, no prompt counter exists — src/providerquota.ts is ground
+  truth; this repo's promptmeter is the spawn-discipline proxy) — efficiency
+  wins are real wins.
 
 ## Now (high value, low risk)
 

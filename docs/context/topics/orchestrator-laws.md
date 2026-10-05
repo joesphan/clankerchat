@@ -28,7 +28,8 @@ mechanics and routing, never law.
 - Two queues: human (tag/reply/forward/ask-click) always drains before
   bot. Lane injects are deliberate and never coalesce with Discord
   triggers; same-channel Discord triggers DO coalesce into one queued
-  run (prompt-count economy).
+  run (token-pool economy — corrected 2026-10-05: the plan bills tokens, and
+  each spawn spends them).
 - Pool runs `MAX_CONCURRENT` (default 3, clamped 1–8) orchestrator
   processes (src/daemon.ts loadConfig; corrected 2026-10-04).
 - Bare "status" (tagged, mentions stripped) answers from a canned card

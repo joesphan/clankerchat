@@ -1,14 +1,17 @@
-// promptmeter — measures Claude-code plan PROMPT usage on this machine.
+// promptmeter — local TURN/spawn-discipline meter beside the vendor token quota.
 //
-// Tyler's plan bills by PROMPT COUNT (z.ai legacy v1 max: ~1600 prompts per
-// 5-hour window, no weekly cap), not tokens. Every user turn in every session
-// — interactive, headless (-p), hook-spawned, or another session's relayed
-// message — draws from that one pool. This module is the meter: it streams
+// ROLE CORRECTION (2026-10-05, round 25): the plan bills by TOKENS — the z.ai
+// 5h TOKENS_LIMIT, read by src/providerquota.ts (the billing ground truth;
+// fixed-anchor, capacity returns full at each fire). There is NO server-side
+// prompt counter; "~1600 prompts" was a marketing abstraction. This module
+// keeps a DIFFERENT, complementary discipline: it streams
 // ~/.claude/projects/**\/*.jsonl transcripts (mtime-filtered) and counts REAL
 // user turns in a sliding window, separates sidechain (subagent) messages,
 // and flags the headless-spawn pattern (many tiny sessions in one project)
-// that caused the 2026-10-05 remember-plugin storm (422 of 570 prompts, 74%
-// of a window, from ~105 four-turn summarizer sessions firing every ~2 min).
+// that caused the 2026-10-05 remember-plugin storm (422 of 570 window turns,
+// from ~105 four-turn summarizer sessions firing every ~2 min) — every extra
+// spawn spends tokens through the same pool, so spawn discipline IS budget
+// discipline.
 //
 // Laws baked in:
 // - ZERO PROMPT COST: pure filesystem scan, no LLM anywhere. The watcher
