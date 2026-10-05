@@ -53,3 +53,52 @@ export function nextStatusDelayMs(elapsedMs: number): number {
   const intoCycle = (elapsedMs - STATUS_AFTER_MS) % STATUS_EDIT_MS;
   return Math.max(1_000, STATUS_EDIT_MS - intoCycle);
 }
+
+/**
+ * The crash/timeout salvage post (audit round 3 W2, template moved into the
+ * repo in round 18): one honest line when a run dies without answering, so a
+ * tagged human never faces total silence. `why` is the death reason the run
+ * machinery composes — "timed out at 10 min" / "exited early (code N)".
+ * Lives HERE (not at the posting site) so isTransientOwnPost below matches
+ * it by construction instead of by copy.
+ */
+export function salvagePostLine(why: string): string {
+  return `run ${why} before posting in-thread — if it relayed work to a session that may still land; otherwise ask again or narrow the ask.`;
+}
+
+/**
+ * True when a post is RUN MACHINERY, not a run's answer — the editable
+ * "still working" line (statusLine above), the crash salvage line
+ * (salvagePostLine above), or a canned status card (slash.ts
+ * renderStatusCard's first line). First line decides: machinery posts are
+ * single-line or lead with their header.
+ *
+ * Why this exists (audit round 3 W2): consumers that attribute own-posts to
+ * runs — the "did this run post?" salvage decider and the phone prompt's
+ * answer excerpt — must not treat machinery as an answer. A transient
+ * matching as "posted" swallows a crashed run's salvage line; matching as an
+ * excerpt puts boilerplate on the phone.
+ *
+ * Round 18: this matcher used to live in one machine's watcher while the
+ * TEMPLATES it matches are rendered here and in slash.ts — a wording change
+ * on either side silently broke it. Colocated now, and the tests pin the
+ * matcher against the actual generators, so template drift fails a build
+ * instead of shipping.
+ */
+export function isTransientOwnPost(content: string | null | undefined): boolean {
+  const t = String(content ?? "").split("\n", 1)[0]?.trim() ?? "";
+  if (!t) return false;
+  // 1. The editable "still working" status line (statusLine above).
+  if (t.startsWith("⏳") && t.includes("still working — ") && t.endsWith("(answer lands here when the run finishes)")) {
+    return true;
+  }
+  // 2. The crash/timeout salvage line (salvagePostLine above).
+  if (/^run (timed out at \d+ min|exited early \(code -?\d+\)) before posting in-thread\b/.test(t)) {
+    return true;
+  }
+  // 3. The canned status card's header line (slash.ts renderStatusCard).
+  if (/^\*\*.*\*\* — status \(canned card, no model run\)$/.test(t)) {
+    return true;
+  }
+  return false;
+}

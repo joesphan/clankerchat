@@ -567,3 +567,35 @@ then parse/bind honesty, then the watcher's throw/liveness classes.
   (run-progress.ts statusLine, slash.ts card header) — if those templates
   change, the matcher must follow. The tests pin today's shapes; moving the
   matcher into run-progress.ts would remove the drift risk.
+
+## Round 18 — isTransientOwnPost + salvage template moved into the repo (2026-10-04)
+
+The round-17 known-coupling, closed. The transient-own-post matcher and the
+crash-salvage line template were local to one machine's watcher while the
+strings they match are RENDERED BY THE REPO (run-progress.ts statusLine,
+slash.ts renderStatusCard header) — a wording change on either side would
+silently un-match that machine's own machinery, resurrecting the W2 bugs
+(status line marking a crashed run "posted" → swallowed salvage; boilerplate
+as a phone prompt's answer excerpt).
+
+- src/run-progress.ts: `salvagePostLine(why)` (the crash/timeout salvage
+  text, previously a bare literal in the watcher's finish path) and
+  `isTransientOwnPost(content)` (first-line matcher for the three machinery
+  shapes: ⏳ status line, salvage line, canned-card header). run-progress.ts
+  is the charter home — "line shape shared across machines" — so the peer's
+  daemon (same salvage-post feature) gets template + matcher free on merge.
+- tests/run-progress.test.mjs: +3 tests. The drift-kill property is the
+  round-trip pin — the matcher is asserted against the ACTUAL generators
+  (`statusLine(...)`, `salvagePostLine(...)`, `renderStatusCard(...)` first
+  line AND whole card), so a template edit fails the suite in the same
+  commit. Near-miss matrix (truncated status line, trailing graft, missing
+  anchor phrase, header without suffix, empty/null, prose that mentions the
+  words, machinery text on line 2) moved over from the watcher suite.
+- Watcher (~/tools, per-machine): imports both from dist/run-progress.js,
+  salvage send now posts salvagePostLine(why); watch-history.mjs drops its
+  copy (pointer comment left); its 2 local tests moved to the repo suite.
+  Watcher tests 22/22.
+- Deploy: watch.mjs edited BEFORE the build, so the round-13 drift guard's
+  self-revival loads new dist + new watch.mjs in one boot — no manual
+  restart window where an old watch.mjs could import a missing export.
+- Tests: repo 200/200 (was 197); watcher 22/24 → 22/22 (2 moved, not lost).
