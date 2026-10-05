@@ -911,3 +911,60 @@ Provider-accounting caveat (honest): we count PRIMARY user turns as the
 billing proxy. Whether z.ai bills sidechain/subagent turns, tool-call
 rounds within a turn, or token-limit auto-resumes separately is
 UNVERIFIED — top of the Gemini deep-research list handed to the owner.
+
+## Round 24 planning — Gemini deep-research verdicts (2026-10-05)
+
+Owner ran the deep-research prompt; report digested against tonight's
+measurements. Verdicts (full reasoning in session; preserved for the next
+compaction):
+
+ADOPTED (already true or cheap):
+- Priority 5 (official-client fingerprint): ALREADY COMPLIANT — every model
+  call originates from the compiled claude binary; no daemon/SDK API traffic
+  (companion/metro/watcher never touch the API endpoint).
+- Priority 3 (no autonomous subagents on the spawn surface): ALREADY TRUE —
+  orchestrator deny list includes Task + Agent; daemon-side spawns are the
+  vision pre-pass (one per image BATCH, hot-skipped).
+- Meter accuracy: compaction entries ARE type:user in transcripts
+  (isCompactSummary:true) → currently counted as turns. Split into a separate
+  `compact` count (sidechain-style: reported, not gated) so dashboard
+  reconciliation (Experiment A) can attribute exactly. Round-24 item.
+- Meter addition: next-replenishment projection (age-out time of oldest
+  in-window turn) + peak-window flag (06:00–10:00 UTC, per report unverified)
+  on the card. Additive keys only, as always.
+
+EXPERIMENTS (≤10 prompts, owner reads dashboard, run OFF-peak >10:00Z):
+- A (matters): 1 turn spawning 3 one-echo subagents → dashboard delta 1 vs 4
+  settles sidechain billing. Also reconcile compact: 1 plain turn after a
+  compaction vs delta.
+- B (cheap, expected yes): daemon socket-inject "acknowledge" → delta 1
+  confirms relays bill like human input (already our operating assumption).
+- C (skip): cache TTL is latency-only on a prompt-count plan; not worth
+  prompts.
+
+REJECTED (with reasons — do not re-litigate without new evidence):
+- Priority 1 (persistent router session replacing -p spawns): report optimizes
+  prompt economics and ignores our threat model — per-run sandboxing, canaries,
+  UNTRUSTED_DATA framing, 10-min timeout, clean-env are per-run by design.
+  Post-storm legit burn ≈29/hr vs 1600/5h — no economics emergency. The
+  grouping benefit (1 prompt = 15-20 tool loops, X-Claude-Code-Session-Id)
+  ALREADY applies per spawned run. Coalescing/fast-paths killed the low-value
+  spawn classes; keep the spawner.
+- Priority 2 (leaky-bucket defer at P_max=530): round-19 A1 law — delivery
+  classes never drop; a defer queue is complexity for a 429 we've never hit.
+  Visibility first (replenishment projection above); add defer ONLY if a real
+  429 is observed (watcher would log exit + salvage line).
+- CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS / CLAUDE_AGENT_SDK_DISABLE_*: env names
+  unverified — do not set invented vars. Revisit only with docs.
+
+OPEN (owner dashboard checks, zero prompts):
+- Time-of-day multiplier (3x peak / 2x off-peak claim): compare meter count
+  vs dashboard delta over a fixed hour. If ratio >1, wire real multipliers
+  into cap model. Affects BOTH machines (shared plan).
+- Rolling-TTL vs fixed 10:10 anchor: if dashboard "resets at" time slides
+  later as usage continues → rolling TTL confirmed (meter already models
+  sliding; no code change either way).
+
+Peer note: findings generalize to their machine (shared plan). Brief them
+with round 24 once experiments land — one consolidated cite, not a relay of
+the whole report.

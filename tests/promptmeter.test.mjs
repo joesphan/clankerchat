@@ -22,6 +22,9 @@ function toolResultLine(ts) {
 function sidechainLine(ts) {
   return `{"type":"user","isSidechain":true,"timestamp":"${ts}","message":{"role":"user","content":"subagent chatter"},"sessionId":"s1"}`;
 }
+function compactLine(ts) {
+  return `{"type":"user","isCompactSummary":true,"timestamp":"${ts}","message":{"role":"user","content":"compacted"},"sessionId":"s1"}`;
+}
 function assistantLine(ts) {
   return `{"type":"assistant","timestamp":"${ts}","message":{"role":"assistant","content":"ok"},"sessionId":"s1"}`;
 }
@@ -98,4 +101,30 @@ test("unreadable/corrupt files and a missing root degrade to zeros, never throw"
   const s2 = await scanPromptUsage({ projectsRoot: root, now: NOW });
   assert.equal(s2.turns, 0);
   assert.ok(s2.byProject);
+});
+
+test("compaction summaries count separately; replenish projects oldest turn age-out; peak window flag (round 24)", async () => {
+  const root = tmpRoot();
+  writeProj(root, "-c", {
+    "a.jsonl": [userLine("2026-10-05T00:30:00Z"), compactLine("2026-10-05T01:00:00Z"), userLine(IN)],
+  });
+  const s = await scanPromptUsage({ projectsRoot: root, now: NOW, cap: 100 });
+  assert.equal(s.turns, 2, "human turns only");
+  assert.equal(s.compact, 1, "compact summary split out of turns");
+  assert.equal(s.sidechain, 0);
+  // oldest turn 00:30Z + 5h window = 05:30Z; NOW = 04:30Z → 60 min to capacity
+  assert.equal(Math.round(s.replenishInMs / 60000), 60);
+  assert.match(promptsLine(s), /\+1@05:30Z/);
+  assert.equal(s.peak, false, "04:30Z is outside the claimed 06:00–10:00Z peak");
+  // inside the claimed peak window
+  const s2 = await scanPromptUsage({ projectsRoot: root, now: Date.parse("2026-10-05T07:00:00Z"), cap: 100 });
+  assert.equal(s2.peak, true);
+  // compact-only window: counted (visible) but no turn → no replenish promise
+  const onlyCompact = tmpRoot();
+  writeProj(onlyCompact, "-k", { "k.jsonl": [compactLine("2026-10-05T06:30:00Z")] });
+  const s3 = await scanPromptUsage({ projectsRoot: onlyCompact, now: Date.parse("2026-10-05T07:00:00Z") });
+  assert.equal(s3.compact, 1);
+  assert.equal(s3.turns, 0);
+  assert.equal(s3.replenishInMs, null, "nothing gating → no age-out to project");
+  assert.doesNotMatch(promptsLine(s3), /\+1@/);
 });
