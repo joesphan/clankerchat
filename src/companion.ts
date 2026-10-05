@@ -441,6 +441,10 @@ export function startCompanionServer(opts: {
             log(`companion: ask ${askM[1]} tap arrived after ${existing.status} (${existing.decidedBy ?? "?"}) — nothing changed`);
             return json(res, 409, { error: `already ${existing.status}`, status: existing.status, decidedBy: existing.decidedBy ?? null });
           }
+          // Map mirrors the route alphabet (the phone offers Approve/Deny only).
+          // If this route ever gains yolo (custom_ids carry it since c2a7ebe),
+          // enumerate it here — a binary fallback records a YOLO tap as denied
+          // (the watcher host hit exactly that, 2026-10-04).
           const rec = decideAsk(spoolDir, askM[1], askM[2] === "approve" ? "approved" : "denied", `companion:${v.phone.id}`);
           if (!rec || rec.status === "pending") return json(res, 500, { error: "decision failed to record" });
           log(`companion: ask ${askM[1]} ${rec.status} by ${v.phone.id} — delivery pending watcher sweep`);
