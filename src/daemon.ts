@@ -71,7 +71,13 @@ import { appendJournal, dailyDigestText, journalFile, journalStats, verifyJourna
 import { appendNotice, listNotices } from "./notices.js";
 import { classifyAudit, filterAuditSince, type AuditLike } from "./audit.js";
 import { registerSlashCommands, renderStatusCard, type StatusFacts } from "./slash.js";
-import { promptsLine, scanPromptUsage, type PromptWindowStats } from "./promptmeter.js";
+import {
+  promptsLine,
+  scanPromptUsage,
+  scanTokenUsage,
+  type PromptWindowStats,
+  type TokenWindowStats,
+} from "./promptmeter.js";
 import { pollProviderQuota, quotaLine, type ProviderQuota } from "./providerquota.js";
 import {
   askClockLine,
@@ -1908,6 +1914,29 @@ async function sweepPromptUsage(): Promise<void> {
   writeWatcherState(); // publish prompt_window (or refresh without one)
 }
 
+// Round 25 producer (machine-local port, lane task 2026-10-05): token-class
+// meter beside the prompt proxy — the X variable for the quota-fit
+// correlation (quota-fit-20261005). Same projectsRoot and fail-quiet law;
+// scanTokenUsage sums input/output/cache-read/cache-creation per model,
+// split mainline/sidechain (whether subagents bill is Experiment A).
+let tokenWindow: TokenWindowStats | null = null;
+
+async function sweepTokenUsage(): Promise<void> {
+  try {
+    tokenWindow = await scanTokenUsage({
+      projectsRoot: path.join(os.homedir(), ".claude", "projects"),
+    });
+    const t = tokenWindow.total;
+    log(
+      `token window: in=${t.input} out=${t.output} cacheRead=${t.cacheRead} cc=${t.cacheCreation}` +
+        ` msgs=${t.messages} sidechain_in=${tokenWindow.sidechain.input}`,
+    );
+  } catch (err) {
+    log(`token sweep failed (fail-quiet, keeping last-good): ${errText(err)}`);
+  }
+  writeWatcherState(); // publish token_window (or refresh without one)
+}
+
 // Round 24.2 producer (machine-local port, owner "install"+"go"
 // 2026-10-05): vendor 5h-quota poll beside the local prompt proxy. Boot +
 // 10-min cadence, fail-quiet, token only ever an Authorization header to the
@@ -1965,6 +1994,17 @@ function writeWatcherState(): void {
       mcp_pct: providerQuota.mcpPct,
       calls_24h: providerQuota.calls24h,
       tokens_24h: providerQuota.tokens24h,
+    };
+  }
+  if (tokenWindow) {
+    // Pairs with provider_quota by tick alignment (both fire at boot + 10-min)
+    // — the fit joins on at/pct_5h against these per-class sums.
+    snapshot.token_window = {
+      at: new Date(tokenWindow.now).toISOString(),
+      mainline: tokenWindow.mainline,
+      sidechain: tokenWindow.sidechain,
+      total: tokenWindow.total,
+      by_model: tokenWindow.byModel,
     };
   }
   const file = path.join(askSpool(), "watcher-state.json");
@@ -2044,6 +2084,11 @@ async function main(): Promise<void> {
   // provider_quota in watcher-state.json + the status card's quotaLine.
   void sweepProviderQuota();
   setInterval(() => void sweepProviderQuota(), 10 * 60_000).unref();
+
+  // Round 25 (machine-local port): same cadence, token-class scan →
+  // token_window in watcher-state.json (card unchanged — rows, not chrome).
+  void sweepTokenUsage();
+  setInterval(() => void sweepTokenUsage(), 10 * 60_000).unref();
 
   // CLANKER SPEC A1: one REST catch-up at boot, then the gateway is the only
   // trigger source — no idle polling, no cursor crawls, no swallowed history.
