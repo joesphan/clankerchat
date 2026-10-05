@@ -12,6 +12,7 @@ import {
   fitFreeWeights,
   fitHypothesis,
   formatReport,
+  splitSpans,
   main,
 } from "../tools/quota-fit.mjs";
 
@@ -204,4 +205,74 @@ test("--json: provisional flag labels a sign-unstable fit (r28 M4)", () => {
   const out = JSON.parse(logged[0]);
   assert.equal(out.steadyPairs, 10);
   assert.equal(out.provisional, true);
+});
+
+test("splitSpans: breaks exactly where reset_at changes, null never splits (r28 M3)", () => {
+  const A = "2026-10-05T09:10:44.917Z";
+  const B = "2026-10-05T14:10:45.872Z";
+  const r = (ts, resetAt) => parseRow({ ts, q_pct: 10, reset_at: resetAt, tok: { in: 1, out: 1, cr: 1, cc: 0 } });
+  const spans = splitSpans([r("2026-10-05T05:00:00Z", A), r("2026-10-05T05:10:00Z", A), r("2026-10-05T05:20:00Z", A), r("2026-10-05T09:20:00Z", B), r("2026-10-05T09:30:00Z", B)]);
+  assert.equal(spans.length, 2);
+  assert.equal(spans[0].length, 3);
+  assert.equal(spans[1].length, 2);
+  assert.equal(splitSpans([r("2026-10-05T05:00:00Z", A), r("2026-10-05T05:10:00Z", A)]).length, 1);
+  // null resetAt splits on both sides (same !== boundary pairDeltas uses) —
+  // the null row lands as a singleton and drops out of fitting, exactly like
+  // the old isReset exclusion
+  const withNull = splitSpans([r("2026-10-05T05:00:00Z", A), r("2026-10-05T05:10:00Z", null), r("2026-10-05T05:20:00Z", B)]);
+  assert.equal(withNull.length, 3);
+  assert.deepEqual(withNull.map((s) => s.length), [1, 1, 1]);
+});
+
+test("--json spans: each anchor window fitted alone; newest is the headline (r28 M3)", () => {
+  const OLD = "2026-10-05T09:10:44.917Z";
+  const NEW = "2026-10-05T14:10:45.872Z";
+  const raw = [];
+  // OLD span: 11 rows (10 steady pairs — the quotable threshold) burning all
+  // three classes with the suite's true constants — quotable by construction
+  // (the morning-window shape).
+  let inT = 1_000_000;
+  let outT = 100_000;
+  let crT = 20_000_000;
+  let q = 10;
+  for (let i = 0; i < 11; i++) {
+    const dIn = Math.round(120_000 * (0.7 + ((i * 7) % 11) / 20));
+    const dOut = Math.round(8_000 * (0.7 + ((i * 5) % 13) / 25));
+    const dCr = Math.round(900_000 * (0.6 + ((i * 3) % 17) / 20));
+    inT += dIn;
+    outT += dOut;
+    crT += dCr;
+    q += (dIn * K_IN + dOut * K_OUT + dCr * K_CR) * 100;
+    raw.push({ at: new Date(Date.parse("2026-10-05T05:00:00Z") + i * 600_000).toISOString(), q_pct: q, reset_at: OLD, tok: { in: inT, out: outT, cr: crT, cc: 0 } });
+  }
+  // NEW span: 3 rows — too few to fit (the post-reset shape).
+  for (let i = 0; i < 3; i++) {
+    inT += 50_000;
+    outT += 4_000;
+    crT += 400_000;
+    q += 1;
+    raw.push({ at: new Date(Date.parse("2026-10-05T09:20:00Z") + i * 600_000).toISOString(), q_pct: q, reset_at: NEW, tok: { in: inT, out: outT, cr: crT, cc: 0 } });
+  }
+  const tmp = `/tmp/quota-fit-spans-test-${process.pid}.jsonl`;
+  fs.writeFileSync(tmp, raw.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  const logged = [];
+  const orig = console.log;
+  console.log = (s) => logged.push(s);
+  try {
+    main(["--json", tmp]);
+  } finally {
+    console.log = orig;
+    fs.rmSync(tmp, { force: true });
+  }
+  const out = JSON.parse(logged[0]);
+  assert.equal(out.spans.length, 2);
+  assert.equal(out.resetPairs, 1, "the span boundary is still visible as a reset pair");
+  // headline = NEWEST span: 2 steady pairs, unfittable → provisional
+  assert.equal(out.provisional, true);
+  assert.equal(out.free, null);
+  // OLD span fitted alone and quotable: k_out recovers 4 credits/tok within 2%
+  assert.equal(out.spans[0].provisional, false);
+  const kOutPtsPerMtok = out.spans[0].free.kOut * 1e6 * 100;
+  assert.ok(Math.abs(kOutPtsPerMtok - K_OUT * 1e6 * 100) / (K_OUT * 1e6 * 100) < 0.02, `k_out ${kOutPtsPerMtok} vs true ${K_OUT * 1e6 * 100}`);
+  assert.equal(out.spans[1].provisional, true);
 });
