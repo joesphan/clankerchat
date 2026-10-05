@@ -704,6 +704,17 @@ export function startCompanionServer(opts: {
               ? (raw.audit_alerts as unknown[]).filter((a): a is string => typeof a === "string").slice(0, 5)
               : [];
             alerts.push(...auditAlerts);
+            // Round 27: the provider-quota tripwire (429/1308/1313,
+            // owner-ordered 2026-10-05) rides the same red-line surface —
+            // the watcher keeps one alarm flag in state, the phone shows
+            // it the moment a poll lands. HH:MM Z from the ISO stamp so a
+            // lingering alarm reads with its age, never as "happening now".
+            const quotaAlarm = (raw.quota_alarm ?? null) as Record<string, unknown> | null;
+            if (quotaAlarm && typeof quotaAlarm.source === "string") {
+              const detail = typeof quotaAlarm.detail === "string" ? quotaAlarm.detail.slice(0, 160) : "";
+              const at = typeof quotaAlarm.at === "string" && quotaAlarm.at.length >= 16 ? `${quotaAlarm.at.slice(11, 16)}Z` : "";
+              alerts.push(`⚠ PROVIDER QUOTA ALARM${at ? ` ${at}` : ""} — ${quotaAlarm.source}: ${detail}`);
+            }
             return json(res, 200, {
               machine: {
                 active: Number(raw.active ?? 0),

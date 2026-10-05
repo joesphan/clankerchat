@@ -576,6 +576,36 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     res = await signed("GET", "/machine");
     const m3 = (await res.json()).machine;
     assert.ok(m3.alerts.some((a) => /1 refused interaction/.test(a)), "journal refusal stat rides the card");
+
+    // Round 27: the provider-quota tripwire (429/1308/1313) rides the same
+    // red-line surface from the watcher's quota_alarm state flag, stamp
+    // included so a lingering alarm reads with its age.
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({
+        active: 0,
+        quota_alarm: {
+          source: "orchestrator run",
+          detail: "429 [1308] Usage limit reached for 5 hour",
+          at: "2026-10-05T06:25:12.345Z",
+        },
+        updated: new Date().toISOString(),
+      }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const mq = (await res.json()).machine;
+    const qline = mq.alerts.find((a) => /PROVIDER QUOTA/.test(a));
+    assert.ok(qline, "tripwire alert rides the card");
+    assert.match(qline, /06:25Z — orchestrator run: 429 \[1308\] Usage limit reached/);
+
+    // malformed flag → guarded, never breaks the card
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({ active: 0, quota_alarm: { detail: 42 }, updated: new Date().toISOString() }) + "\n",
+    );
+    res = await signed("GET", "/machine");
+    const mg = (await res.json()).machine;
+    assert.ok(!mg.alerts.some((a) => /PROVIDER QUOTA/.test(a)), "non-string source is dropped silently");
   } finally {
     listener.close();
   }
