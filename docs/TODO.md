@@ -988,6 +988,76 @@ Peer note: findings generalize to their machine (shared plan). Brief them
 with round 24 once experiments land — one consolidated cite, not a relay of
 the whole report.
 
+## Round 26 — Gemini deep-research #3 verdicts (orchestrator→session pipeline, 2026-10-05)
+
+Report digested against our live stack. Biggest meta-finding: the report's
+top recommendations describe a system we ALREADY RUN (router-executor split,
+composed work orders, acceptance criteria, untrusted-quote-as-data,
+externalized memory over compaction) — validated more than novel.
+
+ALREADY-ALIGNED (no action; report confirms the architecture):
+- Router-executor topology (orchestrator eats the messy Discord context;
+  coding sessions get framed work orders) — our prompt-improver role since
+  2026-10-04. Report Priority 2 = our status quo.
+- Stable-prefix cache economics — client-enforced by construction in Claude
+  Code (tools+system+CLAUDE.md prefix, messages append); our own token rows
+  prove it (cache-read 27:1). Compaction lossiness — why round records live
+  in TODO.md + memory files, not conversation. Opera-style persistent notes
+  = our OPEN-items-with-resolution-criteria pattern.
+- One-work-order-per-run + coalescing (report's "one big spec beats
+  iterative small prompts" — same conclusion, already shipped round ~5).
+
+ADOPTED (cheap, wired this round — orchestrator CLAUDE.md, machine-local):
+- Ambiguity taxonomy checklist (report §1: terminology 33.5% / output
+  format 21.4% / collection semantics 11.5% / edge cases 9.2% — benchmark
+  prevalence, directional not literal): one line in the interpret step so
+  the orchestrator checks the four classes it under-detects.
+- Negative acceptance criteria (EARS "If <condition>, then NOT…" kernel):
+  "done when…" gains the unwanted-behavior case in composed prompts.
+
+REJECTED (with standing reasons — do not re-litigate without new evidence):
+- Sub-agents for context isolation (report §4): round-24 standing verdict —
+  deny Task/Agent on the spawn surface. On a token-billed shared pool,
+  isolation-by-spawn is isolation-by-payment; a subagent's fresh prefix
+  costs more than the parent pollution it saves.
+- SWE-PRM process supervision (§5): an evaluator per trajectory segment is
+  the worst possible shape under prompt economics. Rejected outright.
+- rubric.yaml LLM-judge gates (§5): we have real test suites (238/238
+  class); execution beats judgment on our repos. Kernel noted for any
+  future testless repo.
+- Tree-sitter repo maps (§3): sessions explore directly; repos small;
+  maps decay vs reality. REVISIT TRIGGER: token_window by-project shows a
+  session's cache-read ratio collapsing during exploration (the round-25
+  meter is now the instrument that would prove the need).
+- "Coding session never sees raw Discord text" (§4): deliberately REVERSED
+  here — the verbatim quote rides every relay marked as data (fidelity +
+  ratification law: claims must be checkable against the human's exact
+  words). Our composition carries instruction load; the quote preserves
+  auditability. Stronger than the report's sterilization.
+- Agentless topology (§2): our sessions' value IS agentic exploration under
+  jail+tests; diff-surgical edits are already enforced by tool design
+  (Edit = search/replace). Kernel already shipped as coalescing + context
+  anchors.
+
+NOT RECONCILED (do NOT wire — flagged for phase-2 fit):
+- ★ The two reports CONTRADICT each other on cache price: report #2 (GLM
+  docs) says cache ≈ 25% of fresh-input cost; report #3 (Anthropic
+  mechanics) says 10% (90% discount). 2.5x apart. Neither verified on our
+  backend; the round-25 least-squares fit settles it from our own rows.
+- Report #3's cache mechanics (cache_control breakpoints, 20-block lookback,
+  5-min default TTL / 1h at 2x write premium) are ANTHROPIC-API-specific;
+  our z.ai backend's cache implementation is opaque (observed: cache-creation
+  billed as 0, cache-read works at scale). Not actionable through the Claude
+  Code client anyway — client owns caching. Principle absorbed, mechanics
+  rejected-as-unverifiable.
+- GEARS as a named standard: untraceable; treat as report-coined branding
+  over the real EARS syntax. Benchmark stats (63% guessing, pp gains
+  tables) are directional context from other stacks, not our telemetry.
+
+Peer note: findings generalize to their daemon's relay framing; brief
+DEFERRED past 10:00Z (peak window 06-10Z = 1x burn — bias lane-spawning
+communication off-peak).
+
 ## Round 25 — Gemini deep-research #2 verdicts (GLM quota mechanics, 2026-10-05)
 
 CONFIRMED (cross-validated against local telemetry):
