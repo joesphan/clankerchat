@@ -60,7 +60,7 @@ test("counts user turns, excludes tool_result and sidechain, window-filters", as
 test("mtime filter: a file not touched in the window is never opened", async () => {
   const root = tmpRoot();
   writeProj(root, "-old", { "stale.jsonl": [userLine(IN)] });
-  const old = new Date(Date.now() - 10 * 3600 * 1000);
+  const old = new Date(NOW - 10 * 3600 * 1000); // vs the fixed scan clock — Date.now() would drift into the window after 2026-10-05T09:30Z
   fs.utimesSync(path.join(root, "-old", "stale.jsonl"), old, old); // Date, not ms — utimes treats numbers as SECONDS
   const s = await scanPromptUsage({ projectsRoot: root, now: NOW });
   assert.equal(s.turns, 0, "stale file skipped without reading");
