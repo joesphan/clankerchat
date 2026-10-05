@@ -599,3 +599,82 @@ as a phone prompt's answer excerpt).
   self-revival loads new dist + new watch.mjs in one boot — no manual
   restart window where an old watch.mjs could import a missing export.
 - Tests: repo 200/200 (was 197); watcher 22/24 → 22/22 (2 moved, not lost).
+
+## Round 19 — audit round 4: delivery-safety + honest pagination (2026-10-04, dc55bb2)
+
+Fourteen findings (A1–A8 watcher-side, B1–B6 repo/app-side). Trigger: the
+ask-decision misroute incident — a decision run for Joe's merge-YOLO wandered
+into the wrong repo's session by pattern-matching a reflog, surfaced by Tyler
+("for some reason this ended up in shim and not you"). The audit widened from
+that one defect to every delivery/honesty surface in the loop.
+
+Watcher side (~/tools, per-machine — mirror features into watch.mjs, the
+repo copy is the spec):
+- A1 (the big one): enqueue's full-queue shift-drop could evict a
+  DELIVERY-class job (ask decision, auto-approval, phone prompt) while its
+  registry stamp said "delivered" — silently lost decisions. New pure module
+  watch-admit.mjs: PROTECTED_KINDS always admit (may exceed MAX_QUEUE),
+  everything else is REFUSED at the cap, never dropped. 4 retired W3
+  refuse-before-claim guards (full queues can no longer defer delivery).
+  5 tests in watch-admit.test.mjs.
+- A2: decideAsk releases its claim when the registry write fails (a crashed
+  writer used to freeze the ask pending forever); stale-claim reaper >5min
+  in sweepExpiredAsks unfreezes the wedge class.
+- A3: countdown sweep re-reads the registry after the fetch gap (a decision
+  landing mid-flight owned the card — no stale "Xm left" over a decided
+  ask); legacy cards edit CONTENT ONLY (components round-trip through the
+  API for no gain and could kill the button row mid-fuse); click-race loser
+  with live buttons repairs the card terminal via its free update channel.
+- A4: messageCreate cursor advance bumps pool activity — the drift guard's
+  idle-exit could land between cursor write and enqueue, orphaning the
+  trigger on a self-revive.
+- A5: enqueueAutoApproval stamps BEFORE enqueue (claim-first): a crash
+  between enqueue and stamp left the retry scan double-delivering.
+- A6: /machine's watcher-busy probe accused a busy watcher of being down
+  ("sweep down?") — now "deferred — run queue full" when the state file
+  shows real activity.
+- A7: sweepTerminalAsks GCs orphan .claim/.tmp siblings (registry entries
+  removed but claim files stranded = reaper false-positives later).
+- A8 (the incident itself): VENUE LAW in the spawn template — ask-decision
+  deliveries never relay to project sessions, never compose work orders for
+  other sessions' repos; clankerchat/botlink bilateral matters name the
+  gateway session in the receipt. Mirrored in the orchestrator CLAUDE.md
+  routing rules. Verified failure: the misrouted merge-go (muuifi9v card,
+  ~23:36Z) reached the shim session as a "work order" and was correctly
+  REFUSED by its untrusted-input law — the fix is routing, not trust.
+
+Repo/app side (this commit, dc55bb2):
+- B4: companion signedFetch fully sequential. Counters burn AT VERIFY
+  server-side, so two in-flight requests could arrive inverted → the second
+  one replays a burned counter → 403 replay refusals. counterChain promise
+  gate; marker literal "seq-burn-v13" (doctor.ts + App.tsx comment).
+- B5: double-scan enroll race (QR re-scan while first enroll in flight
+  minted two enrollments) — enrollingRef guard.
+- B6: historyWindow composite cursor (before, beforeId): strict < on
+  createdAt alone stranded same-ms twins at page boundaries; with beforeId,
+  createdAt < before || (=== && promptId < beforeId). /prompts?before_id=
+  param plumbed; App loadOlder sends the oldest row's (ms, id).
+- B1: /prompts `more` computed from the REGISTRY count, not the page size —
+  the default branch said `more: true` when nothing remained.
+- B2: SENT render dedupes stale history copies against fresh prompts (was:
+  both rows shown until the next fetch).
+- B3: four sub-fetch failures now setError — silently swallowed before.
+- Tests: 207/207 (was 201): stale-claim reaper, GC siblings, twin cursor
+  both directions, honest more, machine-busy wording, fixture updates.
+
+Incident record (same round, same commit window): during the A1 work I
+clobbered ~/tools/watch-history.mjs (pre-existing module) with the new
+admit-policy content — the Write said "updated" and I missed that it was an
+overwrite of a live module the watcher imports. Watcher crash-looped ~7.5
+min (43 restarts) until restored from .bak + the policy relocated to a NEW
+file (watch-admit.mjs). Recovery proof: journal counter 38→43 SyntaxErrors,
+then "watching for @fast-clank" at 00:51:30Z with NRestarts frozen. Lesson
+recorded in memory: look before overwriting; a Write to an existing path is
+a clobber. Boot replay covered the outage window (no lost triggers).
+
+Merge authority: Joe's YOLO (muuifi9v, API-verified 00:27:27Z) covered the
+16-commit held set through df5bf50 + standing auto-merge until
+2026-10-05T14:00Z (code/tests/docs only, cited-SHA law unchanged). Round 19
+(dc55bb2) rides that standing authority. Lazy-consensus asks are REVOKED
+permanently (Tyler: "SILENCE COUNTS AS A YES… dont let that happen again")
+— every ask fails closed; expiry = expire, never approve.

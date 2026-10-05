@@ -20,10 +20,12 @@ export interface DoctorLine {
 /** Current UI marker embedded in the app source — the served dev bundle must
  *  contain it or the phone is being handed STALE CODE (the exact class that
  *  burned an evening: old cached bundle + degraded dev server). Bump this
- *  whenever the app's primary surface changes. Current literal = the YOLO
- *  presence prompt (round 12: phone YOLO route + per-status decision
- *  framing) — only round-12 bundles carry it. */
-export const BUNDLE_MARKER = "yolo-route-v12";
+ *  whenever the app's primary surface changes. Current literal = the
+ *  signedFetch header comment (round 19: burn+dispatch fully serialized so
+ *  counter arrival order == burn order; also composite history cursor,
+ *  live-copy dedupe, sub-fetch error surfacing, double-scan guard) — only
+ *  round-19 bundles carry it. */
+export const BUNDLE_MARKER = "seq-burn-v13";
 
 function tcpReachable(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
   return new Promise((resolve) => {

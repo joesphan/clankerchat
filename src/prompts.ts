@@ -141,15 +141,28 @@ export function listPhonePrompts(spoolDir: string): PromptRecord[] {
 }
 
 /** History window for the phone's "load older" (round 7): the newest
- *  `limit` records strictly OLDER than `before` (a createdAt cursor), plus
- *  whether anything older still exists — the caller renders the button or
- *  the end-of-history line. List must be the registry order (asc). */
+ *  `limit` records older than the cursor, plus whether anything older still
+ *  exists — the caller renders the button or the end-of-history line. List
+ *  must be the registry order (asc, promptId tiebreak — the same order the
+ *  cursor compares by).
+ *
+ *  Composite cursor since audit round 4 (finding B6): a createdAt-only
+ *  strict `<` made a same-millisecond twin at a page boundary permanently
+ *  unreachable — the cursor equals the shared createdAt and every later
+ *  page excluded the cut twin. With beforeId the cursor tie-breaks on
+ *  promptId exactly like the sort, so paging always makes progress; without
+ *  it (older bundles) the comparison stays the legacy strict `<`. */
 export function historyWindow(
   list: PromptRecord[],
   before: number,
   limit = 20,
+  beforeId?: string,
 ): { records: PromptRecord[]; more: boolean } {
-  const older = list.filter((r) => r.createdAt < before);
+  const older = list.filter(
+    (r) =>
+      r.createdAt < before ||
+      (beforeId !== undefined && r.createdAt === before && r.promptId < beforeId),
+  );
   const clamped = Math.max(1, Math.min(50, limit));
   const records = older.slice(-clamped);
   return { records, more: older.length > records.length };

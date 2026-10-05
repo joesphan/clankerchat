@@ -365,8 +365,23 @@ export function decideAsk(
   if (!claimed) return getAsk(spoolDir, askId); // winner's record (maybe still mid-write; callers' decidedBy checks handle it)
   const next: AskRecord = { ...rec, status: decision, decidedBy, decidedAt: Date.now() };
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // audit round 4 (finding 2): a write failure AFTER the claim must release
+    // it, mirroring the sweep's failure path — otherwise the ask wedges
+    // forever (every later click loses the claim, and the expiry sweep skips
+    // held claims). Re-throw so the caller reports the failure honestly; the
+    // claim is gone, a retry works.
+    try {
+      fs.rmSync(claim, { force: true });
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* nothing more to do — the stale-claim reaper in sweepExpiredAsks recovers it */
+    }
+    throw e;
+  }
   return next;
 }
 
@@ -384,10 +399,30 @@ export function decideAsk(
  *  APPROVAL with the message re-edited. The sweep now takes the same O_EXCL
  *  claim decideAsk does: a lost claim means a live decision (tap, click)
  *  holds the ask and the sweep skips it entirely. Deny-before-expiry wins
- *  on every interleaving. */
+ *  on every interleaving.
+ *
+ *  Stale-claim reaper (audit round 4, finding 2): a claim held longer than
+ *  STALE_CLAIM_MS on a STILL-PENDING record is a dead claimant — a process
+ *  that died between claim and write (decideAsk's catch releases its own,
+ *  but a kill -9 mid-window never runs any catch). Without the reaper such
+ *  an ask is undead: no click can win the claim, the sweep skips it, and it
+ *  never even expires. Real decisions write in <1s; 5min is a very safe
+ *  margin against a slow-but-alive claimant. */
+export const STALE_CLAIM_MS = 5 * 60_000;
+
 export function sweepExpiredAsks(spoolDir: string, now = Date.now()): AskRecord[] {
   const swept: AskRecord[] = [];
   for (const rec of listPendingAsks(spoolDir)) {
+    if (rec.status === "pending") {
+      try {
+        const st = fs.statSync(`${askFile(spoolDir, rec.askId)}.claim`);
+        if (now - st.mtimeMs > STALE_CLAIM_MS) {
+          fs.rmSync(`${askFile(spoolDir, rec.askId)}.claim`, { force: true });
+        }
+      } catch {
+        /* no claim file — the normal case */
+      }
+    }
     if (rec.status === "pending" && rec.expiresAt <= now) {
       const file = askFile(spoolDir, rec.askId);
       const claim = `${file}.claim`;
@@ -454,6 +489,11 @@ export function sweepTerminalAsks(
     if (ageFrom >= weekAgo) continue;
     try {
       fs.rmSync(askFile(spoolDir, rec.askId), { force: true });
+      // audit round 4 (finding 7): the record's .claim (and any torn .tmp)
+      // are garbage the moment the record is — GC'ing only the .json orphaned
+      // one claim file per ask forever, slowly rotting every readdir scan.
+      fs.rmSync(`${askFile(spoolDir, rec.askId)}.claim`, { force: true });
+      fs.rmSync(`${askFile(spoolDir, rec.askId)}.tmp`, { force: true });
       removed.push(rec.askId);
     } catch {
       /* unreadable/locked — next sweep retries */

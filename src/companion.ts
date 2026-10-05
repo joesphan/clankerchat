@@ -513,10 +513,12 @@ export function startCompanionServer(opts: {
               return json(res, 400, { error: "before must be a positive createdAt epoch-ms" });
             }
             const limit = Number(url.searchParams.get("limit") ?? 20);
+            const beforeId = url.searchParams.get("before_id") ?? undefined; // composite cursor (round 19)
             const { records, more } = historyWindow(
               listPhonePrompts(spoolDir),
               before,
               Number.isFinite(limit) ? limit : 20,
+              beforeId || undefined,
             );
             return json(res, 200, { prompts: records.map(renderPromptForApp), more });
           }
@@ -526,9 +528,23 @@ export function startCompanionServer(opts: {
               r.status === "enqueued" ||
               (r.finishedAt ?? 0) > now - 30 * 60 * 1000, // recent history chips
           );
+          const window = eligible.slice(-20); // newest 20 — a scroll, not the registry
+          // audit round 4 (finding B1): `more` must describe the branch the
+          // Load-older button pages — ?before= walks the WHOLE registry, not
+          // this 30-minute band. `eligible.length > 20` needed >15 runs
+          // finishing inside 30min, so on every real machine the button read
+          // "start of history" over a week of paged records (round-7 history
+          // was dead on arrival). Honest question instead: is any registry
+          // record outside this window at or below its oldest row? (<=
+          // matches the inclusive cursor.)
+          const shownIds = new Set(window.map((r) => r.promptId));
+          const oldestShown = window.length ? window[0].createdAt : Number.POSITIVE_INFINITY;
+          const more = listPhonePrompts(spoolDir).some(
+            (r) => !shownIds.has(r.promptId) && r.createdAt <= oldestShown,
+          );
           return json(res, 200, {
-            prompts: eligible.slice(-20).map(renderPromptForApp), // newest 20 — a scroll, not the registry
-            more: eligible.length > 20,
+            prompts: window.map(renderPromptForApp),
+            more,
           });
         }
 
@@ -587,6 +603,24 @@ export function startCompanionServer(opts: {
           // Metro/bundle freshness stays CLI-only: a 2s poll must not curl
           // the dev server.
           const alerts: string[] = [];
+          // Audit round 4 (finding A6): the two delivery scans below fire on
+          // DELIBERATE deferral too — refuse-before-claim (round 17) leaves
+          // prompts pending and decisions unstamped, retrying every 15s, for
+          // as long as the run queue stays full. A fresh watcher-state with a
+          // busy pool means "deferred, queue full", not "sweep down" — the
+          // old wording invited restarting a perfectly healthy watcher.
+          let watcherBusy = false;
+          try {
+            const stRaw = JSON.parse(fs.readFileSync(path.join(spoolDir, "watcher-state.json"), "utf8")) as Record<string, unknown>;
+            const stAge = typeof stRaw.updated === "string" ? Date.now() - Date.parse(stRaw.updated) : Number.NaN;
+            const n = (v: unknown) => (typeof v === "number" ? v : 0);
+            watcherBusy =
+              Number.isFinite(stAge) &&
+              stAge <= 300_000 && // same freshness bound the card facts use
+              n(stRaw.active) + n(stRaw.queued_human) + n(stRaw.queued_bot) > 0;
+          } catch {
+            /* absent/unreadable state — the sweep-down wording is then honest */
+          }
           try {
             const pDir = path.join(spoolDir, "pending-prompts");
             if (fs.existsSync(pDir)) {
@@ -599,7 +633,13 @@ export function startCompanionServer(opts: {
                   return false;
                 }
               });
-              if (stuck.length > 0) alerts.push(`${stuck.length} prompt(s) pending >60s — watcher sweep down?`);
+              if (stuck.length > 0) {
+                alerts.push(
+                  watcherBusy
+                    ? `${stuck.length} prompt(s) deferred — run queue full, sweep retries every 15s`
+                    : `${stuck.length} prompt(s) pending >60s — watcher sweep down?`,
+                );
+              }
             }
           } catch {
             /* scan failure is not itself an alert */
@@ -616,7 +656,13 @@ export function startCompanionServer(opts: {
                   return false;
                 }
               });
-              if (undelivered.length > 0) alerts.push(`${undelivered.length} phone-decided ask(s) undelivered — sweep down?`);
+              if (undelivered.length > 0) {
+                alerts.push(
+                  watcherBusy
+                    ? `${undelivered.length} phone-decided ask(s) deferred — run queue full, sweep retries every 15s`
+                    : `${undelivered.length} phone-decided ask(s) undelivered — sweep down?`,
+                );
+              }
             }
           } catch {
             /* same */
