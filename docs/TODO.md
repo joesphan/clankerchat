@@ -29,8 +29,13 @@ react-native) — mine them before designing.
   /prompts?q= searches the WHOLE registry (promptId or text substring,
   case-insensitive, newest 50) — signature covers pathname only, so the
   query never breaks auth. App-side search box = next round.
-- [ ] **Phone-prompt history navigation**: SENT list is newest-20 only; a "load more"
-  or per-prompt detail view (full excerpt, timestamps) once real usage shows the need.
+- [x] ~~**Phone-prompt history navigation**~~ SHIPPED (round 7, 2026-10-04):
+  GET /prompts?before=<createdAt ms>[&limit=1-50] pages strictly-older
+  records (newest-last like the default branch, `more` says whether older
+  exist); present-but-invalid cursor → 400 (never a silent fall-through to
+  the default list). historyWindow() in prompts.ts; app "Load older" walks
+  by the oldest rendered createdAt (frozen history pages, deduped against
+  the live window); rows are tap-to-expand (full text + excerpt + stamps).
 - [x] ~~**Slash commands (/status, /ask)**~~ SHIPPED 2026-10-04 (owner
   green-lit): one grouped command `/clankerchat` (subcommands `status`, `ask`)
   registered guild-scoped on every watcher boot — repo core in src/slash.ts
@@ -194,3 +199,403 @@ ride to Google — machine facts and own words only. 167/167. Spark surface
 confirmed working end-to-end by Tyler (Google validator accepted path-only
 URL; @appname tag forces the tool connection in a Gemini prompt). Peer
 briefed: inject 1791141604139-5c9210 (cites 4e472a8 d92e7db 33ca049 d09a856).
+
+## Round — observability + phone report lane (2026-10-04, rounds 3 + 8)
+
+S-tier #4 INTERACTION JOURNAL (src/journal.ts): append-only hash-chained
+JSONL at <spool>/interaction-journal.jsonl — every slash invocation and
+ask-button click the daemon sees, refusals included, who/what/verdict
+(ids only, no display names). Chain = sha256(prevH + canonical JSON),
+genesis file-bound, 2MB rotation to .1 (chain restarts per file);
+readJournalTail fails closed to [] so /machine never breaks on tamper
+(verifyJournalFile is the loud path). journalStats feeds the phone card:
+"N refused interaction(s) last 24h".
+
+S-tier #5 AUDIT WATCH (src/audit.ts + daemon sweep): discord.js-free
+classification of guild audit entries scoped to OUR blast radius (bot id +
+watched venues). critical = bot's posts deleted / watched channel deleted /
+webhook created in a watched channel / bot kicked or re-rolled → ONE
+human-eyes post per event through the tripwired sendToThread. notify =
+channel modify + overwrites + webhook update/delete (journal + card only).
+Resume cursor in daemon.state.json; sweep every 5min + boot; 403 → one-time
+degrade + card alert, never spam. Card alert ring (5 / 24h TTL) folds into
+watcher-state.json audit_alerts → /machine alerts.
+
+NOTICES (round 8, src/notices.ts + dist/notice.js): the machine→phone
+free-text report lane (owner: "let me know not in discord but just on the
+phone"). Writers are LOCAL processes (notice CLI / sessions / daemon) on
+<spool>/notices.json — bounded 50, seq-ordered (same-ms bursts keep
+insertion order), atomic writes, leak-scanner REFUSES leak-shaped text at
+append. Phone surface is read+ack only: GET /notices (newest window +
+whole-registry unacked count), POST /notices/:id/ack, /notices/ack-all.
+App: NOTICES card (unread badge, warn severity, tap-to-expand, dismiss
+one/all), arrival banner once per notice per app session while unacked.
+184/184.
+
+Also this round: docs/context/topics/antigravity-cli.md (official headless/
+permissions docs banked — envelope mode, --print-timeout, read_url rule
+syntax) + gemini-ask.mjs upgraded to --output-format json + --print-timeout
+3m (external SIGKILL demoted to 210s backstop; usage line on stderr; live
+E2E re-verified).
+
+## Round — audit→notices bridge, noise meter, haptics (2026-10-04)
+
+CRITICAL AUDIT → NOTICES: the audit watch's critical events and its
+one-time 403 degrade now ALSO write a warn notice — the phone banners
+them on arrival, a human-eyes path that survives Discord itself being
+the tampered surface. Journal kind widened to "noise" for the meter
+below (chain-verified, stats stay blind to it).
+
+OWN-POST NOISE METER (parked TODO item, shipped): countOwnPost at the
+sendToThread chokepoint — rolling 1h per-thread window, threshold 10,
+ONE journal NOISE line per thread per hour. Visibility only: no card
+alert, no suppression (never cut the wire that reports). In-memory by
+design — restart undercounts, never phantom-noise.
+
+HAPTICS (expo-haptics ~57.0.3): ask arrival (warning), answer/failed
+transition (success/error), notice arrival (warn→warning else light),
+decision commit (medium). Fire-and-forget — no-engine devices no-op and
+the flow never gates on feedback. 185/185; app tsc clean.
+
+## Round — daily digest notice + notices window toggle (2026-10-04, round 9)
+
+DAILY DIGEST: one notice per local day on the phone — the automated version
+of the owner's "let me know not in discord but just on the phone". Cursor =
+the REGISTRY ITSELF (newest daily-digest notice's local day): no state
+field, no first-boot seeding, crash-safe by construction (the append IS the
+commit). Two flavors, same ritual:
+- daemon deployment (src/daemon.ts sweepDailyDigest): 24h journal counts
+  (interactions/refused/critical+notify audit/noise) + CHAIN VERDICT — a
+  broken chain files at warn severity with counts marked untrusted, so the
+  digest doubles as a daily tamper check. dailyDigestText lives in
+  src/journal.ts (pure, tested).
+- watcher host (~/tools/clankerchat-watch.mjs): runs-since-start counter +
+  lane verdict (this machine has no interaction journal — daemon-side
+  feature). First digest fires 5s after boot (post lane-probe).
+
+NOTICES WINDOW TOGGLE (phone): "Show older notices" widens GET /notices to
+?limit=50 when the default window is full; "Recent only" shrinks back.
+Limit rides a ref so the poll effect isn't re-armed; machine flip resets.
+
+journal-verify CLI also landed this round-block (human-facing chain proof;
+see commit 879056f). 187/187; watch+companion+botlink restarted; first
+digest verified live in the registry (seq 3).
+
+## Round — audit watch on the LIVE watcher host (2026-10-04, round 10)
+
+The S-tier #5 audit watch existed only in the daemon flavor; the host that
+actually runs here (~/tools/clankerchat-watch.mjs) had NO audit-log watch.
+Now it does — same pure classifier (dist/audit.js), same contract: fetch
+since cursor, classify to our blast radius, critical → one human-eyes
+channel post (ids-only, users-parse owner mention) + warn notice, notify →
+card alert line. Differences from the daemon flavor, on purpose:
+- cursor persists in watcher-state.json (audit_cursor key, restored at boot
+  BEFORE laneHeartbeat's first state write can clobber it — placement law);
+- FIRST DEPLOY seeds to newest without back-alerting (days-old deletes are
+  history, not incidents); restart gaps stay covered by the persisted cursor;
+- no interaction journal on this host — notices + the Discord post are the
+  record.
+
+LIVE RESULT: fast-clank lacks View Audit Log in epicEFI → the one-time
+honest degrade fired on all three surfaces (log, card alert line, warn
+notice). The watch self-arms within 5 min of the permission being granted —
+that's a guild-settings action (Joe's guild). Asked in the lane.
+
+## Round — interaction journal on the live host + YOLO click fix (2026-10-04, round 11)
+
+INTERACTION JOURNAL (watcher flavor): every slash invocation and ask-button
+click the live watcher handles now hash-chains into
+<spool>/interaction-journal.jsonl — same entry shape as the daemon flavor
+(kind/type/detail/outcome/actor/name, ids only), refusals included (leak
+shapes, mass mention, queue-full, venue-blocked, non-approver, dangling,
+race-lost). jInteraction helper try/caught at every site — the reply always
+matters more than the journal line. This brings journalStats (phone card
+alert line), journal-verify, and the digest's journal counts alive on the
+host where interactions actually happen. Quarantine path journals nothing
+(absolute silence law).
+
+YOLO CLICK BUG (caught live, fixed): the watcher's decide line binary-mapped
+parsed.action to approved/denied — a YOLO button click (custom_id
+ask:<id>:yolo, peer c2a7ebe's widened contract) recorded DENIED. Fixed to
+the three-verb map; the enqueued trigger + askDecisionLine already spoke
+yolo fluently downstream. Worth checking any other pre-c2a7ebe click handler.
+
+DEGRADE NOTICE RESTART-SPAM GUARD (both flavors): the 403-degrade's
+per-process one-time flag resets every restart — one identical warn notice
+per restart is noise. Both flavors now skip when an unacked twin from the
+last 24h is already in the lane. Verified live: three restarts, one unacked
+degrade notice.
+
+187/187; watch+companion+botlink restarted and verified.
+
+## Round 12 — YOLO from the phone + one shared decision-instruction source (2026-10-04)
+
+Gap found by surface audit: c2a7ebe gave Discord cards a third verb (YOLO =
+one-shot full-auto) but the phone could only Approve/Deny — and BOTH watcher
+delivery paths (button click + phone tap) told the spawned run only the bare
+status word, so a YOLO run's semantics depended on which brain read it
+(daemon.ts inlined the instructions; the watcher host didn't). Same class as
+the round-11 binary-map bug: decision surfaces replicate the verb map and the
+framing independently.
+
+- src/asks.ts: `askDecisionInstruction(status, decider)` — ONE shared
+  per-status instruction (approved = proceed exactly as asked; yolo =
+  one-shot full-auto, no further asks, receipt in-thread; denied = stand
+  down). daemon.ts's two enqueue fns render from it; the watcher's two
+  delivery paths (button + companion) append it to the trigger content.
+- src/companion.ts: `/asks/:id/(approve|deny|yolo)` with the three-verb
+  decideAsk map — the binary map there was the round-11 bug class one commit
+  away from re-minting YOLO taps as denials.
+- App.tsx: YOLO button full-width in amber beneath Approve/Deny (the
+  escalation, not a third peer), presence-gated like Approve with a prompt
+  that says what it grants. New bundle marker literal (`yolo-route-v12`) —
+  doctor BUNDLE_MARKER bumped so pre-round-12 bundles read STALE.
+- 188/188 (+1 asks instruction test; companion yolo case inside the existing
+  route test).
+
+## Round 13 — watcher dist-drift guard (deployment-side, 2026-10-04)
+
+Failure class: the live watcher (`~/tools/clankerchat-watch.mjs`) imports the
+repo's dist/ libs at boot; every rebuild needs a manual service restart, and
+forgetting it once means the live host silently runs OLD lib code (round 12's
+framing fix would have been dead locally if that step had been skipped).
+
+- Guard (watch.mjs): fingerprint every `dist/*.js` (name:mtimeMs:size); exit 0
+  when it differs from boot AND has been stable across polls ≥45s (tsc writes
+  incrementally — a mid-build read must never trigger) AND the pool is truly
+  idle (no active runs, both queues empty, ≥10s since the last pool activity
+  so a trigger mid-handler is never dropped — gateway events have no
+  persistent cursor). Drift logs loudly at first sight; a busy pool defers
+  the exit to its next idle moment instead of suppressing it.
+- systemd user drop-in `restart-always.conf`: the base unit's
+  `Restart=on-failure` leaves a clean exit(0) dead — `Restart=always` revives
+  both drift exits and real crashes (explicit stop/restart still behave
+  normally). Live-proven end-to-end: rebuild at 23:06:54Z → detected
+  23:07:02Z → `stable 45s + pool idle 75s` exit 23:07:47Z → systemd revival
+  23:07:52Z (NRestarts=1, no loop; guard inert on the new boot fingerprint).
+- Same-class drift on companion/botlink/metro: DEFERRED (their idle
+  definitions are harder — live SSH connections, in-flight signed requests,
+  connected Expo clients — a dropped phone poll round-trips in 2s but a
+  dropped pairing ceremony does not). Pattern is portable when wanted.
+- Peer note: their daemon runs `node dist/daemon.js` under systemd — same
+  drift class on Joe's machine; the fingerprint+idle+exit+Restart=always
+  pattern ports as-is (their idle = no active runs + no lane connections
+  mid-ceremony).
+
+## Round 14 — boot-replay cursor: the restart dead-window is closed (deployment-side, 2026-10-04)
+
+Class: every watcher restart (manual, round-13 drift revival, crash-revival,
+reboot) has a dead window — RestartSec 5s + boot ~1.5s, longer after crashes —
+where arriving Discord messages were LOST forever. The gateway has no push
+cursor: a tag landing in the gap never triggered, and nobody knew.
+
+- Cursor store: `message-cursors.json` in the spool — per-watched-channel
+  last-seen snowflake, advanced at the TOP of the messageCreate handler
+  BEFORE any gate (a skipped message still counts as delivered — own posts,
+  bot-authored, and webhook skips are identical on replay, so the cursor must
+  move past them or they refetch forever). Atomic tmp+rename write.
+- Boot replay (ready handler, post-slash-registration): channels WITH a
+  cursor get one `fetch({after, limit: 50})`; missed messages re-enter the
+  SAME handler via `client.emit("messageCreate", m)` — gates, quarantine,
+  coalescing, ask idempotence all unchanged. Channels WITHOUT a cursor seed
+  from the newest message with NO back-replay (the round-10 audit-cursor
+  precedent: first contact never back-alerts). Saturated window (50 fetched)
+  logs honestly — older messages are NOT replayed.
+- Scope enumeration matches the live gate exactly: root channel + every
+  thread whose parentId is the root. GOTCHA fixed live: the per-channel
+  `channel.threads.fetchActive()` is unusable under our intents (non-iterable
+  result); `guild.channels.fetchActiveThreads()` + parentId filter is the
+  working shape (11 live threads under #clankerchat, incl. the epicNode
+  thread).
+- Ordering trade-off, stated honestly: cursor persists BEFORE processing
+  completes, so a crash mid-processing loses that one message (at-most-once
+  for in-flight) while the down-window replays (at-least-once for the gap).
+  The reverse order would double-process on every crash — this is the right
+  default.
+- Live-proven: watcher stopped → probe posted 17:14:02Z → boot 17:14:17Z →
+  `boot replay: 1 missed message(s) … re-processing` 17:14:18Z → cursor
+  advanced to the probe id exactly.
+- Peer note: same class on their daemon host — ports as-is (cursor file +
+  fetch-after on ready + emit into the same handler; same fetchActive trap).
+
+## Round 15 — repo-side dist-drift guard: serve + companion self-restart on rebuild (2026-10-04)
+
+Class: rounds 13–14 closed the drift/dead-window hole for the WATCHER host
+only — but `botlink-server` serves from `dist/` too, and both repo-side
+services (lane serve + companion surface) were running stale code after every
+rebuild until a human restarted them. The lane hub and the phone surface had
+no self-update path at all.
+
+- `armDistDriftGuard(label)` in src/botlink-server.ts, wired into BOTH serve
+  flavors (`serve` and `companion --serve`): fingerprints the directory the
+  entry script lives in (`name:mtimeMs:size` per *.js, sorted, joined — same
+  shape as the round-13 watcher guard), and when it changes from boot AND is
+  stable across polls (tsc writes files incrementally), exits 0 for the
+  service manager to revive on the new code. Guard is inert on unreadable
+  dirs (never exits), whole body fail-quiet, and disabled via
+  `CLANKER_BOTLINK_DRIFT_GUARD=0`; poll/stability windows env-tunable
+  (`_DRIFT_POLL_MS`/`_DRIFT_STABLE_MS`) so tests run it at 150ms/400ms.
+- Restart=always drop-ins for both units (the round-13 trap: the base
+  Restart=on-failure leaves a deliberate exit(0) DEAD). companion RestartSec=3
+  (stateless surface, phone re-polls at 2s), botlink RestartSec=5 (lane
+  injects queue in the spool behind it).
+- Tests: tests/drift.test.mjs — offline, pointed at a COPY of dist/
+  (`dist-drifttest/`, now gitignored) so fingerprint touches never bounce the
+  production services. Serves bind `127.0.0.1:0` (ephemeral). Covers:
+  serve drift-exits clean with both log lines; guard=0 stays up on the same
+  touch; companion flavor carries the same labeled guard.
+- parsePort bug class, caught live by those tests: the old
+  `Number(x) || default` sent an explicit ":0" (ephemeral request) to the
+  DEFAULT port — a test server on ":0" tried to take the production lane port
+  47421 and died EADDRINUSE against the live listener. parsePort() now honors
+  explicit valid ports at all 6 listen sites (serve, pair --arm x2, companion
+  x2, arm-rotate dial).
+- Live-proven full-stack (one build, three guards): rebuild 17:20:37 → both
+  repo guards detect at 17:20:38 → both exit at the 45s mark 17:21:23 →
+  botlink revived (NRestarts 1), companion auto-revival journaled
+  ("Scheduled restart job, restart counter is at 1") at 17:21:26 — a manual
+  restart 2s later reset its counter to 0, which is cosmetic. 190/190.
+- Peer note: repo-side code this time (not watcher-side) — plain merge +
+  rebuild + restart carries the guard on their Windows box, but their units
+  need the SAME Restart=always drop-ins (Task Scheduler or SCM equivalent)
+  or the clean drift exit stays dead. parsePort applies to their tree as-is
+  (same falsy-|| shape at the listen sites).
+
+## Round 16 — identity-noise journal: webhook + spoof evidence, phone-visible (2026-10-04)
+
+Class (S-tier #4): webhooks and content-declared-identity attempts are the
+display-identity spoof class (the demonstrated SanGear compromise vector),
+yet both were skipped with a console log only — evidence that scrolls away
+with journalctl rotation. The hash-chained journal is the audit trail; these
+events belong in it.
+
+- Watcher (~/tools/clankerchat-watch.mjs + watch-history.mjs): new jNoise
+  helper (kind "noise", same never-break-the-path law as jInteraction) +
+  pure webhookJournalLine/spoofJournalLine helpers (ids + neutralized capped
+  snippet, quoted display name is data). STRUCTURAL FIX: the webhook skip
+  moved to AFTER the quarantine gate — it used to sit before it, and
+  journaling from the old position would have paid for/surfaced quarantined
+  events (silence law absolute). Spoof check was already after quarantine.
+- Flood guard: past 25 noise entries in a rolling 60s window the rest are
+  suppressed and ONE honest summary line closes the window — a webhook storm
+  must not turn the evidence log into a disk-fill vector.
+- Repo (this tree): journalStats returns a window-scoped `noise` count;
+  companion /machine card surfaces it ("N identity-noise event(s) last 24h
+  (webhook/spoof)"); journal-verify CLI prints it. All additive — consumers
+  read named fields.
+- Watcher suite 22/22 (new: line composition, neutralization inside snippet,
+  cap, absent-field degradation, spoof shape); repo suite 190/190. Watcher
+  restarted; journal chain VERIFIED post-deploy. Boundary stated honestly:
+  no synthetic webhook can be fired at the live watcher (webhook creation is
+  owner-gated by design), so the branch is proven at the unit level + the
+  glue is 3 lines at a verified-restart checkpoint.
+- Organic round-15 proof: this round's rebuild was the first deploy where NO
+  manual service restarts happened — companion + botlink[serve] detected the
+  dist change at 17:33:13Z, exited at the 45s mark 17:33:58Z, and systemd
+  revived both on the new code unattended.
+- Peer note: your daemon already has a noise-kind writer (own-post meter) —
+  the delta is journaling the webhook + spoof skips on your trigger path and
+  the stats/card plumbing. Same quarantine-ordering caveat applies wherever
+  your skip gates sit.
+
+## Round 17 — audit round 3: sweep/decide race, rotation-stable chain, watcher hardening (2026-10-04)
+
+Two audit agents swept the rounds-12–16 code (repo + watcher). 15 findings,
+all triaged and fixed this round. Severity order: the ask-race kernel first,
+then parse/bind honesty, then the watcher's throw/liveness classes.
+
+- R1 (HIGH, asks.ts): sweepExpiredAsks did read-modify-write WITHOUT the
+  O_EXCL claim decideAsk takes — a phone DENY landing between listPendingAsks
+  and the write was flipped to approved/auto-expiry. The sweep now claim-gates
+  exactly like a deciding surface (loses to a live claim, releases its OWN
+  claim on write failure so the next sweep retries), and decideAsk treats
+  expiry as a hard boundary on EVERY deciding surface (companion tap, Discord
+  click, sweep): past the fuse, pending stays pending — the sweep owns it.
+  Claim files persist after decisions (decision-in-flight proof).
+- R2 (journal.ts): genesis was bound to the CURRENT filename — every healthy
+  rotation made .1 fail verification as a false tamper alarm. Genesis now
+  strips a trailing `.1` (journal-identity-bound, rotation-stable).
+- R6: readJournalTail prepends verified .1 entries when the live file is
+  shorter than n — the 24h stats window survives a rotation (a flood big
+  enough to rotate is exactly the window stats must not forget).
+- R3 (botlink-server.ts + spark-mcp.ts): `Number("") === 0` bound an
+  EPHEMERAL port silently on a templated `HOST:"$PORT"` with empty PORT.
+  parsePort (now EXPORTED, import-guard added so tests can import the CLI
+  module without dispatching cmdServe) treats empty/whitespace as UNSET;
+  spark-mcp port follows the same law.
+- R4: `listenSpec.split(":")[0] ?? "127.0.0.1"` was dead code — "" is not
+  nullish — so a ":47421" spec bound the pairing listener on `::` wildcard
+  while every other listener clamps to loopback. Now `||`.
+- R5 (companion.ts routes): POST /asks/:id gained the expiry pre-check (409
+  status:"expired" — the sweep owns it) and post-decideAsk provenance honesty
+  (a lost claim race answers 409 with the WINNER's verdict, never a fake 200
+  logging the decision as this phone's).
+- W1 (attachments.ts): `Array.isArray(msg.attachments)` is false for the
+  discord.js Collection — the whole image feature was dead code on the
+  watcher. attachmentList() normalizes Array | .toArray() | .values().
+- Watcher (~/tools, per-machine — recipe shared with the peer, not in this
+  tree): W2 transient-own-post guard (⏳ status line / salvage line / canned
+  status card no longer mark runs posted nor pollute phone excerpts — pure
+  isTransientOwnPost in watch-history.mjs); W3 refuse-before-claim on the
+  companion-decision and phone-prompt sweeps (full queue defers UNCLAIMED,
+  15s retry) + deferred auto-approval retry scan (60s) so a full bot queue
+  no longer shift-drops claimed jobs; W4 every timer body try/caught (a
+  repo-lib throw in an interval killed the watcher process) + finishPrompt
+  guarded at the exit handler + safePeerLabel at laneFacts capture (a
+  leak/mass-mention-shaped PEER-CONTROLLED bot name used to flow into posts
+  the watcher makes directly, bypassing send tripwires); W5 boot-replay
+  emit-time dedup (messages delivered live during the fetch await were
+  re-emitted → double runs); W6 noise-flood summary flushes on a one-shot
+  timer (a storm ending quiet never wrote its own evidence line); W7a
+  lastPoolActivity bumped at claim points (drift exit could land between
+  claim and enqueue, losing claimed deliveries); W8 companion decision edit
+  forks on V2 shape like every other terminal edit; W9 fs.watch error
+  handler, prepareImages mkdir guard (a spool failure no longer kills the
+  run pre-spawn with its claims), and a 30s SIGKILL-confirmation fallback
+  (a D-state child never emits exit → pool wedge). Plus two policy adds:
+  click-path expiry pre-check (honest "ask already expired" ephemeral) and
+  the forbidden-venue gate on the BUTTON path (quarantine law parity with
+  slash).
+- Tests: repo 197/197 (was 190 — sweep-claim race, expiry boundary, rotation
+  chain + tail spanning, attachmentList, parsePort, companion expired-tap
+  route); watcher 24/24 (isTransientOwnPost template + near-miss matrix).
+- Deploy: build → botlink[serve]+companion drift-revived at 17:59Z unattended
+  (third consecutive no-manual-restart deploy); watcher manually restarted
+  18:05 local (the guard watches dist/ only), clean boot.
+- Known coupling (round-18 candidate): isTransientOwnPost lives in the
+  local watch-history.mjs but matches strings RENDERED BY THE REPO
+  (run-progress.ts statusLine, slash.ts card header) — if those templates
+  change, the matcher must follow. The tests pin today's shapes; moving the
+  matcher into run-progress.ts would remove the drift risk.
+
+## Round 18 — isTransientOwnPost + salvage template moved into the repo (2026-10-04)
+
+The round-17 known-coupling, closed. The transient-own-post matcher and the
+crash-salvage line template were local to one machine's watcher while the
+strings they match are RENDERED BY THE REPO (run-progress.ts statusLine,
+slash.ts renderStatusCard header) — a wording change on either side would
+silently un-match that machine's own machinery, resurrecting the W2 bugs
+(status line marking a crashed run "posted" → swallowed salvage; boilerplate
+as a phone prompt's answer excerpt).
+
+- src/run-progress.ts: `salvagePostLine(why)` (the crash/timeout salvage
+  text, previously a bare literal in the watcher's finish path) and
+  `isTransientOwnPost(content)` (first-line matcher for the three machinery
+  shapes: ⏳ status line, salvage line, canned-card header). run-progress.ts
+  is the charter home — "line shape shared across machines" — so the peer's
+  daemon (same salvage-post feature) gets template + matcher free on merge.
+- tests/run-progress.test.mjs: +3 tests. The drift-kill property is the
+  round-trip pin — the matcher is asserted against the ACTUAL generators
+  (`statusLine(...)`, `salvagePostLine(...)`, `renderStatusCard(...)` first
+  line AND whole card), so a template edit fails the suite in the same
+  commit. Near-miss matrix (truncated status line, trailing graft, missing
+  anchor phrase, header without suffix, empty/null, prose that mentions the
+  words, machinery text on line 2) moved over from the watcher suite.
+- Watcher (~/tools, per-machine): imports both from dist/run-progress.js,
+  salvage send now posts salvagePostLine(why); watch-history.mjs drops its
+  copy (pointer comment left); its 2 local tests moved to the repo suite.
+  Watcher tests 22/22.
+- Deploy: watch.mjs edited BEFORE the build, so the round-13 drift guard's
+  self-revival loads new dist + new watch.mjs in one boot — no manual
+  restart window where an old watch.mjs could import a missing export.
+- Tests: repo 200/200 (was 197); watcher 22/24 → 22/22 (2 moved, not lost).

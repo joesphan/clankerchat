@@ -57,6 +57,22 @@ import {
 import { findLeakSignals, findMassMentions, massMentionRefusal } from "./leaks.js";
 
 export const SPARK_DEFAULT_PORT = 8791;
+
+/**
+ * Port resolution with the empty-string law (audit round 3 finding 3, applied
+ * here after the peer's round-17 verify named the un-ported class): an unset,
+ * empty, or whitespace-only spec means DEFAULT — never an ephemeral bind.
+ * Number("") === 0 would otherwise pass a `>= 0` range check and silently
+ * listen on a random port, which on this surface means the tunnel's pinned
+ * upstream quietly goes dark. Only an explicit numeric "0" is an ephemeral
+ * request (tests use it); anything non-numeric or out of range falls back.
+ */
+export function resolveSparkPort(spec: string | undefined): number {
+  const s = spec?.trim();
+  if (s === undefined || s === "") return SPARK_DEFAULT_PORT;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 && n < 65536 ? n : SPARK_DEFAULT_PORT;
+}
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 60; // conversational tool use is a handful of calls/min, not a scrape
 
@@ -403,7 +419,7 @@ export async function main(): Promise<void> {
   loadEnvFile();
   const capPath = process.env.SPARK_MCP_PATH?.trim();
   const token = process.env.SPARK_MCP_TOKEN?.trim() || undefined;
-  const port = Number(process.env.SPARK_MCP_PORT ?? SPARK_DEFAULT_PORT);
+  const port = resolveSparkPort(process.env.SPARK_MCP_PORT);
   const spoolDir = process.env.CLANKER_SPOOL_DIR ?? `${process.cwd()}/botlink-spool`;
   if (!capPath || capPath.length < 16) {
     throw new Error("SPARK_MCP_PATH missing/too short in .env — generate 16+ bytes of hex; refusing to start open");

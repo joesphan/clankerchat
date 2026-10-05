@@ -112,9 +112,14 @@ app goes through the same `sanitizePeerText` discipline the tap block uses.
 | `GET /attempts` | render the live confirmable pairing state (tap-block fields + `attemptId` + `expiresAt`); `{}` when none |
 | `POST /attempts/:id/allow` `{sas}` | typed peer SAS → same commit path as `pair --confirm` (mismatch = refuse, nothing written); audit event appended with `via=companion:<phoneFp>` |
 | `POST /attempts/:id/deny` | clear pairing state, nothing written |
+| `GET /asks` | pending asks, oldest first (round 4); no channel ids on the wire |
+| `POST /asks/:id/approve` \| `/deny` \| `/yolo` | decide with provenance `companion:<phoneFp>`; 409 carries the standing decision when the click/expiry won the race. `yolo` (round 12) records the distinct one-shot full-auto verb — never a deny-else default |
 | `POST /prompt` `{text, route?}` | write a prompt record (round 5); `route:"peer"` (multi-machine phase 1) routes it to the peer machine — unknown values or a lane-less machine are 400 at the door, never a silent expiry later |
-| `GET /prompts` `?q=` | lifecycle chips + `?q=` search (round 5 / 5.1); routed records render `route:"peer"` and their excerpt echoes back over the lane (30-min window) |
-| `GET /machine` | the machine card (round 6): pool, queues, lane verdict, peer recency |
+| `GET /prompts` `?q=` `?before=` | lifecycle chips + `?q=` search (round 5 / 5.1) + `?before=<createdAt ms>` strictly-older history pages (round 7, `?limit=` 1-50; invalid cursor = 400, never a silent default-list fall-through); `more` says whether older rows exist |
+| `GET /machine` | the machine card (round 6): pool, queues, lane verdict, peer recency, delivery-health + journal/audit alert lines |
+| `GET /notices` `?limit=` | machine→phone reports (round 8): newest window in registry order + `unacked` over the WHOLE registry (the badge never lies when the window is all-read). Read lane only — writers are local processes, incl. the once-per-local-day `daily-digest` (round 9; the registry itself is the cursor — the newest daily-digest notice's day) |
+| `POST /notices/:id/ack` | dismiss one (idempotent; 404 unknown) |
+| `POST /notices/ack-all` | dismiss every unread notice, `{acked: N}` |
 
 `attemptId` = sha256 of the pairing transcript — stable per exchange, so a
 late/replayed allow for an already-consumed attempt cannot alias onto a new
@@ -135,15 +140,38 @@ warning (phones cannot reach it; pass `--bind` / set the env like the lane).
 - **Allow sheet** — types the peer's 8 characters (same normalization as the
   CLI), confirm gesture, sends the signed allow.
 - **Deny** — one tap, signed.
+- **ASK cards** — pending asks render with their live countdown and the
+  lazy-consensus disclosure ("silence = yes") when the ask auto-approves at
+  expiry. Approve/Deny are the peer buttons; **YOLO** (round 12) sits
+  full-width beneath them in amber — the escalation it is: one-shot
+  full-auto, no further asks, same biometric presence gate as Approve. The
+  run's per-status instruction comes from one shared helper
+  (`askDecisionInstruction`) on every delivery surface, so a phone YOLO and
+  a Discord YOLO execute identically.
 - **Prompt + route toggle** (round 5 + multi-machine phase 1) — composer
   carries a "run on: this machine / peer machine" chip pair (cyan, visually
   distinct from the blue machine-select chips). Peer routing is per-send
   and resets to local after each prompt: deliberate asks route, casual
   ones stay home. A routed chip's status line names the runner and the
   30-min window; the answered preview arrives via the lane's outcome echo.
+- **SENT + history navigation** (round 7) — newest 20 live, "Load older"
+  walks strictly-older pages by createdAt cursor (frozen history pages,
+  deduped against the live window); rows tap to expand full text, excerpt,
+  and both stamps. FIND searches the whole registry by text or promptId.
+- **NOTICES card** (round 8) — machine→phone reports with an unread badge,
+  warn severity in red, per-notice + dismiss-all gestures. Arrival banner
+  once per notice per app session while unacked (unacked = the owner never
+  saw it — a reopen re-banners, a machine flip does not). "Show older
+  notices" (round 9) widens the window to the whole 50-record registry when
+  the default window is full; offered only then — a short list proves there
+  is nothing older to reveal.
+- **Haptics** — warning pattern on ask arrival, success/error on answer
+  transitions, warning/light on notices, medium tap on decision commit.
+  Fire-and-forget: devices without an engine no-op and the flow never
+  gates on feedback.
 - Dependencies: `@noble/ed25519` (pure-JS signatures), `expo-camera`,
-  `expo-crypto`, `expo-secure-store`. No native modules → runs in Expo Go on
-  both platforms unchanged.
+  `expo-crypto`, `expo-secure-store`, `expo-haptics`. No native modules →
+  runs in Expo Go on both platforms unchanged.
 
 ## Wiring + deployment
 

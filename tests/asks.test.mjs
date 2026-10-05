@@ -28,6 +28,7 @@ import {
   listCompanionDecisions,
   renderAskForApp,
   askDecisionLine,
+  askDecisionInstruction,
   ASK_V2_FLAG,
   buildAskV2Components,
   askClockLine,
@@ -181,7 +182,13 @@ test("sweepExpiredAsks: overdue pending → expired and returned; fresh + decide
     channelId: "1",
     messageId: null,
     approvers: [APPROVER],
-    ttlMs: 1,
+    // NOT ttlMs: 1 — this fixture needs decideAsk to WIN before any sweep,
+    // and on Windows FS latency >1ms laps a 1ms fuse first: the (correct)
+    // expiry backstop then refuses the decision, the record stays pending,
+    // and the sweep expires it (peer's round-17 verify caught the flake —
+    // 6/6 on their box). 60s can't lapse inside this test; sweep-exemption
+    // of decided records is what's asserted, not their ttl.
+    ttlMs: 60_000,
   });
   decideAsk(spool, decided.askId, "denied", APPROVER);
   const now = Date.now() + 10_000;
@@ -202,6 +209,17 @@ test("listPendingAsks lists every record file (registry view, all statuses)", ()
   decideAsk(spool, b.askId, "approved", APPROVER);
   const ids = listPendingAsks(spool).map((r) => r.askId).sort();
   assert.deepEqual(ids, [a.askId, b.askId].sort());
+});
+
+test("askDecisionInstruction carries the per-status execution semantics from ONE source", () => {
+  // round 12: every delivery surface (Discord click, phone tap) renders its
+  // run instruction from this helper — YOLO must mean one-shot full-auto on
+  // every host, not just whichever one happened to inline the words.
+  assert.match(askDecisionInstruction("approved", "fast335xi"), /approved.*proceed with exactly what the ask requested/s);
+  assert.match(askDecisionInstruction("yolo", "phone (companion)"), /YOLO'd.*one-shot full-auto.*no further asks/s);
+  assert.match(askDecisionInstruction("denied", "joesphan"), /denied.*do NOT proceed.*stand down/s);
+  // every branch names the decider — authority framing is display-only but always present
+  for (const s of ["approved", "yolo", "denied"]) assert.ok(askDecisionInstruction(s, "who").includes("who"));
 });
 
 test("askDecisionLine renders Approved/Denied/YOLO'd with the decider's display name", () => {
@@ -457,4 +475,55 @@ test("ask registry hygiene: terminal records GC at 7d; undelivered companion dec
   for (const id of [live.askId, "kept-undelivered", "kept-recent"]) {
     assert.ok(fs.existsSync(path.join(dir, `${id}.json`)), `${id} kept`);
   }
+});
+
+// --- audit round 3 (2026-10-04): claim-gated sweep + expiry boundary ------
+
+test("sweep claim (round 17): a decision holding the claim is never overwritten by expiry", () => {
+  // The HIGH race: sweepExpiredAsks used to read-modify-write WITHOUT the
+  // O_EXCL claim decideAsk takes — a deny landing between listPendingAsks
+  // and the write got silently flipped to approved/auto-expiry. The held
+  // claim (a live decideAsk mid-flight) now makes the sweep skip entirely.
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "race", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000, onExpiry: "approve",
+  });
+  // simulate decideAsk mid-flight: claim taken, record still pending
+  fs.closeSync(fs.openSync(path.join(spool, "pending-asks", `${rec.askId}.json.claim`), "wx", 0o600));
+  const swept = sweepExpiredAsks(spool, Date.now() + 5_000);
+  assert.equal(swept.length, 0, "held claim → the sweep skips this ask");
+  assert.equal(getAsk(spool, rec.askId).status, "pending", "the in-flight decision's record is untouched");
+});
+
+test("sweep claim (round 17): unclaimed expired asks still sweep, claim file lands beside the record", () => {
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "clean expiry", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000,
+  });
+  const swept = sweepExpiredAsks(spool, Date.now() + 5_000);
+  assert.equal(swept.length, 1);
+  assert.equal(swept[0].status, "expired");
+  assert.ok(
+    fs.existsSync(path.join(spool, "pending-asks", `${rec.askId}.json.claim`)),
+    "the sweep's own claim persists — no second transition, ever",
+  );
+});
+
+test("decideAsk expiry boundary (round 17): no deciding surface acts past the fuse", () => {
+  const spool = tmpSpool();
+  const stale = createPendingAsk(spool, {
+    question: "late", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000,
+  });
+  const out = decideAsk(spool, stale.askId, "approved", APPROVER);
+  assert.equal(out.status, "pending", "returned unchanged — refused, not decided");
+  assert.equal(getAsk(spool, stale.askId).status, "pending", "nothing recorded past the fuse");
+  // pre-expiry decisions keep working (regression)
+  const early = createPendingAsk(spool, {
+    question: "on time", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: 60_000,
+  });
+  assert.equal(decideAsk(spool, early.askId, "denied", APPROVER).status, "denied");
 });

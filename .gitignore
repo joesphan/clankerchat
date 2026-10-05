@@ -12,3 +12,4 @@ botlink-spool/
 .claude/settings.local.json
 .release-state
 release-watch.log
+dist-drifttest/

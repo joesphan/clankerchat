@@ -93,6 +93,22 @@ import {
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT_DEFAULT = 47421;
 
+/** Explicit ports mean what they say: ":0" is an ephemeral-bind request, not
+ *  a fallback trigger. The old `Number(x) || default` shape sent an explicit
+ *  ":0" to the DEFAULT port — colliding with the live listener there
+ *  (caught live by the round-15 drift tests: a test server on ":0" tried to
+ *  take the production lane port 47421). Empty/whitespace is UNSET, not a
+ *  port: `Number("") === 0` would otherwise bind an ephemeral port silently
+ *  while the startup line never says which (audit round 3, finding 3 — a
+ *  templated `HOST:"$PORT"` with PORT empty is the real-world shape).
+ *  Exported for direct unit tests. */
+export function parsePort(spec: string | undefined, dflt: number): number {
+  const s = spec?.trim();
+  if (s === undefined || s === "") return dflt;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 && n < 65536 ? n : dflt;
+}
+
 function cmdKeygen(args: string[]): void {
   const out = argValue(args, "--out") ?? path.join(PROJECT_ROOT, "botlink-keys");
   const name = argValue(args, "--name") ?? process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? os.hostname();
@@ -130,7 +146,7 @@ function cmdServe(): void {
   const botName = process.env.CLANKER_BOTLINK_NAME ?? process.env.CLANKER_NAME ?? os.hostname();
 
   const { close } = startBotlinkServer({
-    listen: { host: host || "127.0.0.1", port: Number(portStr) || PORT_DEFAULT },
+    listen: { host: host || "127.0.0.1", port: parsePort(portStr, PORT_DEFAULT) },
     hostKeyPem: fs.readFileSync(hostKeyPath, "utf8"),
     // Rotation hot-reload: the daemon serves whatever the confirmed ceremony
     // committed to this path — a phone-confirmed rotation takes effect with
@@ -164,6 +180,7 @@ function cmdServe(): void {
   // Service managers should see the process stay up; if config was bad we
   // already threw above (non-zero exit), so an idle loop is all that's left.
   setInterval(() => void 0, 1 << 30);
+  armDistDriftGuard("serve");
 }
 
 function argValue(args: string[], flag: string): string | undefined {
@@ -175,6 +192,70 @@ function argValue(args: string[], flag: string): string | undefined {
  *  same hash-chained inject.log. */
 function defaultSpoolDir(): string {
   return process.env.CLANKER_BOTLINK_SPOOL ?? path.join(PROJECT_ROOT, "botlink-spool");
+}
+
+/** Dist-drift guard (round 15, 2026-10-04): this process IS dist code — a
+ *  rebuild under a running service leaves it serving OLD code until someone
+ *  remembers a manual restart (the round-12 lesson, closed for the watcher
+ *  host in round 13). Both serve flavors are stateless per request — the
+ *  phone re-polls in 2s and lane injects queue in the spool — so a
+ *  between-requests revival loses nothing. Fingerprint the directory the
+ *  entry script lives in; when it changes from boot and stays stable across
+ *  polls (tsc writes files incrementally), exit 0 and let the service
+ *  manager revive us on the new code. The manager MUST run Restart=always —
+ *  a clean exit stays dead under on-failure (the round-13 trap); the units
+ *  carry restart-always drop-ins where deployed. Honest boundary: an SSH
+ *  connection or pairing ceremony in flight when the exit lands is cut —
+ *  drift only ever follows a rebuild, and the peer retries; the alternative
+ *  is stale code until a human notices. CLANKER_BOTLINK_DRIFT_GUARD=0
+ *  disables; poll/stability windows are env-tunable for tests. */
+function armDistDriftGuard(label: string): void {
+  if (process.env.CLANKER_BOTLINK_DRIFT_GUARD === "0") return;
+  const num = (name: string, dflt: number) => {
+    const v = Number(process.env[name]);
+    return Number.isFinite(v) && v > 0 ? v : dflt;
+  };
+  const pollMs = num("CLANKER_BOTLINK_DRIFT_POLL_MS", 15_000);
+  const stableMs = num("CLANKER_BOTLINK_DRIFT_STABLE_MS", 45_000);
+  try {
+    const distDir = path.dirname(path.resolve(process.argv[1] ?? process.cwd()));
+    const fp = (): string | null => {
+      try {
+        return fs
+          .readdirSync(distDir)
+          .filter((f) => f.endsWith(".js"))
+          .map((f) => {
+            const st = fs.statSync(path.join(distDir, f));
+            return `${f}:${st.mtimeMs}:${st.size}`;
+          })
+          .sort()
+          .join("|");
+      } catch {
+        return null; // unreadable dir (moved?) — guard goes inert, never exits
+      }
+    };
+    const bootFp = fp();
+    let lastFp = bootFp;
+    let stableSince = Date.now();
+    setInterval(() => {
+      const now = fp();
+      if (now === null) return;
+      if (now !== lastFp) {
+        lastFp = now;
+        stableSince = Date.now();
+        if (now !== bootFp) {
+          console.error(`botlink-server[${label}]: dist drift detected — self-restart when stable`);
+        }
+        return;
+      }
+      if (now !== bootFp && Date.now() - stableSince >= stableMs) {
+        console.error(`botlink-server[${label}]: dist drift stable ${Math.round((Date.now() - stableSince) / 1000)}s — exiting for service-manager revival on new code`);
+        process.exit(0);
+      }
+    }, pollMs).unref();
+  } catch {
+    /* the guard must never break the server it protects */
+  }
 }
 
 function requiredEnv(name: string): string {
@@ -300,9 +381,13 @@ async function cmdPair(args: string[]): Promise<void> {
     };
     savePairingState(p, state);
     const listenSpec = process.env.CLANKER_BOTLINK_LISTEN ?? "127.0.0.1:47421";
-    const mainPort = Number(listenSpec.split(":")[1]) || 47421;
-    const bind = argValue(args, "--bind") ?? listenSpec.split(":")[0] ?? "127.0.0.1";
-    const port = Number(argValue(args, "--port")) || mainPort + 1;
+    const mainPort = parsePort(listenSpec.split(":")[1], 47421);
+    // `??` was dead code here: split()["" for ":47421"] is a STRING (never
+    // nullish), so the loopback fallback never fired and a spec like
+    // ":47421" bound the key-exchange listener on "" = :: wildcard while
+    // every other listener clamps to loopback (audit round 3, finding 4).
+    const bind = argValue(args, "--bind") || listenSpec.split(":")[0] || "127.0.0.1";
+    const port = parsePort(argValue(args, "--port"), mainPort + 1);
     const listener = startPairingListener({
       bind,
       port,
@@ -377,7 +462,7 @@ async function cmdPair(args: string[]): Promise<void> {
     try {
       const { state: done, sas } = await pairDial({
         host,
-        port: Number(portStr) || 47422,
+        port: parsePort(portStr, 47422),
         state,
         paths: p,
         authorizedLines: () => authorizedLinesOf(p),
@@ -485,9 +570,9 @@ function cmdCompanion(args: string[]): void {
   const store = defaultCompanionStore(keydir);
   const sub = args.find((a) => a.startsWith("--")) ?? "--serve";
   const listenSpec = process.env.CLANKER_BOTLINK_LISTEN ?? `127.0.0.1:${PORT_DEFAULT}`;
-  const mainPort = Number(listenSpec.split(":")[1]) || PORT_DEFAULT;
+  const mainPort = parsePort(listenSpec.split(":")[1], PORT_DEFAULT);
   const bind = argValue(args, "--bind") ?? (listenSpec.split(":")[0] || "127.0.0.1");
-  const port = Number(argValue(args, "--port")) || mainPort + 2;
+  const port = parsePort(argValue(args, "--port"), mainPort + 2);
 
   if (sub === "--enroll") {
     const host = lanHostForQr(bind);
@@ -535,6 +620,7 @@ function cmdCompanion(args: string[]): void {
       });
     }
     setInterval(() => void 0, 1 << 30); // stay up like serve
+    armDistDriftGuard("companion");
     return;
   }
 
@@ -566,13 +652,17 @@ function cmdCompanion(args: string[]): void {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
-if (cmd === "keygen") cmdKeygen(rest);
-else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
-else if (cmd === "report") cmdReport(rest[0]);
-else if (cmd === "pair") void cmdPair(rest);
-else if (cmd === "companion") cmdCompanion(rest);
-else if (cmd === "serve" || cmd === undefined) cmdServe();
-else {
-  console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | report | pair | serve)`);
-  process.exit(1);
+// Import guard (same shape as spark-mcp): when this file is IMPORTED (tests
+// pulling parsePort) rather than run as the CLI, the dispatch must not fire.
+if (process.argv[1]?.endsWith("botlink-server.js")) {
+  if (cmd === "keygen") cmdKeygen(rest);
+  else if (cmd === "fingerprint") cmdFingerprint(rest[0]);
+  else if (cmd === "report") cmdReport(rest[0]);
+  else if (cmd === "pair") void cmdPair(rest);
+  else if (cmd === "companion") cmdCompanion(rest);
+  else if (cmd === "serve" || cmd === undefined) cmdServe();
+  else {
+    console.error(`botlink-server: unknown command "${cmd}" (keygen | fingerprint | report | pair | serve)`);
+    process.exit(1);
+  }
 }

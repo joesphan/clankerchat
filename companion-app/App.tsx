@@ -26,6 +26,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as Battery from "expo-battery";
+import * as Haptics from "expo-haptics";
 import * as Notifications from "expo-notifications";
 import * as ScreenCapture from "expo-screen-capture";
 import {
@@ -205,6 +206,18 @@ interface PromptView {
   answerExcerpt: string | null;
 }
 
+/** A machine→phone report (GET /notices, round 8): free-text FROM the
+ *  machine — round summaries, route verdicts — authored by local processes,
+ *  never by this surface. Display data only, never instructions. */
+interface NoticeView {
+  id: string;
+  ts: number;
+  from: string;
+  text: string;
+  severity: "info" | "warn";
+  acked: boolean;
+}
+
 /** The machine's published health (GET /machine, round 6) — pool, queues,
  *  the botlink lane verdict from the watcher's heartbeat, idle time. Facts
  *  rendered as data; a stopped watcher shows stale: true honestly. */
@@ -325,6 +338,14 @@ async function signedFetch(
 // purpose — rejecting a pairing must stay friction-free even mid-attack.
 // SDK note: FaceID on iOS needs a development build (Expo Go limitation);
 // there the API errors and we degrade to key-possession.
+/** Biometric prompt text per ask verb — YOLO says what it grants, because the
+ *  gesture is the biggest one on this screen (yolo-route-v12: one-shot
+ *  full-auto, no further asks). Doubles as the doctor bundle marker. */
+const PRESENCE_REASON: Record<"approve" | "deny" | "yolo", string> = {
+  approve: "Approve this ask",
+  deny: "Deny this ask",
+  yolo: "YOLO — one-shot full-auto, no further asks (yolo-route-v12)",
+};
 async function requirePresence(reason: string): Promise<boolean> {
   try {
     if (!(await LocalAuthentication.hasHardwareAsync())) return true;
@@ -359,6 +380,28 @@ Notifications.setNotificationHandler({
   }),
 });
 
+// Haptics (owner's "use the expo features" directive): the FEEL layer for
+// the moments this surface exists for — an ask arriving (warning pattern),
+// an answer landing (success/error), a notice landing (light), a decision
+// committing (medium tap). Always fire-and-forget: a device without a
+// taptic engine (simulator, desktop web preview) no-ops and the flow moves
+// on — feedback must never gate the action it decorates.
+function haptic(pattern: "light" | "medium" | "warning" | "success" | "error"): void {
+  const fire =
+    pattern === "light" || pattern === "medium"
+      ? Haptics.impactAsync(
+          pattern === "light" ? Haptics.ImpactFeedbackStyle.Light : Haptics.ImpactFeedbackStyle.Medium,
+        )
+      : Haptics.notificationAsync(
+          pattern === "warning"
+            ? Haptics.NotificationFeedbackType.Warning
+            : pattern === "success"
+              ? Haptics.NotificationFeedbackType.Success
+              : Haptics.NotificationFeedbackType.Error,
+        );
+  void fire.catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -374,6 +417,14 @@ export default function App() {
   const [asks, setAsks] = useState<AskView[]>([]);
   const [prompts, setPrompts] = useState<PromptView[]>([]);
   const [machine, setMachine] = useState<MachineView | null>(null);
+  const [notices, setNotices] = useState<NoticeView[]>([]);
+  const [unacked, setUnacked] = useState(0);
+  // Notices window width (round 9): the poll fetches the newest 10 by
+  // default; "Show older notices" widens to the whole 50-record registry.
+  // Kept in a ref so flipping it re-renders the toggle WITHOUT re-arming the
+  // poll effect — the next 2s tick simply fetches the wider window.
+  const [noticesLimit, setNoticesLimit] = useState(10);
+  const noticesLimitRef = useRef(10);
   const [promptText, setPromptText] = useState("");
   // Route toggle (multi-machine phase 1): false = this machine runs it (the
   // only behavior before phase 1); true = route:"peer" — the peer machine
@@ -384,6 +435,13 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [searchQ, setSearchQ] = useState("");
   const [searchResults, setSearchResults] = useState<PromptView[] | null>(null);
+  // History navigation (round 7): the SENT card ships the newest 20 from the
+  // server; "Load older" walks backward by createdAt cursor. `history` holds
+  // ONLY rows older than the live window (deduped against it at render).
+  const [history, setHistory] = useState<PromptView[]>([]);
+  const [sentMore, setSentMore] = useState(false);
+  // Expanded SENT/search rows (tap to read the full text + excerpt + stamps).
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string>("");
   const [notice, setNotice] = useState<string>("");
   const [perm, requestPerm] = useCameraPermissions();
@@ -393,6 +451,10 @@ export default function App() {
   // machine:askId keys for ask-arrival banners — one banner per ask per app
   // session, surviving machine switches (a flip must not re-spam old asks).
   const seenAsks = useRef<Set<string>>(new Set());
+  // Same shape for notices (round 8): an UNACKED notice banners once per app
+  // session — unacked means Tyler never saw it, so a reopen re-banner is
+  // correct, a flip within the session is not.
+  const seenNotices = useRef<Set<string>>(new Set());
   // The pocket's own health (S-tier #3): the phone IS the approval surface,
   // so its battery belongs beside the machine's health on the machine card.
   const [battery, setBattery] = useState<{ level: number; charging: boolean } | null>(null);
@@ -445,10 +507,22 @@ export default function App() {
         const promptRes = await signedFetch(active, seed, phoneId, "GET", "/prompts");
         if (!stopped && promptRes.status === 200) {
           setPrompts(Array.isArray(promptRes.json.prompts) ? (promptRes.json.prompts as unknown as PromptView[]) : []);
+          setSentMore(promptRes.json.more === true);
         }
         const machineRes = await signedFetch(active, seed, phoneId, "GET", "/machine");
         if (!stopped && machineRes.status === 200 && machineRes.json?.machine) {
           setMachine(machineRes.json.machine as unknown as MachineView);
+        }
+        const noticeRes = await signedFetch(
+          active,
+          seed,
+          phoneId,
+          "GET",
+          noticesLimitRef.current > 10 ? `/notices?limit=${noticesLimitRef.current}` : "/notices",
+        );
+        if (!stopped && noticeRes.status === 200) {
+          setNotices(Array.isArray(noticeRes.json.notices) ? (noticeRes.json.notices as unknown as NoticeView[]) : []);
+          setUnacked(Number(noticeRes.json.unacked ?? 0));
         }
       } catch (e) {
         if (!stopped) setError(`unreachable: ${(e as Error).message}`);
@@ -537,6 +611,7 @@ export default function App() {
       const key = `${active.id}:${a.askId}`;
       if (seenAsks.current.has(key)) continue;
       seenAsks.current.add(key);
+      haptic("warning");
       void Notifications.scheduleNotificationAsync({
         content: {
           title: "Ask needs your decision",
@@ -546,6 +621,27 @@ export default function App() {
       }).catch((e) => setError(`notification failed: ${(e as Error).message}`));
     }
   }, [asks, active]);
+
+  // Notice-arrival banners (round 8): same display-data class as ask banners.
+  // One banner per notice per app session, unacked only — unacked means the
+  // owner never saw it (acks come from THIS phone), so a reopen re-banners.
+  useEffect(() => {
+    if (!active) return;
+    for (const n of notices) {
+      if (n.acked) continue;
+      const key = `${active.id}:${n.id}`;
+      if (seenNotices.current.has(key)) continue;
+      seenNotices.current.add(key);
+      haptic(n.severity === "warn" ? "warning" : "light");
+      void Notifications.scheduleNotificationAsync({
+        content: {
+          title: n.severity === "warn" ? `⚠ machine notice (${n.from})` : `machine notice (${n.from})`,
+          body: String(n.text).slice(0, 140),
+        },
+        trigger: null, // local, immediate
+      }).catch((e) => setError(`notification failed: ${(e as Error).message}`));
+    }
+  }, [notices, active]);
 
   // Notification permission: ask once on mount. A denial is SURFACED (quiet
   // notice line) rather than swallowed — "no banner" with no reason is
@@ -572,6 +668,7 @@ export default function App() {
         before !== p.status &&
         (p.status === "answered" || p.status === "failed")
       ) {
+        haptic(p.status === "answered" ? "success" : "error");
         void Notifications.scheduleNotificationAsync({
           content: {
             title: p.status === "answered" ? "Prompt answered" : "Prompt failed",
@@ -735,9 +832,9 @@ export default function App() {
   );
 
   const doAskDecision = useCallback(
-    async (askId: string, verb: "approve" | "deny") => {
+    async (askId: string, verb: "approve" | "deny" | "yolo") => {
       if (!active || !seed || !phoneId) return;
-      if (!(await requirePresence(verb === "approve" ? "Approve this ask" : "Deny this ask"))) {
+      if (!(await requirePresence(PRESENCE_REASON[verb]))) {
         setError("presence declined — nothing sent");
         return;
       }
@@ -747,6 +844,7 @@ export default function App() {
       try {
         const { status, json } = await signedFetch(active, seed, phoneId, "POST", `/asks/${askId}/${verb}`);
         if (status === 200) {
+          haptic("medium");
           setNotice(`Ask ${String(json.status ?? verb)} — recorded`);
           setAsks((prev) => prev.filter((a) => a.askId !== askId));
         } else if (status === 409) {
@@ -763,6 +861,32 @@ export default function App() {
     },
     [active, phoneId, seed],
   );
+
+  // Dismiss notices (round 8): mark seen — the record stays for history,
+  // dimmed; only the unread badge and banner eligibility go away. The server
+  // is source of truth; the 2s poll repaints ack state, no local surgery.
+  const doAckNotice = useCallback(
+    async (id: string) => {
+      if (!active || !seed || !phoneId) return;
+      try {
+        const { status, json } = await signedFetch(active, seed, phoneId, "POST", `/notices/${id}/ack`);
+        if (status !== 200) setError(String(json.error ?? `HTTP ${status}`));
+      } catch (e) {
+        setError(`unreachable: ${(e as Error).message}`);
+      }
+    },
+    [active, phoneId, seed],
+  );
+
+  const doAckAllNotices = useCallback(async () => {
+    if (!active || !seed || !phoneId) return;
+    try {
+      const { status, json } = await signedFetch(active, seed, phoneId, "POST", "/notices/ack-all");
+      if (status !== 200) setError(String(json.error ?? `HTTP ${status}`));
+    } catch (e) {
+      setError(`unreachable: ${(e as Error).message}`);
+    }
+  }, [active, phoneId, seed]);
 
   // Send an owner prompt to the active machine (round 5): the machine's
   // watcher sweep turns it into an owner-priority run whose answer posts in
@@ -799,6 +923,79 @@ export default function App() {
       setBusy(false);
     }
   }, [active, phoneId, promptText, routePeer, seed]);
+
+  // Walk the history one page older (round 7). The cursor is the OLDEST
+  // createdAt currently rendered; the server answers strictly-older records
+  // plus `more` for the next button. History never re-polls — it is frozen
+  // record, unlike the live window above it.
+  const loadOlder = useCallback(async () => {
+    if (!active || !seed || !phoneId) return;
+    const rows = [...history, ...prompts];
+    if (rows.length === 0) return;
+    const oldest = Math.min(...rows.map((p) => p.createdAt));
+    setBusy(true);
+    setError("");
+    try {
+      const { status, json } = await signedFetch(
+        active,
+        seed,
+        phoneId,
+        "GET",
+        `/prompts?before=${oldest}`,
+      );
+      if (status === 200) {
+        const page = Array.isArray(json.prompts) ? (json.prompts as unknown as PromptView[]) : [];
+        setHistory((prev) => {
+          const seen = new Set(prev.map((p) => p.promptId));
+          return [...prev, ...page.filter((p) => !seen.has(p.promptId))];
+        });
+        setSentMore(json.more === true);
+      } else {
+        setError(String(json.error ?? `HTTP ${status}`));
+      }
+    } catch (e) {
+      setError(`unreachable: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [active, history, phoneId, prompts, seed]);
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // One prompt row: collapsed = 2-line preview (today's card), expanded =
+  // full text, full excerpt, both stamps — the excerpt is capped server-side
+  // already, so "expanded" is a layout change, not a data change.
+  const renderPromptRow = (p: PromptView) => {
+    const open = expanded.has(p.promptId);
+    return (
+      <Pressable key={p.promptId} style={s.promptRow} onPress={() => toggleExpanded(p.promptId)}>
+        <Text style={s.muted} numberOfLines={open ? undefined : 2}>
+          {p.text}
+        </Text>
+        <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
+          {promptStatusLine(p)}
+        </Text>
+        {p.status === "answered" && p.answerExcerpt ? (
+          <Text style={s.excerpt} numberOfLines={open ? undefined : 6}>
+            {p.answerExcerpt}
+          </Text>
+        ) : null}
+        {open ? (
+          <Text style={s.stamp}>
+            sent {new Date(p.createdAt).toLocaleString()}
+            {p.finishedAt ? ` · ${p.status} ${new Date(p.finishedAt).toLocaleString()}` : ""}
+          </Text>
+        ) : null}
+      </Pressable>
+    );
+  };
 
   const promptStatusLine = (p: PromptView): string => {
     const where = p.route === "peer" ? "peer machine" : "this machine";
@@ -894,6 +1091,13 @@ export default function App() {
                 setPrompts([]);
                 setMachine(null);
                 setSearchResults(null); // results belong to the machine they came from
+                setHistory([]); // history pages are per-machine too — walk each machine's own past
+                setSentMore(false);
+                setNotices([]); // notices are per-machine reports — clear, repoll repopulates
+                setUnacked(0);
+                noticesLimitRef.current = 10; // window width is a view preference per machine view
+                setNoticesLimit(10);
+                setExpanded(new Set());
                 seenPromptStatus.current.clear(); // notification transitions are per-machine:
                 // a stale status from machine A must never look like a
                 // "transition" for a colliding promptId on machine B
@@ -971,6 +1175,64 @@ export default function App() {
         </View>
       ) : null}
 
+      {active && notices.length > 0 ? (
+        <View style={s.card}>
+          <Text style={s.cardTitle}>NOTICES{unacked > 0 ? ` · ${unacked} unread` : ""}</Text>
+          {notices
+            .slice()
+            .reverse()
+            .map((n) => {
+              const open = expanded.has(n.id);
+              return (
+                <Pressable key={n.id} style={s.promptRow} onPress={() => toggleExpanded(n.id)}>
+                  <Text style={n.severity === "warn" && !n.acked ? s.err : s.muted} numberOfLines={1}>
+                    {n.severity === "warn" ? "⚠ " : ""}
+                    {n.from} · {new Date(n.ts).toLocaleString()}
+                    {n.acked ? " · read" : ""}
+                  </Text>
+                  <Text style={n.acked ? s.stamp : s.noticeText} numberOfLines={open ? undefined : 4}>
+                    {n.text}
+                  </Text>
+                  {!n.acked ? (
+                    <Pressable style={[s.button, s.buttonDim]} onPress={() => void doAckNotice(n.id)}>
+                      <Text style={s.buttonText}>Dismiss</Text>
+                    </Pressable>
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          {unacked > 1 ? (
+            <Pressable style={[s.button, s.buttonDim]} onPress={() => void doAckAllNotices()}>
+              <Text style={s.buttonText}>Dismiss all ({unacked})</Text>
+            </Pressable>
+          ) : null}
+          {/* Window toggle: only offered when the window is FULL (exactly
+              `limit` rows) — a short list proves the registry has nothing
+              older to reveal. The flip takes effect on the next 2s poll. */}
+          {noticesLimit === 10 && notices.length >= 10 ? (
+            <Pressable
+              style={[s.button, s.buttonDim]}
+              onPress={() => {
+                noticesLimitRef.current = 50;
+                setNoticesLimit(50);
+              }}
+            >
+              <Text style={s.buttonText}>Show older notices</Text>
+            </Pressable>
+          ) : noticesLimit === 50 ? (
+            <Pressable
+              style={[s.button, s.buttonDim]}
+              onPress={() => {
+                noticesLimitRef.current = 10;
+                setNoticesLimit(10);
+              }}
+            >
+              <Text style={s.buttonText}>Recent only</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
+
       {active && asks.length > 0
         ? asks.map((a) => (
             <View key={a.askId} style={s.card}>
@@ -995,6 +1257,13 @@ export default function App() {
                   <Text style={s.buttonText}>Deny</Text>
                 </Pressable>
               </View>
+              <Pressable
+                style={[s.button, s.yolo]}
+                disabled={busy}
+                onPress={() => void doAskDecision(a.askId, "yolo")}
+              >
+                <Text style={s.buttonText}>YOLO · full-auto once, no further asks</Text>
+              </Pressable>
             </View>
           ))
         : null}
@@ -1075,21 +1344,7 @@ export default function App() {
               searchResults
                 .slice()
                 .reverse()
-                .map((p) => (
-                  <View key={`sr-${p.promptId}`} style={s.promptRow}>
-                    <Text style={s.muted} numberOfLines={2}>
-                      {p.text}
-                    </Text>
-                    <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
-                      {promptStatusLine(p)}
-                    </Text>
-                    {p.status === "answered" && p.answerExcerpt ? (
-                      <Text style={s.excerpt} numberOfLines={6}>
-                        {p.answerExcerpt}
-                      </Text>
-                    ) : null}
-                  </View>
-                ))
+                .map(renderPromptRow)
             )
           ) : null}
         </View>
@@ -1098,24 +1353,16 @@ export default function App() {
       {active && prompts.length > 0 ? (
         <View style={s.card}>
           <Text style={s.cardTitle}>SENT</Text>
-          {prompts
+          {/* newest first: live window on top, frozen history pages under it,
+              deduped (a still-eligible answer can sit in both windows) */}
+          {[...history, ...prompts]
+            .filter((p, i, all) => all.findIndex((q) => q.promptId === p.promptId) === i)
             .slice()
             .reverse()
-            .map((p) => (
-              <View key={p.promptId} style={s.promptRow}>
-                <Text style={s.muted} numberOfLines={2}>
-                  {p.text}
-                </Text>
-                <Text style={p.status === "failed" || p.status === "expired" ? s.err : s.ok}>
-                  {promptStatusLine(p)}
-                </Text>
-                {p.status === "answered" && p.answerExcerpt ? (
-                  <Text style={s.excerpt} numberOfLines={6}>
-                    {p.answerExcerpt}
-                  </Text>
-                ) : null}
-              </View>
-            ))}
+            .map(renderPromptRow)}
+          <Pressable style={[s.button, s.buttonDim]} disabled={busy || !sentMore} onPress={() => void loadOlder()}>
+            <Text style={s.buttonText}>{sentMore ? "Load older" : "start of history"}</Text>
+          </Pressable>
         </View>
       ) : null}
 
@@ -1205,12 +1452,18 @@ const s = StyleSheet.create({
     textAlignVertical: "top",
   },
   promptRow: { borderTopWidth: 1, borderTopColor: "#1f2335", paddingTop: 8, gap: 2 },
+  noticeText: { color: "#c0caf5", fontSize: 13, lineHeight: 19 },
+  stamp: { color: "#565f89", fontSize: 11 },
   excerpt: { color: "#9aa5ce", fontStyle: "italic", fontSize: 13, lineHeight: 18 },
   buttonDim: { opacity: 0.4 },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
   button: { backgroundColor: "#7aa2f7", borderRadius: 10, paddingVertical: 12, paddingHorizontal: 22 },
   allow: { backgroundColor: "#9ece6a", flex: 1, alignItems: "center" },
   deny: { backgroundColor: "#f7768e", flex: 1, alignItems: "center" },
+  // YOLO sits full-width BELOW Approve/Deny — visually the escalation it is,
+  // not a third peer of the same weight (amber = caution-class, not the
+  // deny-red; it grants power rather than refusing it).
+  yolo: { backgroundColor: "#e0af68", alignSelf: "stretch", alignItems: "center", marginTop: 4 },
   buttonText: { color: "#1a1b26", fontWeight: "700", fontSize: 15 },
   chip: { backgroundColor: "#24283b", borderRadius: 999, paddingHorizontal: 14, paddingVertical: 8 },
   chipActive: { backgroundColor: "#7aa2f7" },

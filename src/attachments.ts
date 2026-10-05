@@ -31,6 +31,34 @@ export interface PickedAttachment {
 }
 
 /**
+ * Normalize a message's attachments to a plain array. discord.js delivers
+ * `Message.attachments` as a Collection — NOT an array — so the original
+ * `Array.isArray` guard silently produced [] for every real message and the
+ * whole image feature was dead code on the watcher (audit round 3, W-finding
+ * 1). Accepts: arrays (raw payloads), Collection-likes (`.toArray()`), and
+ * Map-likes (`.values()`) — everything else is "no attachments".
+ */
+export function attachmentList(msg: { attachments?: unknown }): unknown[] {
+  const a = msg.attachments;
+  if (Array.isArray(a)) return a;
+  if (a && typeof (a as { toArray?: unknown }).toArray === "function") {
+    try {
+      return Array.from((a as { toArray: () => unknown[] }).toArray());
+    } catch {
+      return [];
+    }
+  }
+  if (a && typeof (a as { values?: unknown }).values === "function") {
+    try {
+      return Array.from((a as { values: () => Iterable<unknown> }).values());
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/**
  * Extract renderable image attachments from a discord-like message.
  * Non-image attachments are ignored (they were always ignored); oversized
  * or over-count images are dropped, never fatal — a message with 6 images
@@ -40,9 +68,7 @@ export function pickImageAttachments(
   msg: { attachments?: unknown },
   messageId: string,
 ): PickedAttachment[] {
-  const list = Array.isArray((msg as { attachments?: unknown[] }).attachments)
-    ? ((msg as { attachments?: unknown[] }).attachments as unknown[])
-    : [];
+  const list = attachmentList(msg);
   const out: PickedAttachment[] = [];
   for (const a of list) {
     if (out.length >= ATTACHMENT_MAX_COUNT) break;
@@ -76,10 +102,9 @@ export function safeAttachmentName(messageId: string, idx: number, filename: str
  * says an otherwise-eligible trigger with empty text still counts.
  */
 export function imagesCarryTrigger(msg: { attachments?: unknown }): boolean {
-  const list = Array.isArray((msg as { attachments?: unknown[] }).attachments)
-    ? ((msg as { attachments?: unknown[] }).attachments as unknown[])
-    : [];
-  return list.some((a) => IMAGE_EXT_RE.test(String((a as { filename?: unknown })?.filename ?? "")));
+  return attachmentList(msg).some((a) =>
+    IMAGE_EXT_RE.test(String((a as { filename?: unknown })?.filename ?? "")),
+  );
 }
 
 /**

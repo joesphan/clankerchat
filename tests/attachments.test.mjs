@@ -68,3 +68,23 @@ test("imageDescriptionLines: untrusted framing, numbered, whitespace flattened, 
   assert.ok(lines[2].length <= "  [image 2] ".length + 1200); // description slice cap
   assert.deepEqual(imageDescriptionLines([]), []); // empty in, empty out
 });
+
+test("attachmentList (round 17): discord.js Collection attachments are not invisible", () => {
+  // Audit round 3, W-1: the watcher passes parsed discord.js Messages, whose
+  // attachments are a Collection — Array.isArray(Collection) is false, so the
+  // old guard saw [] for every real message and the image feature was dead
+  // code on the watcher. Collection-likes and Map-likes now normalize.
+  const collectionLike = {
+    size: 1,
+    toArray: () => [{ url: "https://cdn.example/a.png", filename: "a.png", size: 10 }],
+  };
+  assert.equal(imagesCarryTrigger({ attachments: collectionLike }), true, "Collection shape carries the trigger");
+  const picked = pickImageAttachments({ attachments: collectionLike }, "155");
+  assert.equal(picked.length, 1);
+  assert.equal(picked[0].name, "att-155-0.png");
+  const mapLike = new Map([["1", { url: "https://cdn.example/b.jpg", filename: "b.jpg", size: 5 }]]);
+  assert.equal(imagesCarryTrigger({ attachments: mapLike }), true, "Map-like shape works too");
+  // junk stays quietly empty, never fatal
+  assert.deepEqual(pickImageAttachments({ attachments: "nope" }, "1"), []);
+  assert.deepEqual(pickImageAttachments({}, "1"), []);
+});

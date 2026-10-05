@@ -346,6 +346,13 @@ export function decideAsk(
   const rec = getAsk(spoolDir, askId);
   if (!rec) return null;
   if (rec.status !== "pending") return rec;
+  // Expiry is a hard boundary on EVERY deciding surface (audit round 3,
+  // finding 1): past the fuse the sweep owns the ask — a late tap or click
+  // must never approve what "buttons die at expiry" promised would die.
+  // Return the still-pending record unchanged; callers report it honestly
+  // (the companion route and click handler pre-check this for a clean
+  // "expired" answer, this is the backstop at the single choke point).
+  if (rec.expiresAt <= Date.now()) return rec;
   const file = askFile(spoolDir, askId);
   const claim = `${file}.claim`;
   let claimed = false;
@@ -369,22 +376,42 @@ export function decideAsk(
  *  flip to approved with decidedBy "auto-expiry" — any Deny before expiry
  *  already won via decideAsk, so this only fires on true silence. Returns
  *  every record transitioned this pass so the caller can edit its message
- *  and (for auto-approvals) enqueue the decision run. */
+ *  and (for auto-approvals) enqueue the decision run.
+ *
+ *  Claim-gated since audit round 3 (finding 1): the old read-modify-write
+ *  could OVERWRITE a decision that landed between listPendingAsks and the
+ *  write — proven live as a phone DENY silently flipped to an auto-expiry
+ *  APPROVAL with the message re-edited. The sweep now takes the same O_EXCL
+ *  claim decideAsk does: a lost claim means a live decision (tap, click)
+ *  holds the ask and the sweep skips it entirely. Deny-before-expiry wins
+ *  on every interleaving. */
 export function sweepExpiredAsks(spoolDir: string, now = Date.now()): AskRecord[] {
   const swept: AskRecord[] = [];
   for (const rec of listPendingAsks(spoolDir)) {
     if (rec.status === "pending" && rec.expiresAt <= now) {
+      const file = askFile(spoolDir, rec.askId);
+      const claim = `${file}.claim`;
+      try {
+        fs.closeSync(fs.openSync(claim, "wx", 0o600));
+      } catch {
+        continue; // a live decision holds the claim — it wins, the sweep skips
+      }
       const next: AskRecord = rec.onExpiry === "approve"
         ? { ...rec, status: "approved", decidedBy: "auto-expiry", decidedAt: now }
         : { ...rec, status: "expired" };
-      const file = askFile(spoolDir, rec.askId);
       try {
         const tmp = `${file}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify(next, null, 1) + "\n");
         fs.renameSync(tmp, file);
         swept.push(next);
       } catch {
-        /* unreadable/locked — next sweep retries */
+        /* unreadable/locked — release our own claim so the next sweep
+           retries (only a crash mid-window leaves it held, same as decideAsk) */
+        try {
+          fs.rmSync(claim, { force: true });
+        } catch {
+          /* nothing more to do — the record stays pending, next sweep retries */
+        }
       }
     }
   }
@@ -465,4 +492,20 @@ export function askDecisionLine(rec: AskRecord, decidedName: string): string {
   if (rec.decidedBy === "auto-expiry") return `Auto-approved (no Deny before expiry) · ${t}Z`;
   const verb = rec.status === "approved" ? "Approved" : rec.status === "denied" ? "Denied" : rec.status === "yolo" ? "YOLO'd" : "Expired";
   return `${verb} by ${decidedName} · ${t}Z`;
+}
+
+/** The per-status INSTRUCTION a decision run executes — ONE shared source for
+ *  every delivery surface (Discord click, phone tap, and any future one), so
+ *  a YOLO means one-shot full-auto no matter which host delivers the run.
+ *  Round-12 law: the delivery paths used to carry only the bare status word
+ *  ("[ask decision] YOLO by …"), leaving the semantics to whichever brain
+ *  read it — daemon.ts had the instructions inline, the watcher host didn't,
+ *  and the two hosts' YOLO runs would have behaved differently. deciderName
+ *  is display-only (authority was the API/signed-surface check upstream). */
+export function askDecisionInstruction(status: AskRecord["status"], deciderName: string): string {
+  if (status === "approved")
+    return `The human (${deciderName}) approved — proceed with exactly what the ask requested, then answer in the thread.`;
+  if (status === "yolo")
+    return `The human (${deciderName}) YOLO'd — one-shot full-auto granted by their gesture: execute the ask's request now with no further asks, then answer in the thread with the receipt.`;
+  return `The human (${deciderName}) denied — do NOT proceed; stand down and acknowledge the denial in the thread.`;
 }

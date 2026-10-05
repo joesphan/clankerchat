@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  resolveSparkPort,
+  SPARK_DEFAULT_PORT,
   capabilityMatch,
   bearerOk,
   secretMatch,
@@ -268,4 +270,19 @@ test("listener: prompt_result and list_recent_prompts see spark records ONLY, sc
     assert.ok(!listText.includes("pmphone0001"));
     assert.ok(!listText.includes("phone prompt text"));
   });
+});
+
+// --- port resolution (peer's round-17 verify named the un-ported "" class) ----
+
+test("resolveSparkPort: unset/empty/whitespace = DEFAULT, never a silent ephemeral bind", () => {
+  assert.equal(resolveSparkPort(undefined), SPARK_DEFAULT_PORT);
+  assert.equal(resolveSparkPort(""), SPARK_DEFAULT_PORT); // Number("")===0 trap
+  assert.equal(resolveSparkPort("   "), SPARK_DEFAULT_PORT); // whitespace-only
+  assert.equal(resolveSparkPort("junk"), SPARK_DEFAULT_PORT);
+  assert.equal(resolveSparkPort("-1"), SPARK_DEFAULT_PORT);
+  assert.equal(resolveSparkPort("99999"), SPARK_DEFAULT_PORT);
+  // explicit numeric values ARE honored — including a deliberate ephemeral "0"
+  assert.equal(resolveSparkPort("0"), 0);
+  assert.equal(resolveSparkPort("8791"), 8791);
+  assert.equal(resolveSparkPort(" 47422 "), 47422); // trimmed, not rejected
 });

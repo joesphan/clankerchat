@@ -34,8 +34,11 @@ import http from "node:http";
 import path from "node:path";
 import { appendInjectEvent, deriveInjectMetrics, fingerprintOfPublicKey, parseKey, verifyInjectLog } from "./botlink.js";
 import { decideAsk, getAsk, listPendingAsks, renderAskForApp } from "./asks.js";
+import { journalStats, readJournalTail } from "./journal.js";
+import { ackAllNotices, ackNotice, listNotices } from "./notices.js";
 import {
   createPhonePrompt,
+  historyWindow,
   listPhonePrompts,
   renderPromptForApp,
   type PromptRecord,
@@ -419,8 +422,10 @@ export function startCompanionServer(opts: {
         // --- shared registry with provenance "companion:<fp>"; the gateway
         // --- watcher delivers (message edit + trigger run) and stamps
         // --- enqueuedAt — this surface never delivers, so no double path.
-        // --- decideAsk's pending-guard is the only gate: a tap racing the
-        // --- expiry sweep simply loses or wins cleanly, never both.
+        // --- Two-surface race law (audit round 3): every deciding path goes
+        // --- through decideAsk's kernel-atomic O_EXCL claim, and the expiry
+        // --- sweep claims too — a tap racing a click or the sweep loses or
+        // --- wins cleanly, never both, and never overwrites the other.
         if (method === "GET" && url.pathname === "/asks") {
           const now = Date.now();
           const asks = listPendingAsks(spoolDir)
@@ -430,7 +435,7 @@ export function startCompanionServer(opts: {
           return json(res, 200, { asks });
         }
 
-        const askM = url.pathname.match(/^\/asks\/([a-z0-9-]+)\/(approve|deny)$/);
+        const askM = url.pathname.match(/^\/asks\/([a-z0-9-]+)\/(approve|deny|yolo)$/);
         if (method === "POST" && askM) {
           const existing = getAsk(spoolDir, askM[1]);
           if (!existing) return json(res, 404, { error: "no such ask" });
@@ -441,12 +446,32 @@ export function startCompanionServer(opts: {
             log(`companion: ask ${askM[1]} tap arrived after ${existing.status} (${existing.decidedBy ?? "?"}) — nothing changed`);
             return json(res, 409, { error: `already ${existing.status}`, status: existing.status, decidedBy: existing.decidedBy ?? null });
           }
-          // Map mirrors the route alphabet (the phone offers Approve/Deny only).
-          // If this route ever gains yolo (custom_ids carry it since c2a7ebe),
-          // enumerate it here — a binary fallback records a YOLO tap as denied
-          // (the watcher host hit exactly that, 2026-10-04).
-          const rec = decideAsk(spoolDir, askM[1], askM[2] === "approve" ? "approved" : "denied", `companion:${v.phone.id}`);
+          // Expiry is a hard boundary on every surface (audit round 3,
+          // finding 1): the GET above filters expired asks, but a stale card
+          // can still drive a POST — past the fuse the sweep owns the ask and
+          // no tap may approve what "buttons die at expiry" promised.
+          if (existing.expiresAt <= Date.now()) {
+            log(`companion: ask ${askM[1]} tap arrived AFTER expiry (sweep owns it) — nothing changed`);
+            return json(res, 409, { error: "ask expired — the expiry sweep owns it", status: "expired" });
+          }
+          // Three-verb map (c2a7ebe contract): yolo = one-shot full-auto, NOT
+          // a deny-else default — the binary map here would have silently
+          // recorded YOLO taps as denials, the exact bug class caught on the
+          // watcher's button path (round 11).
+          const rec = decideAsk(
+            spoolDir,
+            askM[1],
+            askM[2] === "approve" ? "approved" : askM[2] === "yolo" ? "yolo" : "denied",
+            `companion:${v.phone.id}`,
+          );
           if (!rec || rec.status === "pending") return json(res, 500, { error: "decision failed to record" });
+          if (rec.decidedBy !== `companion:${v.phone.id}`) {
+            // LOST the O_EXCL claim: a click or another surface decided first
+            // (audit round 3, finding 5 — this used to answer 200 and log the
+            // decision as THIS phone's). Report the winner's verdict honestly.
+            log(`companion: ask ${askM[1]} tap LOST the decision race to ${rec.decidedBy} (${rec.status}) — reporting theirs`);
+            return json(res, 409, { error: `already ${rec.status}`, status: rec.status, decidedBy: rec.decidedBy ?? null });
+          }
           log(`companion: ask ${askM[1]} ${rec.status} by ${v.phone.id} — delivery pending watcher sweep`);
           return json(res, 200, { status: rec.status, askId: rec.askId });
         }
@@ -462,27 +487,83 @@ export function startCompanionServer(opts: {
           const now = Date.now();
           // ?q= searches the WHOLE registry (promptId or text substring,
           // case-insensitive) — "that thing I asked Tuesday" without scroll.
-          // No q= keeps the round-5 contract: active + recent chips, newest 20.
+          // ?before=<createdAt ms> pages OLDER history (round 7): the phone's
+          // SENT list loads the newest 20, then walks back by cursor. The two
+          // never compose — search is bounded at 50 already. No query keeps
+          // the round-5 contract: active + recent chips, newest 20. `more`
+          // says whether an older page exists under this branch.
           const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
-          const prompts = q
-            ? listPhonePrompts(spoolDir)
-                .filter(
-                  (r) =>
-                    r.promptId.toLowerCase().includes(q) ||
-                    r.text.toLowerCase().includes(q),
-                )
-                .slice(-50) // newest 50 matches — bounded even on a big registry
-                .map(renderPromptForApp)
-            : listPhonePrompts(spoolDir)
-                .filter(
-                  (r) =>
-                    r.status === "pending" ||
-                    r.status === "enqueued" ||
-                    (r.finishedAt ?? 0) > now - 30 * 60 * 1000, // recent history chips
-                )
-                .slice(-20) // newest 20 — a scroll, not the registry
-                .map(renderPromptForApp);
-          return json(res, 200, { prompts });
+          const beforeRaw = url.searchParams.get("before");
+          const before = beforeRaw === null ? null : Number(beforeRaw);
+          if (q) {
+            const prompts = listPhonePrompts(spoolDir)
+              .filter(
+                (r) =>
+                  r.promptId.toLowerCase().includes(q) ||
+                  r.text.toLowerCase().includes(q),
+              )
+              .slice(-50) // newest 50 matches — bounded even on a big registry
+              .map(renderPromptForApp);
+            return json(res, 200, { prompts, more: false });
+          }
+          if (before !== null) {
+            // Present-but-invalid cursor is a client bug, not "no cursor" —
+            // answering the default list would silently page WRONG history.
+            if (!Number.isFinite(before) || before <= 0) {
+              return json(res, 400, { error: "before must be a positive createdAt epoch-ms" });
+            }
+            const limit = Number(url.searchParams.get("limit") ?? 20);
+            const { records, more } = historyWindow(
+              listPhonePrompts(spoolDir),
+              before,
+              Number.isFinite(limit) ? limit : 20,
+            );
+            return json(res, 200, { prompts: records.map(renderPromptForApp), more });
+          }
+          const eligible = listPhonePrompts(spoolDir).filter(
+            (r) =>
+              r.status === "pending" ||
+              r.status === "enqueued" ||
+              (r.finishedAt ?? 0) > now - 30 * 60 * 1000, // recent history chips
+          );
+          return json(res, 200, {
+            prompts: eligible.slice(-20).map(renderPromptForApp), // newest 20 — a scroll, not the registry
+            more: eligible.length > 20,
+          });
+        }
+
+        // --- notices (round 8, owner 2026-10-04 "let me know not in discord
+        // --- but just on the phone"): machine→phone reports. The phone READS
+        // --- and ACKS — the writers are local processes (sessions/daemon/
+        // --- the notice CLI) on the spool file, never this surface. Newest
+        // --- `limit` in registry order (oldest-first, like /prompts — the
+        // --- app reverses for display) plus an UNACKED count over the WHOLE
+        // --- registry so the badge stays honest when the window is all-read.
+        if (method === "GET" && url.pathname === "/notices") {
+          const limitRaw = Number(url.searchParams.get("limit") ?? 10);
+          const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(50, limitRaw)) : 10;
+          const all = listNotices(spoolDir);
+          const notices = all.slice(-limit).map((r) => ({
+            id: r.id,
+            ts: r.ts,
+            from: r.from,
+            text: r.text,
+            severity: r.severity,
+            acked: r.ackedAt != null,
+          }));
+          return json(res, 200, { notices, unacked: all.filter((r) => !r.ackedAt).length });
+        }
+        const noticeAckAll = method === "POST" && url.pathname === "/notices/ack-all";
+        if (noticeAckAll) {
+          const acked = ackAllNotices(spoolDir);
+          log(`companion: ack-all notices by ${v.phone.id} — ${acked} dismissed`);
+          return json(res, 200, { acked });
+        }
+        const noticeM = url.pathname.match(/^\/notices\/([a-z0-9]+)\/ack$/);
+        if (method === "POST" && noticeM) {
+          const rec = ackNotice(spoolDir, noticeM[1]);
+          if (!rec) return json(res, 404, { error: "no such notice" });
+          return json(res, 200, { ok: true });
         }
 
         if (method === "GET" && url.pathname === "/machine") {
@@ -540,6 +621,27 @@ export function startCompanionServer(opts: {
           } catch {
             /* same */
           }
+          // S-tier #4/#5 (2026-10-04): the interaction journal is local
+          // security truth — refused interactions (non-approver button
+          // probes, quarantined venues) and classified audit events surface
+          // on the card the same way delivery failures do. Chain-broken or
+          // absent journal → silence (readJournalTail never throws here).
+          try {
+            const stats = journalStats(readJournalTail(spoolDir, 500));
+            if (stats.refused > 0) {
+              alerts.push(`${stats.refused} refused interaction(s) last 24h — see daemon.log / interaction-journal`);
+            }
+            if (stats.criticalAudit > 0) {
+              alerts.push(`${stats.criticalAudit} critical audit event(s) last 24h — see interaction-journal`);
+            }
+            // Round 16: webhook posts + identity-spoof refusals — display-
+            // identity events that never triggered but ARE the spoof class.
+            if (stats.noise > 0) {
+              alerts.push(`${stats.noise} identity-noise event(s) last 24h (webhook/spoof) — see interaction-journal`);
+            }
+          } catch {
+            /* journal read is best-effort card decoration */
+          }
           // Round 6 (pocket lane dashboard): the watcher's published state —
           // pool, queues, lane verdict, idle time. Facts only, no secrets, no
           // channel ids. An absent or stale file is HONEST on the wire
@@ -549,6 +651,13 @@ export function startCompanionServer(opts: {
             const raw = JSON.parse(fs.readFileSync(path.join(spoolDir, "watcher-state.json"), "utf8")) as Record<string, unknown>;
             const ageMs = typeof raw.updated === "string" ? Date.now() - Date.parse(raw.updated) : NaN;
             const lane = (raw.lane ?? null) as Record<string, unknown> | null;
+            // S-tier #5: the audit watch's live alert lines (bounded by the
+            // writer) ride the card exactly when the watcher is alive to
+            // classify them — a dead watcher shows its own staleness instead.
+            const auditAlerts = Array.isArray(raw.audit_alerts)
+              ? (raw.audit_alerts as unknown[]).filter((a): a is string => typeof a === "string").slice(0, 5)
+              : [];
+            alerts.push(...auditAlerts);
             return json(res, 200, {
               machine: {
                 active: Number(raw.active ?? 0),
