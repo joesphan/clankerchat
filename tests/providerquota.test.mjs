@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parseQuota, quotaLine, pollProviderQuota } from "../dist/providerquota.js";
+import { parseQuota, quotaLine, pollProviderQuota, describeResetEvent, resetEventLine } from "../dist/providerquota.js";
 
 // providerquota (round 24.2 producer): the vendor monitor API's raw types are
 // the contract — TOKENS_LIMIT/TIME_LIMIT, never the plugin's display renames
@@ -54,4 +54,34 @@ test("pollProviderQuota: non-allowlisted origin never sees the token", async () 
     null,
   );
   assert.equal(await pollProviderQuota({ baseUrl: "not a url", token: "x" }), null);
+});
+
+// Round 27d: reset_at discontinuities — the natural experiment the fit
+// consumes. Boot (null prev), unchanged anchors, and missing fields are
+// never events; a fired reset records both pcts, the drain, and the jump.
+test("describeResetEvent: fired reset classifies emptied vs partial, boot never fires", () => {
+  const snap = (pct, at) => ({ pct5h: pct, resetAt: at });
+  const fired = describeResetEvent(
+    snap(46, "2026-10-05T09:10:44.917Z"),
+    snap(3, "2026-10-05T14:10:44.917Z"),
+  );
+  assert.equal(fired.verdict, "emptied");
+  assert.equal(fired.drainPts, 43);
+  assert.ok(Math.abs(fired.jumpMs - 5 * 3_600_000) < 5, "anchor jumped ~5h");
+
+  const rolling = describeResetEvent(snap(46, "2026-10-05T09:10:44.917Z"), snap(38, "2026-10-05T14:10:44.917Z"));
+  assert.equal(rolling.verdict, "partial");
+
+  // non-events: same anchor, no prev (boot), missing resetAt, missing pct
+  assert.equal(describeResetEvent(snap(46, "a"), snap(45, "a")), null);
+  assert.equal(describeResetEvent(null, snap(3, "b")), null);
+  assert.equal(describeResetEvent(snap(46, null), snap(3, "b")), null);
+  assert.equal(describeResetEvent({ pct5h: null, resetAt: "a" }, snap(3, "b")), null);
+});
+
+test("resetEventLine: facts + quick read, HH:MM Z anchors", () => {
+  const line = resetEventLine(describeResetEvent({ pct5h: 46.4, resetAt: "2026-10-05T09:10:44.917Z" }, { pct5h: 2.6, resetAt: "2026-10-05T14:10:44.917Z" }));
+  assert.equal(line, "5h window reset 09:10Z→14:10Z (+5.0h): q_pct 46→3 — window emptied (fixed-anchor behavior)");
+  const partial = resetEventLine(describeResetEvent({ pct5h: 46, resetAt: "2026-10-05T09:10:44.917Z" }, { pct5h: 38, resetAt: "2026-10-05T14:10:44.917Z" }));
+  assert.match(partial, /partial drain \(rolling behavior\)/);
 });
