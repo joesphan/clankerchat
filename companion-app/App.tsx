@@ -260,14 +260,21 @@ async function saveJson(key: string, value: unknown): Promise<void> {
 // Signed transport (mirrors src/companion.ts verifyCompanionRequest)
 // ---------------------------------------------------------------------------
 
-// Counter burn is SERIALIZED (audit fix 4): signedFetch is async, so two
-// overlapping calls — the 2s poll tick colliding with an Approve tap, or a
-// double-tap — could both read counter N from SecureStore, both persist N+1,
-// and both SIGN N+1; the server correctly refuses the second as a replay
-// (spurious 403 on a legitimate action). A module-level promise chain makes
-// the read-modify-write section single-filed; the signing/request itself
-// stays concurrent.
-let counterChain: Promise<void> = Promise.resolve();
+// Counter burn AND dispatch are SERIALIZED (audit fix 4 + round 19 B4,
+// marker seq-burn-v13): signedFetch is async, so two overlapping calls — the
+// 2s poll tick colliding with an Approve tap, or a double-tap — could both
+// read counter N from SecureStore, both persist N+1, and both SIGN N+1; the
+// server correctly refuses the second as a replay (spurious 403 on a
+// legitimate action). Serializing only the read-modify-write was not enough
+// (round 19): the server burns counters AT VERIFY, so two correctly-burned
+// counters N+1/N+2 dispatching concurrently can ARRIVE inverted — N+2 lands
+// first, the verifier records it, and real N+1 is then refused as a replay.
+// The whole read-burn-sign-dispatch section now rides one module-level
+// promise chain: arrival order == burn order, always.
+let counterChain: Promise<{ status: number; json: Record<string, unknown> }> = Promise.resolve({
+  status: 0,
+  json: {},
+});
 
 async function signedFetch(
   machine: Machine,
@@ -277,51 +284,50 @@ async function signedFetch(
   path: string,
   bodyObj?: unknown,
 ): Promise<{ status: number; json: Record<string, unknown> }> {
-  let counter = 0;
   const gate = counterChain.then(async () => {
     const counters = (await loadJson<Record<string, number>>(K_COUNTERS)) ?? {};
-    counter = (counters[machine.id] ?? 0) + 1;
+    const counter = (counters[machine.id] ?? 0) + 1;
     counters[machine.id] = counter;
     await saveJson(K_COUNTERS, counters); // burn optimistically: gaps are fine, repeats never
-  });
-  counterChain = gate.catch(() => {}); // storage failure must not poison later calls
-  await gate;
 
-  const body: Bytes = method === "GET" ? new Uint8Array(0) : utf8(JSON.stringify(bodyObj ?? {}));
-  // The server signs the PATHNAME only — a query string (GET /prompts?q=…)
-  // must never enter the signed message.
-  const msg = lenDelim(
-    "clanker-companion-v1",
-    method,
-    path.split("?")[0],
-    await sha256hex(body),
-    String(counter),
-  );
-  const sig = await ed25519.signAsync(msg, seed);
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 5000);
-  try {
-    const res = await fetch(`http://${machine.host}:${machine.port}${path}`, {
+    const body: Bytes = method === "GET" ? new Uint8Array(0) : utf8(JSON.stringify(bodyObj ?? {}));
+    // The server signs the PATHNAME only — a query string (GET /prompts?q=…)
+    // must never enter the signed message.
+    const msg = lenDelim(
+      "clanker-companion-v1",
       method,
-      headers: {
-        "x-companion-id": phoneId,
-        "x-counter": String(counter),
-        "x-sig": bytesToB64(sig),
-        ...(method === "POST" ? { "content-type": "application/json" } : {}),
-      },
-      body: method === "GET" ? undefined : body,
-      signal: ctrl.signal,
-    });
-    let parsed: Record<string, unknown> = {};
+      path.split("?")[0],
+      await sha256hex(body),
+      String(counter),
+    );
+    const sig = await ed25519.signAsync(msg, seed);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
     try {
-      parsed = (await res.json()) as Record<string, unknown>;
-    } catch {
-      /* non-JSON (413 close etc.) — status still reported */
+      const res = await fetch(`http://${machine.host}:${machine.port}${path}`, {
+        method,
+        headers: {
+          "x-companion-id": phoneId,
+          "x-counter": String(counter),
+          "x-sig": bytesToB64(sig),
+          ...(method === "POST" ? { "content-type": "application/json" } : {}),
+        },
+        body: method === "GET" ? undefined : body,
+        signal: ctrl.signal,
+      });
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = (await res.json()) as Record<string, unknown>;
+      } catch {
+        /* non-JSON (413 close etc.) — status still reported */
+      }
+      return { status: res.status, json: parsed };
+    } finally {
+      clearTimeout(timer);
     }
-    return { status: res.status, json: parsed };
-  } finally {
-    clearTimeout(timer);
-  }
+  });
+  counterChain = gate.catch(() => ({ status: 0, json: {} })); // a failure must not poison later calls
+  return gate;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +431,7 @@ export default function App() {
   // poll effect — the next 2s tick simply fetches the wider window.
   const [noticesLimit, setNoticesLimit] = useState(10);
   const noticesLimitRef = useRef(10);
+  const enrollingRef = useRef(false); // synchronous double-scan guard (round 19 B5)
   const [promptText, setPromptText] = useState("");
   // Route toggle (multi-machine phase 1): false = this machine runs it (the
   // only behavior before phase 1); true = route:"peer" — the peer machine
@@ -501,17 +508,29 @@ export default function App() {
           setError(String(json.error ?? `HTTP ${status}`));
         }
         const askRes = await signedFetch(active, seed, phoneId, "GET", "/asks");
-        if (!stopped && askRes.status === 200) {
-          setAsks(Array.isArray(askRes.json.asks) ? (askRes.json.asks as unknown as AskView[]) : []);
+        if (!stopped) {
+          if (askRes.status === 200) {
+            setAsks(Array.isArray(askRes.json.asks) ? (askRes.json.asks as unknown as AskView[]) : []);
+          } else {
+            setError(String(askRes.json.error ?? `HTTP ${askRes.status}`)); // round 19 B3: every sub-fetch reports, not just /attempts
+          }
         }
         const promptRes = await signedFetch(active, seed, phoneId, "GET", "/prompts");
-        if (!stopped && promptRes.status === 200) {
-          setPrompts(Array.isArray(promptRes.json.prompts) ? (promptRes.json.prompts as unknown as PromptView[]) : []);
-          setSentMore(promptRes.json.more === true);
+        if (!stopped) {
+          if (promptRes.status === 200) {
+            setPrompts(Array.isArray(promptRes.json.prompts) ? (promptRes.json.prompts as unknown as PromptView[]) : []);
+            setSentMore(promptRes.json.more === true);
+          } else {
+            setError(String(promptRes.json.error ?? `HTTP ${promptRes.status}`));
+          }
         }
         const machineRes = await signedFetch(active, seed, phoneId, "GET", "/machine");
-        if (!stopped && machineRes.status === 200 && machineRes.json?.machine) {
-          setMachine(machineRes.json.machine as unknown as MachineView);
+        if (!stopped) {
+          if (machineRes.status === 200 && machineRes.json?.machine) {
+            setMachine(machineRes.json.machine as unknown as MachineView);
+          } else {
+            setError(String(machineRes.json.error ?? `HTTP ${machineRes.status}`));
+          }
         }
         const noticeRes = await signedFetch(
           active,
@@ -520,9 +539,13 @@ export default function App() {
           "GET",
           noticesLimitRef.current > 10 ? `/notices?limit=${noticesLimitRef.current}` : "/notices",
         );
-        if (!stopped && noticeRes.status === 200) {
-          setNotices(Array.isArray(noticeRes.json.notices) ? (noticeRes.json.notices as unknown as NoticeView[]) : []);
-          setUnacked(Number(noticeRes.json.unacked ?? 0));
+        if (!stopped) {
+          if (noticeRes.status === 200) {
+            setNotices(Array.isArray(noticeRes.json.notices) ? (noticeRes.json.notices as unknown as NoticeView[]) : []);
+            setUnacked(Number(noticeRes.json.unacked ?? 0));
+          } else {
+            setError(String(noticeRes.json.error ?? `HTTP ${noticeRes.status}`));
+          }
         }
       } catch (e) {
         if (!stopped) setError(`unreachable: ${(e as Error).message}`);
@@ -685,8 +708,16 @@ export default function App() {
 
   const onScanned = useCallback(
     async (data: string) => {
+      // Synchronous re-entry guard (round 19 B5): `busy` is state — two scans
+      // in the same tick both read busy=false and both enroll. A ref is set
+      // before the first await, so the second scan returns before any work.
+      if (enrollingRef.current) return;
+      enrollingRef.current = true;
       setScanning(false);
-      if (!seed || !phoneId) return;
+      if (!seed || !phoneId) {
+        enrollingRef.current = false;
+        return;
+      }
       setBusy(true);
       setError("");
       setNotice("");
@@ -737,6 +768,7 @@ export default function App() {
       } catch (e) {
         setError((e as Error).message);
       } finally {
+        enrollingRef.current = false;
         setBusy(false);
       }
     },
@@ -924,15 +956,22 @@ export default function App() {
     }
   }, [active, phoneId, promptText, routePeer, seed]);
 
-  // Walk the history one page older (round 7). The cursor is the OLDEST
-  // createdAt currently rendered; the server answers strictly-older records
-  // plus `more` for the next button. History never re-polls — it is frozen
-  // record, unlike the live window above it.
+  // Walk the history one page older (round 7; composite cursor round 19).
+  // The cursor is the LAST rendered row in sort order (createdAt asc,
+  // promptId tiebreak — the registry's own sort): createdAt alone strands a
+  // same-millisecond twin at the page boundary, so before_id rides along and
+  // the server tie-breaks exactly like the sort. History never re-polls —
+  // it is frozen record, unlike the live window above it.
   const loadOlder = useCallback(async () => {
     if (!active || !seed || !phoneId) return;
     const rows = [...history, ...prompts];
     if (rows.length === 0) return;
-    const oldest = Math.min(...rows.map((p) => p.createdAt));
+    const oldestMs = Math.min(...rows.map((p) => p.createdAt));
+    // among rows sharing the oldest ms, the cursor is the LARGEST promptId —
+    // everything strictly below the rendered window, nothing re-offered
+    const oldestId = rows
+      .filter((p) => p.createdAt === oldestMs)
+      .reduce((a, b) => (a.promptId < b.promptId ? b : a)).promptId;
     setBusy(true);
     setError("");
     try {
@@ -941,7 +980,7 @@ export default function App() {
         seed,
         phoneId,
         "GET",
-        `/prompts?before=${oldest}`,
+        `/prompts?before=${oldestMs}&before_id=${encodeURIComponent(oldestId)}`,
       );
       if (status === 200) {
         const page = Array.isArray(json.prompts) ? (json.prompts as unknown as PromptView[]) : [];
@@ -1353,10 +1392,16 @@ export default function App() {
       {active && prompts.length > 0 ? (
         <View style={s.card}>
           <Text style={s.cardTitle}>SENT</Text>
-          {/* newest first: live window on top, frozen history pages under it,
-              deduped (a still-eligible answer can sit in both windows) */}
-          {[...history, ...prompts]
-            .filter((p, i, all) => all.findIndex((q) => q.promptId === p.promptId) === i)
+          {/* newest first: live window on top, frozen history pages under it.
+              Dedupe toward the LIVE copy (round 19 B2): the old findIndex
+              filter kept whichever copy sat earlier in the array — history —
+              so a still-eligible answer rendered its STALE paged snapshot;
+              the live row is the one whose status keeps updating. History
+              rows absent from the live window keep their frozen position. */}
+          {[
+            ...history.filter((p) => !prompts.some((q) => q.promptId === p.promptId)),
+            ...prompts,
+          ]
             .slice()
             .reverse()
             .map(renderPromptRow)}

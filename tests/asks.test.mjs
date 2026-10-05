@@ -511,6 +511,72 @@ test("sweep claim (round 17): unclaimed expired asks still sweep, claim file lan
   );
 });
 
+// --- audit round 4 (2026-10-04): stale-claim reaper + GC sibling cleanup ----
+
+test("stale-claim reaper (round 19, A2): a >5min-old claim on an overdue ask is released, then the ask expires", () => {
+  // decideAsk releases its claim on write failure and the sweep releases its
+  // own — but a kill -9 mid-window never runs any catch. Without the reaper
+  // such an ask is undead: no click can win the claim, the sweep skips it,
+  // and it never expires. The reaper frees the claim when it's old enough
+  // that no alive claimant can plausibly still be writing (<1s real writes).
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "dead claimant", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: -1_000,
+  });
+  const claim = path.join(spool, "pending-asks", `${rec.askId}.json.claim`);
+  fs.closeSync(fs.openSync(claim, "wx", 0o600));
+  fs.utimesSync(claim, new Date(Date.now() - 6 * 60_000), new Date(Date.now() - 6 * 60_000));
+  const swept = sweepExpiredAsks(spool, Date.now() + 5_000);
+  assert.equal(swept.length, 1, "stale claim reaped → the sweep proceeds");
+  assert.equal(swept[0].status, "expired");
+  assert.equal(getAsk(spool, rec.askId).status, "expired");
+});
+
+test("stale-claim reaper (round 19, A2): a stale claim on a FRESH ask is released but the ask stays pending", () => {
+  // The reaper must not conflate claim age with ask age: a live-ttl ask whose
+  // claimant died still deserves its remaining fuse — release the claim, let
+  // clicks work again, expire on schedule (the next sweep's empty result
+  // proves nothing was transitioned early).
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "fresh but claimless", channelId: "1", messageId: null,
+    approvers: [APPROVER], ttlMs: 60 * 60_000,
+  });
+  const claim = path.join(spool, "pending-asks", `${rec.askId}.json.claim`);
+  fs.closeSync(fs.openSync(claim, "wx", 0o600));
+  fs.utimesSync(claim, new Date(Date.now() - 6 * 60_000), new Date(Date.now() - 6 * 60_000));
+  const swept = sweepExpiredAsks(spool, Date.now() + 5_000);
+  assert.equal(swept.length, 0, "fresh-ttl ask never transitioned");
+  assert.equal(getAsk(spool, rec.askId).status, "pending");
+  assert.ok(!fs.existsSync(claim), "the dead claimant's claim is gone — clicks work again");
+  // and a click after the reap does decide (the point of releasing)
+  assert.equal(decideAsk(spool, rec.askId, "denied", APPROVER).status, "denied");
+});
+
+test("sweepTerminalAsks (round 19, A7): GC removes the record's .claim and .tmp siblings, not just the .json", async () => {
+  const { sweepTerminalAsks } = await import("../dist/asks.js");
+  const spool = tmpSpool();
+  const rec = createPendingAsk(spool, {
+    question: "old terminal", channelId: "1", messageId: null,
+    approvers: [APPROVER],
+  });
+  decideAsk(spool, rec.askId, "denied", APPROVER);
+  stampAskEnqueued(spool, rec.askId);
+  const dir = path.join(spool, "pending-asks");
+  // orphaned garbage the crash windows can leave behind
+  fs.writeFileSync(path.join(dir, `${rec.askId}.json.claim`), "");
+  fs.writeFileSync(path.join(dir, `${rec.askId}.json.tmp`), "{torn");
+  const removed = sweepTerminalAsks(spool, Date.now() + 8 * 24 * 60 * 60_000, 0);
+  assert.deepEqual(removed, [rec.askId]);
+  for (const suffix of ["", ".claim", ".tmp"]) {
+    assert.ok(
+      !fs.existsSync(path.join(dir, `${rec.askId}.json${suffix}`)),
+      `${suffix || ".json"} removed`,
+    );
+  }
+});
+
 test("decideAsk expiry boundary (round 17): no deciding surface acts past the fuse", () => {
   const spool = tmpSpool();
   const stale = createPendingAsk(spool, {

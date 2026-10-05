@@ -517,7 +517,9 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     );
     assert.deepEqual(m.alerts, [], "healthy spool → no alerts");
 
-    // doctor-subset escalation: a prompt pending >60s turns the card red
+    // doctor-subset escalation: a prompt pending >60s turns the card red —
+    // and with THIS fixture's busy fresh watcher-state (round 19, A6), the
+    // honest wording is "deferred, run queue full", not a sweep accusation
     fs.mkdirSync(path.join(spool, "pending-prompts"), { recursive: true });
     fs.writeFileSync(
       path.join(spool, "pending-prompts", "pmstuck99.json"),
@@ -526,7 +528,7 @@ test("machine route (round 6): lane + pool facts from watcher state, honest stal
     res = await signed("GET", "/machine");
     const ma = (await res.json()).machine;
     assert.equal(ma.alerts.length, 1);
-    assert.match(ma.alerts[0], /1 prompt\(s\) pending >60s/);
+    assert.match(ma.alerts[0], /1 prompt\(s\) deferred — run queue full/);
     fs.rmSync(path.join(spool, "pending-prompts", "pmstuck99.json"));
 
     // lane health from the audit log: one received→consumed pair → median
@@ -978,6 +980,181 @@ test("prompt routes (round 5): send from the phone, list lifecycle, caps and aut
     // junk cursor → 400, never a silent fall-through to the default list
     res = await signed("GET", "/prompts?before=not-a-number");
     assert.equal(res.status, 400);
+  } finally {
+    listener.close();
+  }
+});
+
+// --- round 19 (audit round 4) ------------------------------------------------
+
+test("prompts paging (round 19, B6): before_id reaches a same-ms twin a legacy cursor strands", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(path.join(spool, "pending-prompts"), { recursive: true });
+  const listener = startCompanionServer({
+    bind: "127.0.0.1", port: 0, paths: p, spoolDir: spool, store, log: () => {},
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+  try {
+    const nowMs = Date.now();
+    const twinMs = nowMs - 2 * 60_000;
+    const recs = [
+      { promptId: "pmtold-a", createdAt: nowMs - 5 * 60_000 },
+      { promptId: "pmttwin-a", createdAt: twinMs }, // same ms as twin-b — the stranded class
+      { promptId: "pmttwin-b", createdAt: twinMs },
+      { promptId: "pmttop", createdAt: nowMs - 1 * 60_000 },
+    ];
+    for (const r of recs) {
+      fs.writeFileSync(
+        path.join(spool, "pending-prompts", `${r.promptId}.json`),
+        JSON.stringify({ ...r, text: r.promptId, fp: phone.fingerprint, status: "answered", finishedAt: r.createdAt, exit: 0 }),
+      );
+    }
+    // cursor at the twins' shared ms WITHOUT before_id: legacy semantics
+    // (strict <) return only the strictly-older row — the twins are stranded,
+    // which is exactly why before_id exists (documents the old bundle shape).
+    let res = await signed("GET", `/prompts?before=${twinMs}`);
+    let page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtold-a"]);
+    // the composite cursor tie-breaks on promptId exactly like the sort:
+    // paging from twin-b reaches twin-a (previously dead at this boundary)
+    res = await signed("GET", `/prompts?before=${twinMs}&before_id=pmttwin-b`);
+    page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtold-a", "pmttwin-a"]);
+    assert.equal(page.more, false);
+    // and from twin-a the page advances to strictly-older — progress always
+    res = await signed("GET", `/prompts?before=${twinMs}&before_id=pmttwin-a`);
+    page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtold-a"]);
+    assert.equal(page.more, false);
+  } finally {
+    listener.close();
+  }
+});
+
+test("prompts default list (round 19, B1): `more` describes the paged branch, not the 30-minute band", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(path.join(spool, "pending-prompts"), { recursive: true });
+  const listener = startCompanionServer({
+    bind: "127.0.0.1", port: 0, paths: p, spoolDir: spool, store, log: () => {},
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+  try {
+    // empty registry → nothing paged, more:false (the button honestly hides)
+    let res = await signed("GET", "/prompts");
+    let page = await res.json();
+    assert.deepEqual(page.prompts, []);
+    assert.equal(page.more, false);
+    // one fresh chip + one week-old answered record: the default list shows
+    // only the fresh one, but `more` must say TRUE — ?before= pages the WHOLE
+    // registry, and the old record is reachable under that branch. The old
+    // `eligible.length > 20` test needed >15 runs inside 30min to ever say
+    // true, so history read as "start of history" over a week of records.
+    const nowMs = Date.now();
+    fs.writeFileSync(
+      path.join(spool, "pending-prompts", "pmtfresh1.json"),
+      JSON.stringify({ promptId: "pmtfresh1", text: "fresh", fp: phone.fingerprint, createdAt: nowMs - 60_000, status: "answered", finishedAt: nowMs - 30_000, exit: 0 }),
+    );
+    fs.writeFileSync(
+      path.join(spool, "pending-prompts", "pmtweekold.json"),
+      JSON.stringify({ promptId: "pmtweekold", text: "old", fp: phone.fingerprint, createdAt: nowMs - 7 * 24 * 3600_000, status: "answered", finishedAt: nowMs - 7 * 24 * 3600_000, exit: 0 }),
+    );
+    res = await signed("GET", "/prompts");
+    page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtfresh1"]);
+    assert.equal(page.more, true, "a paged-branch record exists — the button must say so");
+    // and the branch delivers on the promise
+    res = await signed("GET", `/prompts?before=${nowMs - 60_000}`);
+    page = await res.json();
+    assert.deepEqual(page.prompts.map((r) => r.promptId), ["pmtweekold"]);
+    assert.equal(page.more, false);
+  } finally {
+    listener.close();
+  }
+});
+
+test("machine card (round 19, A6): a busy watcher means 'deferred, queue full', not 'sweep down?'", async () => {
+  const dir = tmp();
+  const p = keydirPaths(path.join(dir, "keys"));
+  const store = defaultCompanionStore(p.dir);
+  const spool = path.join(dir, "spool");
+  fs.mkdirSync(path.join(spool, "pending-prompts"), { recursive: true });
+  const listener = startCompanionServer({
+    bind: "127.0.0.1", port: 0, paths: p, spoolDir: spool, store, log: () => {},
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const base = `http://127.0.0.1:${listener.port}`;
+  const phone = generateBotKey("phone key");
+  const keyObj = parseKey(phone.privatePem);
+  enrollPhone(store, phone.publicLine);
+  let counter = 0;
+  const signed = async (method, urlPath, bodyObj) => {
+    counter += 1;
+    const body = method === "GET" ? Buffer.alloc(0) : Buffer.from(JSON.stringify(bodyObj ?? {}));
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    const msg = companionRequestMessage(method, urlPath.split("?")[0], sha, String(counter));
+    const sig = keyObj.sign(msg).toString("base64");
+    const headers = { "x-companion-id": phone.fingerprint, "x-counter": String(counter), "x-sig": sig };
+    if (method !== "GET") headers["content-type"] = "application/json";
+    return fetch(base + urlPath, { method, headers, body: method === "GET" ? undefined : body });
+  };
+  try {
+    // a prompt pending >60s with a FRESH busy watcher-state: the sweep is
+    // alive and deliberately refusing (round-17 refuse-before-claim under a
+    // full run queue) — the alert must say deferred, not accuse the sweep.
+    fs.writeFileSync(
+      path.join(spool, "pending-prompts", "pmtstuck1.json"),
+      JSON.stringify({ promptId: "pmtstuck1", text: "stuck", fp: phone.fingerprint, createdAt: Date.now() - 120_000, status: "pending" }),
+    );
+    fs.writeFileSync(
+      path.join(spool, "watcher-state.json"),
+      JSON.stringify({ updated: new Date().toISOString(), active: 2, queued_human: 1, queued_bot: 0, max_concurrent: 2 }),
+    );
+    let res = await signed("GET", "/machine");
+    let card = (await res.json()).machine;
+    assert.ok(card.alerts.some((a) => /deferred — run queue full/.test(a)), `deferred wording: ${JSON.stringify(card.alerts)}`);
+    assert.ok(!card.alerts.some((a) => /sweep down/.test(a)), "no false sweep-down accusation");
+    assert.equal(card.stale, false);
+    // no state file at all: the sweep-down wording is then the honest one
+    fs.rmSync(path.join(spool, "watcher-state.json"));
+    res = await signed("GET", "/machine");
+    card = (await res.json()).machine;
+    assert.ok(card.alerts.some((a) => /watcher sweep down/.test(a)), `sweep-down wording when state absent: ${JSON.stringify(card.alerts)}`);
   } finally {
     listener.close();
   }
