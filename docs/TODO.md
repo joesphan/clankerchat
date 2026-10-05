@@ -1166,3 +1166,27 @@ status: 24.2 port landed (46d95e3, merged f1cadbc) AND round-25 port
 already shipped their side (ec516d3 daemon token sweep, Windows
 projectsRoot; their merge 806145d of our 545309e reconverged both mains —
 zero tree diff; merged our side, fast-forward, pushed).
+
+### Round 25 verdict — the natural experiment fired (09:47Z tick, 2026-10-05)
+
+The 5h window reset at **09:10:44.917Z → 14:10:45.872Z (+5.0h exactly),
+q_pct 71→1 — window EMPTIED. FIXED-ANCHOR confirmed, rolling/TTL refuted**
+(jumpMs was the discriminator exactly as designed; the anchor sat frozen
+all morning while q climbed to 71, then fired to a clean +5.0h successor).
+
+Refinements that fall out:
+- **Scheduling law**: capacity returns FULL at fixed anchors
+  (09:10 / 14:10 / 19:10 / 00:10 / 04:10 …) — heavy rounds are cheapest
+  in the first hours after a fire. Post-reset refill observed ≈1pt/10min
+  at current burn (1→6 over 50 min).
+- **Fit at n=24 steady pairs: PROVISIONAL still** (k_in/k_cr negative —
+  signs unsettled at R²=0.45; only k_out positive at ~16 pts/Mtok, not
+  quotable alone). Structural cause now understood: the LOCAL scan is
+  rolling-5h but the PROVIDER window is fixed-5h — deltas decouple across
+  a fire (local still ages pre-reset tokens while provider restarts from
+  zero). Cleanest fit = pairs inside ONE fixed window; ~10 clean pairs
+  accumulate by ~11:30Z — rerun quota-fit then.
+- Prompt-budget alarms 09:02Z/09:12Z (8 orchestrator one-shots) decomposed
+  via spawn ledger into real triggers (owner posts incl. pi4-shim thread,
+  ggurov + joesphan prompts, 2 peer status injects) — known-legit class,
+  nothing to kill.
