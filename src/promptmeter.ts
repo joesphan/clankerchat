@@ -97,6 +97,42 @@ interface FileAcc {
   oldestTurnTs: number | null;
 }
 
+/** Transcript files under root with mtime inside the window — the shared
+ *  walk law for both meters: per-dir/per-file failures skip, never throw,
+ *  and idle files are never opened (600MB+ transcripts live here). */
+async function* walkTranscriptsInWindow(root: string, since: number): AsyncGenerator<string> {
+  let projects: string[];
+  try {
+    projects = fs.readdirSync(root);
+  } catch {
+    return; // projects root unreadable — both meters report their zeros
+  }
+  for (const proj of projects) {
+    const dir = path.join(root, proj);
+    try {
+      if (!fs.statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of names) {
+      if (!f.endsWith(".jsonl")) continue;
+      const p = path.join(dir, f);
+      try {
+        if (fs.statSync(p).mtimeMs < since) continue; // idle in the window
+      } catch {
+        continue;
+      }
+      yield p;
+    }
+  }
+}
+
 async function scanFile(p: string, since: number): Promise<FileAcc> {
   const acc: FileAcc = { turns: 0, sidechain: 0, compact: 0, oldestTurnTs: null };
   try {
@@ -151,46 +187,22 @@ export async function scanPromptUsage(opts: PromptMeterOptions = {}): Promise<Pr
   let oldestTurnTs: number | null = null;
   let activeSessions = 0;
 
-  try {
-    for (const proj of fs.readdirSync(root)) {
-      const dir = path.join(root, proj);
-      try {
-        if (!fs.statSync(dir).isDirectory()) continue;
-      } catch {
-        continue;
-      }
-      let names: string[];
-      try {
-        names = fs.readdirSync(dir);
-      } catch {
-        continue;
-      }
-      for (const f of names) {
-        if (!f.endsWith(".jsonl")) continue;
-        const p = path.join(dir, f);
-        try {
-          if (fs.statSync(p).mtimeMs < since) continue; // idle in the window — never open it
-        } catch {
-          continue;
-        }
-        const acc = await scanFile(p, since);
-        if (acc.turns === 0 && acc.sidechain === 0 && acc.compact === 0) continue;
-        turns += acc.turns;
-        sidechain += acc.sidechain;
-        compact += acc.compact;
-        if (acc.oldestTurnTs !== null && (oldestTurnTs === null || acc.oldestTurnTs < oldestTurnTs)) {
-          oldestTurnTs = acc.oldestTurnTs;
-        }
-        activeSessions++;
-        const row = byProject.get(proj) ?? { project: proj, turns: 0, sidechain: 0, sessions: 0 };
-        row.turns += acc.turns;
-        row.sidechain += acc.sidechain;
-        row.sessions++;
-        byProject.set(proj, row);
-      }
+  for await (const p of walkTranscriptsInWindow(root, since)) {
+    const acc = await scanFile(p, since);
+    if (acc.turns === 0 && acc.sidechain === 0 && acc.compact === 0) continue;
+    turns += acc.turns;
+    sidechain += acc.sidechain;
+    compact += acc.compact;
+    if (acc.oldestTurnTs !== null && (oldestTurnTs === null || acc.oldestTurnTs < oldestTurnTs)) {
+      oldestTurnTs = acc.oldestTurnTs;
     }
-  } catch {
-    /* projects root unreadable — report the zeros we have */
+    activeSessions++;
+    const proj = p.split(path.sep).slice(-2)[0];
+    const row = byProject.get(proj) ?? { project: proj, turns: 0, sidechain: 0, sessions: 0 };
+    row.turns += acc.turns;
+    row.sidechain += acc.sidechain;
+    row.sessions++;
+    byProject.set(proj, row);
   }
 
   const rows = [...byProject.values()].sort((a, b) => b.turns + b.sidechain - a.turns - a.sidechain);
@@ -214,5 +226,135 @@ export async function scanPromptUsage(opts: PromptMeterOptions = {}): Promise<Pr
     byProject: rows.slice(0, topN),
     spamSuspects,
     activeSessions,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Token-class meter (round 25) — the X variable for quota calibration.
+//
+// The 5h pool is TOKEN-denominated (round 24 settled this: provider % rose
+// while local turn counts FELL across six consecutive intervals; the limits
+// payload carries TOKENS_LIMIT and no prompt counter exists). Predicted
+// credits = Σ(model × token-class × multiplier)/10000 per the vendor docs,
+// so the local meter sums exactly those classes from the transcripts the
+// client already writes — per MODEL (multipliers are per-model), split
+// mainline/sidechain (whether subagents bill is Experiment A, unresolved),
+// zero prompt cost. The watcher pairs these sums with the provider % series
+// in quota-history rows; a least-squares fit over accumulated rows derives
+// every constant the vendor docs leave ambiguous. Fail-quiet law identical
+// to scanPromptUsage.
+export interface TokenClassSums {
+  /** Fresh input tokens (full price in the credit formula). */
+  input: number;
+  /** Output tokens. */
+  output: number;
+  /** Cache-hit input tokens (docs claim ~25% of fresh-input price). */
+  cacheRead: number;
+  /** Cache-write tokens. */
+  cacheCreation: number;
+  /** Assistant messages carrying a usage block (≈ local model calls). */
+  messages: number;
+}
+
+export interface ModelTokenRow {
+  model: string;
+  sums: TokenClassSums;
+}
+
+export interface TokenWindowStats {
+  now: number;
+  windowMs: number;
+  /** Mainline (non-sidechain) sums. */
+  mainline: TokenClassSums;
+  /** Sidechain (subagent) sums, reported separately. */
+  sidechain: TokenClassSums;
+  /** mainline + sidechain. */
+  total: TokenClassSums;
+  /** Per-model sums (bounded), biggest total-token model first. */
+  byModel: ModelTokenRow[];
+}
+
+function emptySums(): TokenClassSums {
+  return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, messages: 0 };
+}
+function addUsage(sums: TokenClassSums, u: Record<string, unknown>): void {
+  sums.input += Number(u.input_tokens ?? 0) || 0;
+  sums.output += Number(u.output_tokens ?? 0) || 0;
+  sums.cacheRead += Number(u.cache_read_input_tokens ?? 0) || 0;
+  sums.cacheCreation += Number(u.cache_creation_input_tokens ?? 0) || 0;
+  sums.messages++;
+}
+function sumClasses(a: TokenClassSums, b: TokenClassSums): TokenClassSums {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheCreation: a.cacheCreation + b.cacheCreation,
+    messages: a.messages + b.messages,
+  };
+}
+function totalTokens(s: TokenClassSums): number {
+  return s.input + s.output + s.cacheRead + s.cacheCreation;
+}
+
+/** Scan transcripts and return in-window token-class sums. Never throws. */
+export async function scanTokenUsage(opts: PromptMeterOptions = {}): Promise<TokenWindowStats> {
+  const now = opts.now ?? Date.now();
+  const windowMs = opts.windowMs ?? 5 * 3600 * 1000;
+  const topN = opts.topN ?? 6;
+  const root = opts.projectsRoot ?? path.join(process.env.HOME ?? "/home/tyler", ".claude", "projects");
+  const since = now - windowMs;
+
+  const mainline = emptySums();
+  const sidechain = emptySums();
+  const byModel = new Map<string, TokenClassSums>();
+
+  for await (const p of walkTranscriptsInWindow(root, since)) {
+    try {
+      const rl = readline.createInterface({
+        input: fs.createReadStream(p, { encoding: "utf8" }),
+        crlfDelay: Infinity,
+      });
+      rl.on("line", (line: string) => {
+        if (!line.includes('"type":"assistant"')) return;
+        let o: any;
+        try {
+          o = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (o?.type !== "assistant") return;
+        const ts = o.timestamp ? Date.parse(o.timestamp) : NaN;
+        if (Number.isNaN(ts) || ts < since) return;
+        const u = o.message?.usage;
+        if (!u || typeof u !== "object") return; // no usage block → contributes nothing
+        addUsage(o.isSidechain ? sidechain : mainline, u);
+        const model = String(o.message?.model ?? "unknown");
+        let m = byModel.get(model);
+        if (!m) {
+          m = emptySums();
+          byModel.set(model, m);
+        }
+        addUsage(m, u);
+      });
+      await new Promise<void>((resolve) => {
+        rl.on("close", () => resolve());
+        rl.on("error", () => resolve()); // torn tail mid-write — keep what we summed
+      });
+    } catch {
+      /* unreadable file contributes nothing */
+    }
+  }
+
+  const models = [...byModel.entries()]
+    .map(([model, sums]) => ({ model, sums }))
+    .sort((a, b) => totalTokens(b.sums) - totalTokens(a.sums));
+  return {
+    now,
+    windowMs,
+    mainline,
+    sidechain,
+    total: sumClasses(mainline, sidechain),
+    byModel: models.slice(0, topN),
   };
 }

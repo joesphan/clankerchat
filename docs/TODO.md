@@ -965,6 +965,79 @@ OPEN (owner dashboard checks, zero prompts):
   later as usage continues → rolling TTL confirmed (meter already models
   sliding; no code change either way).
 
+Calibration PRELIMINARY (first paired rows, 2026-10-05 05:02Z→05:12Z):
+- 13%→17% (+4pts/10min) while LOCAL turns FELL 459→450: quota is not
+  prompt-denominated — token-denominated confirmed by behavior, independent
+  of the API's TOKENS_LIMIT label.
+- 24h totals byte-identical across two polls despite the window sliding →
+  model-usage endpoint serves an hourly-bucketed snapshot; sub-hour deltas
+  are meaningless. quota/limit % is the only near-real-time signal.
+- Cap estimate: 2.38B tok/24h ≈ 16.5M/10min burn; +4%/10min observed ⇒ 5h
+  cap ≈ ~410M tokens (one interval, wide error bars — refine as rows
+  accumulate).
+- IMPLICATION (owner-gated, not wired): turn-count gating (PROMPT_CAP=1600)
+  mis-models the real constraint in BOTH directions — long-context sessions
+  eat quota far faster per turn than count suggests, tiny headless turns far
+  slower. Candidate successor once rows confirm: gate on provider pct
+  directly (provider_quota.pct, already polled) — behavior change, needs
+  owner go + both machines.
+- Row 1 (04:57Z) nulls = boot race + pre-fix TOKENS_LIMIT parse, both
+  already fixed; rows 2+ clean.
+
 Peer note: findings generalize to their machine (shared plan). Brief them
 with round 24 once experiments land — one consolidated cite, not a relay of
 the whole report.
+
+## Round 25 — Gemini deep-research #2 verdicts (GLM quota mechanics, 2026-10-05)
+
+CONFIRMED (cross-validated against local telemetry):
+- Peak window Mon-Fri 14:00-18:00 SGT == 06:00-10:00 UTC — matches the prior
+  report's claim EXACTLY; promptmeter's `peak` flag (round 24) already flags
+  this window, so it was wired right by luck. Credits 1x peak / 0.5x off-peak
+  (off-peak = double capacity). Bias heavy rounds outside weekday 06-10Z.
+- 5h window is ROLLING — CONFIRMED TWICE: our reset_at series fits, AND the
+  peer's 10-03 429 error text ("will reset at 15:10:00" read at 06:46Z) only
+  fits as vendor CST = 07:10Z, 24 min out — impossible as UTC (>5h). Error
+  text clock is vendor-local; the nextResetTime epoch we poll is tz-free.
+- Token-class weighting: cache ≈ 25% of fresh-input cost. Cache warmth is
+  the economic lever; compaction breaks cache AND re-bills — the compact
+  tax compounds. "1600 prompts" = marketing abstraction (1 prompt ≈ 15-20
+  model invocations); no server-side prompt counter exists.
+- EXHAUSTION CODE = **1308** (peer daemon.log: 6× `429 [1308] "Usage limit
+  reached for 5 hour"` on 10-03 06:46–07:01Z — the remember-storm era).
+  The report's 1316 is off-tier, same as its absolutes; 1313/1316 never
+  observed on this account. Any 429 tripwire watches 1308 (exhaustion) +
+  1313 (fair-use, never seen). Bonus regression anchor: 10-03 06:46Z =
+  the pct≈100 wall.
+
+NOT RECONCILED (do NOT wire these constants):
+- Absolutes from the report (28,000 credits/5h, 140k/week, multipliers
+  6.9/1.7/24 ÷10k) contradict observed burn: they imply 5-50x our measured
+  %-climb per estimated token volume, and our limits payload contains NO
+  weekly limit object (only 5h TOKENS_LIMIT + monthly MCP TIME_LIMIT).
+  Shape true, constants unverified — BOTH SIDES agree (peer: "reject
+  absolutes, fit empirically").
+- PHASE 1 SHIPPED (this commit): `scanTokenUsage` in promptmeter.ts —
+  token-class sums (input/output/cache-read/cache-creation) from transcripts
+  in the 5h window, split mainline/sidechain (Experiment A settles from the
+  same rows), grouped per model (multipliers are per-model). Zero prompts,
+  same stream+mtime+fail-quiet law as the prompt meter. Watcher runs both
+  meters in one sweep; quota-history rows now carry `tok` sums beside
+  q_pct → paired X/Y by construction. PHASE 2 (rows pending): least-squares
+  fit of credit constants C against the provider % series, with the 10-03
+  06:46Z wall as a boundary anchor; peer's daemon-restart-pending poller
+  adds their X share when live.
+
+OWNER DECISION ITEM (TOS, both machines): personal plans prohibit account
+sharing; two-machine single-key is policy-gray. Weeks of clean concurrent
+operation with official-client fingerprints on both sides = no active
+enforcement observed (zero 1308 since 10-03, zero 1313 ever). Reject the
+report's "serialize all requests" mitigation (destroys the bilateral
+architecture; unsupported by lived experience). Options: status-quo +
+1308/1313 watch, separate plan for peer, or Team plan. Tyler's call.
+
+PASSIVE TESTS RUNNING: peak inflection at 06:00Z today (Mon) — row climb
+rate before/after (baseline +3.4/10min pre-peak); reset behavior at
+09:10:44Z. Peer status: 24.2 port landed (46d95e3, merged our side f1cadbc,
+236/236, pushed) but their daemon restart pending (in-memory queue drop
+risk) — no local series their side yet.
