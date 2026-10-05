@@ -848,3 +848,66 @@ own-record placement, watcher write-gate placement (forbiddenId BEFORE
 cacheRecord, ahead of all skip gates), floor honesty at boot, WAL +
 busy_timeout, no poisoning path past the new gate, resource bounded,
 deploy parity.
+
+## Round 23 — prompt-budget meter + the remember-plugin storm (2026-10-05)
+
+Owner report: "something is spamming too many prompts" on the new
+prompt-count plan (z.ai legacy v1 max, ~1600 prompts / 5h window, no
+weekly cap; provider-reported reset anchor 10:10 MT). Measured before
+theorizing — transcript scan of the 5h window: 570 prompts, **422 (74%)
+from the `/tmp` transcript project**: ~105 identical 4-turn headless
+sessions firing every ~2 minutes all night with zero human input.
+
+Root cause: the official `remember` plugin (0.7.2). Its SessionStart hook
+launches save-session.sh --force (recovery) and background consolidation;
+both spawn `claude --model haiku -p` summarizers with **cwd=/tmp**
+(pipeline/haiku.py). Headless sessions fire SessionStart hooks too — each
+summarizer's own start spawned the next, rate-limited only by the plugin's
+120s save cooldown. Self-perpetuating since at least Oct 3 (~185
+session-starts/day logged in /tmp/.remember).
+
+Kill (22:17 MT): plugin config at
+`~/.claude/plugins/cache/claude-plugins-official/remember/0.7.2/config.json`
+— `features.recovery:"false"`, `features.ndc_compression:"false"` (STRING
+false, not boolean: the plugin's jq-based config helper does
+`key // empty`, and jq `//` treats boolean false as absent — a boolean
+false can never disable a feature), plus `min_human_messages:99999` /
+`delta_lines_trigger:99999999` to dead-end the PostToolUse save path.
+Memory INJECTION at session start still works (free, file cats); automatic
+summarization is off (2,957 summarized sessions already on disk — the
+.remember history stands). Verified: last /tmp session-start 22:18:00 (an
+in-flight spawn), zero since. NOTE: the config lives in the plugin cache —
+a plugin UPDATE resets it and the storm returns; the meter's spam alarm is
+the backstop.
+
+Shipped this round (commit next):
+- `src/promptmeter.ts` — pure zero-prompt meter: streams
+  ~/.claude/projects/**\/*.jsonl (mtime-filtered; 600MB+ files exist, so
+  readline not readFileSync), counts real user turns in the 5h window
+  (tool_result and sidechain excluded, sidechain reported separately),
+  per-project rows, headless-spawn pattern detection (>=5 sessions, avg
+  <=6 turns), hot flag at CLANKER_PROMPT_GATE_PCT (default 0.85 of
+  CLANKER_PROMPT_CAP, default 1600).
+- `slash.ts` — optional `promptsLine` on the status card (renders only
+  after the first sweep; absent reads "not measured", never a fake zero).
+  Additive/optional: the peer daemon's card renders unchanged until they
+  adopt the meter.
+- watch.mjs (deploy side, ~/tools) — 10-min sweep: publishes
+  `prompt_window` to watcher-state.json (phone card), storm alarm to the
+  journal (deduped by top suspect), one phone notice per hot episode, and
+  the only safe shave: when HOT, the vision pre-pass (an EXTRA spawn per
+  image trigger) is skipped — runs proceed text-only. Deliberately NO
+  enqueue drop-gate: every class is either human-triggered or protected
+  delivery (round 19 A1 law); a drop would trade bilateral reliability
+  for budget. Healing = detection + source-kill + loop backoff, not drops.
+- `tests/promptmeter.test.mjs` — 5 tests (window/exclusion filters, mtime
+  skip, hot+line, spam suspect, degrade-to-zero). 229/229.
+
+Loop side (this session): the machine-watch /loop reads prompt_window
+each tick and backs off its own cadence when hot — the backstop never
+adds load to a window it's warning about.
+
+Provider-accounting caveat (honest): we count PRIMARY user turns as the
+billing proxy. Whether z.ai bills sidechain/subagent turns, tool-call
+rounds within a turn, or token-limit auto-resumes separately is
+UNVERIFIED — top of the Gemini deep-research list handed to the owner.

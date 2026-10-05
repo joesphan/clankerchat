@@ -107,6 +107,9 @@ export interface StatusFacts {
   spoolPending: number;
   /** Pre-built machine-local line (service states) appended verbatim. */
   servicesLine?: string;
+  /** Prompt-budget one-liner (promptmeter.promptsLine) — plan bills by
+   *  prompt count (owner 2026-10-05); absent until the first meter sweep. */
+  promptsLine?: string;
   /** Peer machine's last-run time (ISO), relayed by the lane heartbeat —
    *  multi-machine prompts phase 0 on the Discord card. Null-honest: no
    *  fresh lane facts (never probed, peer down) renders NO line rather than
@@ -144,6 +147,7 @@ export function renderStatusCard(f: StatusFacts): string {
         : " · no runs this boot"),
   );
   if (f.servicesLine) lines.push(noMention(f.servicesLine));
+  if (f.promptsLine) lines.push(noMention(f.promptsLine));
   // Peer recency line (phase 0): only when the heartbeat delivered a
   // parseable timestamp — absent, null, or garbage renders nothing, so the
   // card never claims peer freshness it doesn't have.
