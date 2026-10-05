@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { scanPromptUsage, promptsLine } from "../dist/promptmeter.js";
+import { scanPromptUsage, promptsLine, scanTokenUsage } from "../dist/promptmeter.js";
 
 function tmpRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "promptmeter-"));
@@ -27,6 +27,12 @@ function compactLine(ts) {
 }
 function assistantLine(ts) {
   return `{"type":"assistant","timestamp":"${ts}","message":{"role":"assistant","content":"ok"},"sessionId":"s1"}`;
+}
+function usageLine(ts, u, extra = "") {
+  const model = u.model ?? "glm-5.3";
+  const usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ...u };
+  delete usage.model;
+  return `{"type":"assistant","timestamp":"${ts}","message":{"role":"assistant","model":"${model}","usage":${JSON.stringify(usage)}},"sessionId":"s1"${extra}}`;
 }
 
 function writeProj(root, proj, files) {
@@ -127,4 +133,44 @@ test("compaction summaries count separately; replenish projects oldest turn age-
   assert.equal(s3.turns, 0);
   assert.equal(s3.replenishInMs, null, "nothing gating → no age-out to project");
   assert.doesNotMatch(promptsLine(s3), /\+1@/);
+});
+
+test("token meter: per-class sums, model split, sidechain split, window filter (round 25)", async () => {
+  const root = tmpRoot();
+  writeProj(root, "-fit", {
+    "a.jsonl": [
+      usageLine(IN, { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 20000, cache_creation_input_tokens: 300 }),
+      usageLine(IN, { model: "haiku", input_tokens: 10, output_tokens: 20 }, ',"isSidechain":true'),
+      usageLine(OUT, { input_tokens: 99999, output_tokens: 99999 }), // outside window
+      assistantLine(IN), // no usage block → contributes nothing
+      '{"type":"assistant","timestamp":"' + IN + '","message":{"usage":{', // torn tail
+    ],
+  });
+  const t = await scanTokenUsage({ projectsRoot: root, now: NOW });
+  assert.equal(t.mainline.input, 1000);
+  assert.equal(t.mainline.output, 500);
+  assert.equal(t.mainline.cacheRead, 20000);
+  assert.equal(t.mainline.cacheCreation, 300);
+  assert.equal(t.mainline.messages, 1);
+  assert.equal(t.sidechain.input, 10, "sidechain split carries its own classes");
+  assert.equal(t.sidechain.messages, 1);
+  assert.equal(t.total.input, 1010, "total = mainline + sidechain");
+  assert.equal(t.total.cacheRead, 20000);
+  assert.equal(t.byModel.length, 2);
+  assert.equal(t.byModel[0].model, "glm-5.3", "cache-heavy model ranks first by total tokens");
+  assert.equal(t.byModel[0].sums.input, 1000);
+  assert.equal(t.byModel[1].model, "haiku");
+  assert.equal(t.byModel[1].sums.output, 20);
+});
+
+test("token meter: empty/missing root and mtime-stale files degrade to zeros", async () => {
+  const t1 = await scanTokenUsage({ projectsRoot: "/nonexistent/definitely", now: NOW });
+  assert.equal(t1.total.messages, 0);
+  assert.deepEqual(t1.byModel, []);
+  const root = tmpRoot();
+  writeProj(root, "-old", { "stale.jsonl": [usageLine(IN, { input_tokens: 5000 })] });
+  const old = new Date(NOW - 10 * 3600 * 1000);
+  fs.utimesSync(path.join(root, "-old", "stale.jsonl"), old, old);
+  const t2 = await scanTokenUsage({ projectsRoot: root, now: NOW });
+  assert.equal(t2.total.input, 0, "stale file never opened");
 });

@@ -995,33 +995,49 @@ CONFIRMED (cross-validated against local telemetry):
   report's claim EXACTLY; promptmeter's `peak` flag (round 24) already flags
   this window, so it was wired right by luck. Credits 1x peak / 0.5x off-peak
   (off-peak = double capacity). Bias heavy rounds outside weekday 06-10Z.
-- 5h window is ROLLING (docs: "resets 5 hours after consumption"). Our
-  reset_at readings (stable until oldest entry exits) fit. The 09:10:44Z
-  discriminator becomes a confirmation exercise.
+- 5h window is ROLLING — CONFIRMED TWICE: our reset_at series fits, AND the
+  peer's 10-03 429 error text ("will reset at 15:10:00" read at 06:46Z) only
+  fits as vendor CST = 07:10Z, 24 min out — impossible as UTC (>5h). Error
+  text clock is vendor-local; the nextResetTime epoch we poll is tz-free.
 - Token-class weighting: cache ≈ 25% of fresh-input cost. Cache warmth is
   the economic lever; compaction breaks cache AND re-bills — the compact
   tax compounds. "1600 prompts" = marketing abstraction (1 prompt ≈ 15-20
   model invocations); no server-side prompt counter exists.
-- Error semantics: 1316 = 5h pool exhausted (hard 429); 1313 = fair-use
-  violation. Neither ever observed on this account.
+- EXHAUSTION CODE = **1308** (peer daemon.log: 6× `429 [1308] "Usage limit
+  reached for 5 hour"` on 10-03 06:46–07:01Z — the remember-storm era).
+  The report's 1316 is off-tier, same as its absolutes; 1313/1316 never
+  observed on this account. Any 429 tripwire watches 1308 (exhaustion) +
+  1313 (fair-use, never seen). Bonus regression anchor: 10-03 06:46Z =
+  the pct≈100 wall.
 
 NOT RECONCILED (do NOT wire these constants):
 - Absolutes from the report (28,000 credits/5h, 140k/week, multipliers
   6.9/1.7/24 ÷10k) contradict observed burn: they imply 5-50x our measured
   %-climb per estimated token volume, and our limits payload contains NO
   weekly limit object (only 5h TOKENS_LIMIT + monthly MCP TIME_LIMIT).
-  Shape true, constants unverified. Round-25 candidate: token-class-aware
-  local meter (sum per-message usage fields from transcripts → predicted
-  credits → least-squares fit against provider % series) — pure fs, zero
-  prompts, settles every constant empirically.
+  Shape true, constants unverified — BOTH SIDES agree (peer: "reject
+  absolutes, fit empirically").
+- PHASE 1 SHIPPED (this commit): `scanTokenUsage` in promptmeter.ts —
+  token-class sums (input/output/cache-read/cache-creation) from transcripts
+  in the 5h window, split mainline/sidechain (Experiment A settles from the
+  same rows), grouped per model (multipliers are per-model). Zero prompts,
+  same stream+mtime+fail-quiet law as the prompt meter. Watcher runs both
+  meters in one sweep; quota-history rows now carry `tok` sums beside
+  q_pct → paired X/Y by construction. PHASE 2 (rows pending): least-squares
+  fit of credit constants C against the provider % series, with the 10-03
+  06:46Z wall as a boundary anchor; peer's daemon-restart-pending poller
+  adds their X share when live.
 
 OWNER DECISION ITEM (TOS, both machines): personal plans prohibit account
 sharing; two-machine single-key is policy-gray. Weeks of clean concurrent
 operation with official-client fingerprints on both sides = no active
-enforcement observed. Reject the report's "serialize all requests"
-mitigation (destroys the bilateral architecture; unsupported by lived
-experience). Options: status-quo + 1313/1316 watch, separate plan for peer,
-or Team plan. Tyler's call.
+enforcement observed (zero 1308 since 10-03, zero 1313 ever). Reject the
+report's "serialize all requests" mitigation (destroys the bilateral
+architecture; unsupported by lived experience). Options: status-quo +
+1308/1313 watch, separate plan for peer, or Team plan. Tyler's call.
 
 PASSIVE TESTS RUNNING: peak inflection at 06:00Z today (Mon) — row climb
-rate before/after; reset behavior at 09:10:44Z.
+rate before/after (baseline +3.4/10min pre-peak); reset behavior at
+09:10:44Z. Peer status: 24.2 port landed (46d95e3, merged our side f1cadbc,
+236/236, pushed) but their daemon restart pending (in-memory queue drop
+risk) — no local series their side yet.
