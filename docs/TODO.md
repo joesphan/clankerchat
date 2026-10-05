@@ -1058,6 +1058,41 @@ Peer note: findings generalize to their daemon's relay framing; brief
 DEFERRED past 10:00Z (peak window 06-10Z = 1x burn — bias lane-spawning
 communication off-peak).
 
+## Round 27 — tripwire on the phone, phase-2 fit tool, token line (2026-10-05)
+
+Owner ask: "continue working any other improvements we can do?" — three
+peak-window-safe improvements (all zero-prompt, local), shipped 41b5de4 →
+53006b2 → 7044b47, 246/246, all deployed by drift-revive:
+
+- **27a — provider-quota tripwire on the phone card** (41b5de4): the
+  round-25 tripwire's `quota_alarm` flag now rides /machine `alerts` —
+  same red ⚠ surface as doctor/journal/audit lines, no app change
+  needed. Source + 160-char detail + HH:MM Z stamp (a lingering alarm
+  reads with its age, never as "happening now"); string-guarded,
+  malformed flags drop silently. End-to-end: watcher stderr scan →
+  journal + notice + card line, one deduped path per hour.
+- **27b — `npm run quota-fit`** (53006b2, tools/quota-fit.mjs + 8 tests):
+  phase 2 of the calibration. DELTA regression of provider q_pct on our
+  token-class sums (both windows age out over the same rolling 5h →
+  deltas linear, peer's constant share lands in the intercept);
+  free-weight fit settles the report-#2 (cache=25%) vs #3 (10%)
+  contradiction from our own rows; constrained fits give implied CAP per
+  weighting; reset_at discontinuities excluded from the fit and reported
+  as the drain natural experiment. Two test-design lessons baked in:
+  synthetic deltas must vary INDEPENDENTLY (affine-in-i deltas make the
+  whole design rank-2), and live rows stamp `at` not `ts`. Self-flags
+  PROVISIONAL under 10 pairs or unstable signs — the current 6-pair fit
+  correctly refuses to print quotable constants.
+- **27c — 5h token line on the phone** (7044b47): token_window serves
+  through /machine as numbers (null-honest pre-sweep), the MACHINE card
+  renders `5h tokens: 22.5M in · 606.7M cached · 5.0k msgs · glm-5.3:…`.
+  Bundle marker tok-window-v14.
+
+Pending on data, not code: rows accumulate every ~10min sweep; the fit
+turns quotable at ≥10 steady pairs; the 09:10:44Z reset_at read settles
+fixed-vs-rolling (error-text forensics already say rolling); peer brief
+on rounds 25-27 deferred past 10:00Z (peak window).
+
 ## Round 25 — Gemini deep-research #2 verdicts (GLM quota mechanics, 2026-10-05)
 
 CONFIRMED (cross-validated against local telemetry):
