@@ -831,6 +831,7 @@ interface Job {
   triggerId: string; // id of the Discord message that triggered this job
   skipWake?: boolean; // fallback run: route cwd only, never wake
   noCoalesce?: boolean; // a distinct event (ask decision) — never superseded by a same-author re-send
+  deliveryClass?: "ask-decision" | "auto-approval" | "phone-prompt"; // delivery-safety (A1 mirror): decided/claimed records — ALWAYS admitted, even past MAX_QUEUE. A cap-drop here strands the record: registry says decided/delivered, no run ever fires.
   phonePrompt?: { id: string; anchorId: string }; // round 5: promptId riding to the exit stamp; anchor = newest root message at claim time, the posted-check reference
   canary?: string; // round 6: this run's leak tripwire, kept past runClaude for the exit-hook excerpt recheck
   images?: PickedAttachment[]; // fork 8dfb5c1: trigger carried pickable image attachments — descriptions ride, files never do
@@ -1425,13 +1426,25 @@ async function dispatch(job: Job): Promise<void> {
 }
 
 function enqueue(job: Job): void {
-  if (queue.length >= MAX_QUEUE) {
+  // A1 mirror: delivery-class jobs (a decided ask, a claimed phone prompt) ride
+  // PAST the cap — their record already says decided/claimed, so a drop here is
+  // a silent eviction of a delivery the registry vouched for. Everything else
+  // is refused at cap, and refused LOUDLY: a dropped trigger must not read as
+  // death (same law as the circuit breaker).
+  if (queue.length >= MAX_QUEUE && !job.deliveryClass) {
     log(`queue full — dropping prompt from ${job.from} in "${job.threadName}"`);
     // A claimed phone prompt can never run — stamp it failed now, or its chip
     // hangs on "enqueued" forever (the TTL rot only takes pending records).
     if (job.phonePrompt) finishPrompt(askSpool(), job.phonePrompt.id, { exit: 1, posted: false });
+    void sendToThread(
+      job.threadId,
+      `queue full (backlog ${queue.length}) — this trigger was NOT run. Re-send once the backlog drains.`,
+    ).catch((err) => log(`queue-full notice failed in "${job.threadName}": ${errText(err)}`));
     writeWatcherState(); // queue changed (a drop is a change)
     return;
+  }
+  if (job.deliveryClass && queue.length >= MAX_QUEUE) {
+    log(`queue full but ${job.deliveryClass} admitted anyway (ask/class record already claimed) — backlog ${queue.length + 1}`);
   }
   // Coalesce rapid re-sends from the same author in the same thread: the
   // newer prompt supersedes the still-queued older one (the 02:09
@@ -1929,6 +1942,14 @@ async function main(): Promise<void> {
       `mapped=[${Object.keys(config.threads).join(", ")}]; reposRoot=${config.reposRoot}; ` +
       `wake=${config.wake}; allow=${config.allow.join(",")}; fullAuto=${config.fullAuto}; EVENT-DRIVEN (gateway)`,
   );
+
+  // Discord presence (the green-dot "Playing ..." status). Bots cannot set a
+  // custom profile STATUS line (user-account endpoint, 403 for bots) — the
+  // bot-equivalent is presence activity + online status.
+  me.user.setPresence({
+    status: "online",
+    activities: [{ name: "the overseer — tag = task", type: 0 }], // ActivityType.Playing
+  });
 
   // Slash tree (fork 3e8c6ab): guild-scoped bulk overwrite, idempotent per
   // boot. Members only SEE the commands once the app carries the
@@ -2497,6 +2518,7 @@ async function enqueueAskDecision(rec: AskRecord, clickerName: string): Promise<
     fromBot: false,
     triggerId: rec.messageId ?? rec.askId,
     noCoalesce: true,
+    deliveryClass: "ask-decision", // A1: the click already decided the record — this run IS the delivery
   });
 }
 
@@ -2529,6 +2551,7 @@ async function enqueueAutoApproval(rec: AskRecord): Promise<void> {
     fromBot: true,
     triggerId: rec.messageId ?? rec.askId,
     noCoalesce: true,
+    deliveryClass: "auto-approval", // A1: sweepExpiredAsks already flipped the record approved — a drop would strand it
   });
 }
 
@@ -2561,6 +2584,7 @@ async function enqueueCompanionDecision(rec: AskRecord, name: string): Promise<v
     fromBot: false,
     triggerId: rec.messageId ?? rec.askId,
     noCoalesce: true,
+    deliveryClass: "ask-decision", // A1: stampAskEnqueued already claimed delivery — a cap-drop would make the registry lie
   });
 }
 
@@ -2660,6 +2684,10 @@ async function sweepAskCountdowns(): Promise<void> {
       const ch = await client.channels.fetch(rec.channelId, { cache: false });
       if (!(ch instanceof ThreadChannel) && !(ch instanceof TextChannel)) continue;
       const msg = await ch.messages.fetch(rec.messageId);
+      // A3 mirror: the two fetches above can straddle a decision — re-read the
+      // registry so a tick never decorates a card that was decided mid-sweep
+      // (a "⏳ Xm left" over a terminal card reads as a resurrected wait).
+      if (getAsk(askSpool(), rec.askId)?.status !== "pending") continue;
       if (isAskV2Message(msg.components)) {
         const clock = askClockLine(rec);
         if (clock === null) continue;
@@ -2763,6 +2791,7 @@ async function enqueuePhonePrompt(rec: PromptRecord, parent: TextChannel | NewsC
     fromBot: false,
     triggerId: anchorId,
     noCoalesce: true,
+    deliveryClass: "phone-prompt", // A1: the claim already moved the record out of pending — it must run
     phonePrompt: { id: rec.promptId, anchorId },
   });
 }
