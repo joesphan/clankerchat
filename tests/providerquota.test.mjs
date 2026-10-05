@@ -80,6 +80,11 @@ test("describeResetEvent: fired reset classifies emptied vs partial, boot never 
   // unparseable resetAt (vendor shape drift) = non-event, never a NaN jump (r28 L6)
   assert.equal(describeResetEvent(snap(46, "2026-10-05T09:10:44.917Z"), snap(3, "not-a-date")), null);
   assert.equal(describeResetEvent(snap(46, "not-a-date"), snap(3, "2026-10-05T14:10:44.917Z")), null);
+  // anchor SLIDE (minutes per poll) = non-event, both directions: real fires are
+  // +5h, and a sliding vendor must not turn every 10-min poll into a journal +
+  // phone event flood (r28 L7). Sub-hour q changes still ride the history rows.
+  assert.equal(describeResetEvent(snap(46, "2026-10-05T14:10:44.917Z"), snap(45, "2026-10-05T14:28:44.917Z")), null, "18-min forward slide");
+  assert.equal(describeResetEvent(snap(46, "2026-10-05T14:10:44.917Z"), snap(44, "2026-10-05T13:52:44.917Z")), null, "18-min backward slide");
 });
 
 test("resetEventLine: facts + quick read, HH:MM Z anchors", () => {
@@ -87,7 +92,8 @@ test("resetEventLine: facts + quick read, HH:MM Z anchors", () => {
   assert.equal(line, "5h window reset 09:10Z→14:10Z (+5.0h): q_pct 46→3 — window emptied (fixed-anchor behavior)");
   const partial = resetEventLine(describeResetEvent({ pct5h: 46, resetAt: "2026-10-05T09:10:44.917Z" }, { pct5h: 38, resetAt: "2026-10-05T14:10:44.917Z" }));
   assert.match(partial, /partial drain \(rolling behavior\)/);
-  // backwards jump prints a clean sign, never "+-0.3h" (r28 L6)
-  const back = resetEventLine(describeResetEvent({ pct5h: 46, resetAt: "2026-10-05T14:10:44.917Z" }, { pct5h: 44, resetAt: "2026-10-05T13:52:44.917Z" }));
-  assert.match(back, /\(-0\.3h\)/);
+  // backwards jump prints a clean sign, never "+-1.7h" (r28 L6). Jump must
+  // clear the L7 min-jump gate, so the sign arm pins at -1.7h, not -0.3h.
+  const back = resetEventLine(describeResetEvent({ pct5h: 46, resetAt: "2026-10-05T14:10:44.917Z" }, { pct5h: 44, resetAt: "2026-10-05T12:28:44.917Z" }));
+  assert.match(back, /\(-1\.7h\)/);
 });

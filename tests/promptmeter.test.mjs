@@ -66,6 +66,22 @@ test("counts user turns, excludes tool_result and sidechain, window-filters", as
   assert.equal(s.hot, false);
 });
 
+test("serializer-shape tolerance: spaced JSON counts exactly like compact (r28 L8)", async () => {
+  const root = tmpRoot();
+  // A JSON writer change (`"type": "user"` with a space) must not zero the
+  // meter: the substring fast-path accepts both shapes; JSON.parse stays the
+  // semantic gate either way.
+  const spacedUser = userLine(IN).replace('"type":"user"', '"type": "user"');
+  const spacedSidechain = sidechainLine(IN).replace('"type":"user"', '"type": "user"');
+  const spacedUsage = usageLine(IN, { input_tokens: 100, output_tokens: 10 }).replace('"type":"assistant"', '"type": "assistant"');
+  writeProj(root, "-home-tyler-app", { "a.jsonl": [spacedUser, spacedSidechain, spacedUsage] });
+  const s = await scanPromptUsage({ projectsRoot: root, now: NOW, cap: 100 });
+  assert.equal(s.turns, 1, "spaced user line still counted as a turn");
+  assert.equal(s.sidechain, 1, "spaced sidechain still separated");
+  const t = await scanTokenUsage({ projectsRoot: root, now: NOW });
+  assert.equal(t.total.input, 100, "spaced assistant usage still metered");
+});
+
 test("mtime filter: a file not touched in the window is never opened", async () => {
   const root = tmpRoot();
   writeProj(root, "-old", { "stale.jsonl": [userLine(IN)] });
