@@ -987,3 +987,41 @@ Calibration PRELIMINARY (first paired rows, 2026-10-05 05:02Z→05:12Z):
 Peer note: findings generalize to their machine (shared plan). Brief them
 with round 24 once experiments land — one consolidated cite, not a relay of
 the whole report.
+
+## Round 25 — Gemini deep-research #2 verdicts (GLM quota mechanics, 2026-10-05)
+
+CONFIRMED (cross-validated against local telemetry):
+- Peak window Mon-Fri 14:00-18:00 SGT == 06:00-10:00 UTC — matches the prior
+  report's claim EXACTLY; promptmeter's `peak` flag (round 24) already flags
+  this window, so it was wired right by luck. Credits 1x peak / 0.5x off-peak
+  (off-peak = double capacity). Bias heavy rounds outside weekday 06-10Z.
+- 5h window is ROLLING (docs: "resets 5 hours after consumption"). Our
+  reset_at readings (stable until oldest entry exits) fit. The 09:10:44Z
+  discriminator becomes a confirmation exercise.
+- Token-class weighting: cache ≈ 25% of fresh-input cost. Cache warmth is
+  the economic lever; compaction breaks cache AND re-bills — the compact
+  tax compounds. "1600 prompts" = marketing abstraction (1 prompt ≈ 15-20
+  model invocations); no server-side prompt counter exists.
+- Error semantics: 1316 = 5h pool exhausted (hard 429); 1313 = fair-use
+  violation. Neither ever observed on this account.
+
+NOT RECONCILED (do NOT wire these constants):
+- Absolutes from the report (28,000 credits/5h, 140k/week, multipliers
+  6.9/1.7/24 ÷10k) contradict observed burn: they imply 5-50x our measured
+  %-climb per estimated token volume, and our limits payload contains NO
+  weekly limit object (only 5h TOKENS_LIMIT + monthly MCP TIME_LIMIT).
+  Shape true, constants unverified. Round-25 candidate: token-class-aware
+  local meter (sum per-message usage fields from transcripts → predicted
+  credits → least-squares fit against provider % series) — pure fs, zero
+  prompts, settles every constant empirically.
+
+OWNER DECISION ITEM (TOS, both machines): personal plans prohibit account
+sharing; two-machine single-key is policy-gray. Weeks of clean concurrent
+operation with official-client fingerprints on both sides = no active
+enforcement observed. Reject the report's "serialize all requests"
+mitigation (destroys the bilateral architecture; unsupported by lived
+experience). Options: status-quo + 1313/1316 watch, separate plan for peer,
+or Team plan. Tyler's call.
+
+PASSIVE TESTS RUNNING: peak inflection at 06:00Z today (Mon) — row climb
+rate before/after; reset behavior at 09:10:44Z.
