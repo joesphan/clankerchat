@@ -52,8 +52,18 @@ export interface MsgCacheRecord {
 
 export interface MsgCache {
   record(m: MsgCacheRecord): void;
+  /** True when this channel already has cache coverage established (rows
+   *  held, or a boot-seed floor recorded). Only the coverage-establishing
+   *  writer — the gateway feed — makes it true; a process holding a lone
+   *  message for a channel it returns false for must NOT record (a single
+   *  row would fabricate a contiguous-from-MIN claim that hides every
+   *  other author's messages behind a "covered" read). */
+  established(channelId: string): boolean;
   edit(id: string, content: string, editedAtMs: number): void;
   remove(id: string): void;
+  /** Delete every cached row for a channel (quarantine purge — a venue
+   *  blocked after the fact must not stay searchable). Returns rows gone. */
+  purgeChannel(channelId: string): number;
   /** Raise-only gap floor (snowflake): a saturated boot-replay window
    *  proves a hole below the oldest held message; reads under it use REST.
    *  Ordinary coverage is NOT this — it derives from MIN(cached id) in
@@ -64,7 +74,15 @@ export interface MsgCache {
   covers(channelId: string, after: string | undefined, limit: number): boolean;
   /** REST `after`-semantics: ids numerically > after, newest `limit`, ascending out. */
   list(channelId: string, after: string | undefined, limit: number): MsgCacheRow[];
-  search(q: { text: string; channelId?: string; sinceMs?: number; limit?: number }): MsgCacheRow[];
+  search(q: {
+    text: string;
+    channelId?: string;
+    /** Restrict to this channel set (project-mode allowlist scoping —
+     *  an unlocked search must not sweep other instances' threads). */
+    channelIds?: string[];
+    sinceMs?: number;
+    limit?: number;
+  }): MsgCacheRow[];
   prune(olderThanMs: number): number;
   close(): void;
 }
@@ -157,6 +175,25 @@ function buildMsgCache(dbPath: string): MsgCache | null {
         );
       });
     },
+    established(channelId: string): boolean {
+      try {
+        // Rows held OR a boot-seed floor — either one means the feed has
+        // staked out where coverage genuinely starts.
+        const row = db.prepare("SELECT 1 AS one FROM messages WHERE channel_id = ? LIMIT 1").get(String(channelId));
+        if (row) return true;
+        const floor = db.prepare("SELECT 1 AS one FROM floors WHERE channel_id = ?").get(String(channelId));
+        return Boolean(floor);
+      } catch {
+        return false;
+      }
+    },
+    purgeChannel(channelId: string): number {
+      try {
+        return db.prepare("DELETE FROM messages WHERE channel_id = ?").run(String(channelId)).changes as number;
+      } catch {
+        return 0;
+      }
+    },
     edit(id: string, content: string, editedAtMs: number): void {
       quiet(() => {
         db.prepare("UPDATE messages SET content = ?, edited_at = ? WHERE id = ?").run(
@@ -186,6 +223,11 @@ function buildMsgCache(dbPath: string): MsgCache | null {
     },
     covers(channelId: string, after: string | undefined, limit: number): boolean {
       try {
+        // DELIBERATE DIVERGENCE FROM REST (audit r22/F5c): writer gates
+        // withhold quarantined per-message ids inside in-scope channels, so
+        // a covered fast-path read can return fewer messages than REST
+        // would for the same window. That is the silence law winning over
+        // byte-parity — forbidden content is never re-surfaced by the cache.
         // Contiguous coverage starts at the OLDEST row we hold (fresh caches
         // start mid-history — absence of a floor row must NOT read as "full
         // history"; a read below the oldest cached id falls back to REST).
@@ -234,7 +276,7 @@ function buildMsgCache(dbPath: string): MsgCache | null {
         return [];
       }
     },
-    search(q: { text: string; channelId?: string; sinceMs?: number; limit?: number }): MsgCacheRow[] {
+    search(q: { text: string; channelId?: string; channelIds?: string[]; sinceMs?: number; limit?: number }): MsgCacheRow[] {
       try {
         // LIKE is case-insensitive for ASCII by default; % and _ are escaped
         // so a literal "50%" query doesn't widen into a wildcard.
@@ -244,6 +286,10 @@ function buildMsgCache(dbPath: string): MsgCache | null {
         if (q.channelId) {
           conds.push("channel_id = ?");
           params.push(String(q.channelId));
+        }
+        if (q.channelIds && q.channelIds.length > 0) {
+          conds.push(`channel_id IN (${q.channelIds.map(() => "?").join(",")})`);
+          params.push(...q.channelIds.map((c) => String(c)));
         }
         if (q.sinceMs !== undefined) {
           conds.push("created_at >= ?");
