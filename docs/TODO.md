@@ -129,8 +129,11 @@ react-native) — mine them before designing.
   and rots honestly at 30 min; gap + fix shape reported in lane receipt
   1791136610681-e4f97a, live probe pmroute0002 sent 17:57Z. Phase 2
   (peer index view) deferred until routing shows real use.
-- [ ] Watcher-side own-post noise meter: count own posts per thread per hour, journal
-  a NOISE line past a threshold — enforcement visibility for the quiet-discord law.
+- [x] ~~Watcher-side own-post noise meter: count own posts per thread per hour, journal
+  a NOISE line past a threshold — enforcement visibility for the quiet-discord law.~~
+  SHIPPED 2026-10-04 (countOwnPost at the sendToThread chokepoint, rolling 1h
+  window, one journal NOISE line per thread per hour — see the round record
+  below; this checkbox was stale).
 
 ## Done (strike-through recent)
 
@@ -678,3 +681,38 @@ Merge authority: Joe's YOLO (muuifi9v, API-verified 00:27:27Z) covered the
 (dc55bb2) rides that standing authority. Lazy-consensus asks are REVOKED
 permanently (Tyler: "SILENCE COUNTS AS A YES… dont let that happen again")
 — every ask fails closed; expiry = expire, never approve.
+
+## Round 20 — lazy-consensus revocation made mechanical (2026-10-05, ea26425)
+
+Trigger: owner phone prompt "Continue working on feature improvements"
+(pmtbehcgaao). The revocation was behavioral only — the lib still accepted
+on_expiry:"approve" and enforcement depended on every spawn remembering the
+law. Laws on this stack converge to code (identity law → tripwires,
+mass-mention law → findMassMentions, quarantine → watcher gates); this was
+the last owner law enforced purely by behavior.
+
+- src/asks.ts: `lazyConsensusRefused()` + `LAZY_CONSENSUS_REFUSAL`, env-gated
+  CLANKER_NO_LAZY_CONSENSUS=1 (default off — the shared lib stays
+  upstream-shaped for peers who haven't revoked; the peer was already
+  recommended to mirror the revocation). createPendingAsk refuses at the
+  chokepoint BEFORE mkdir/write: every minting surface (MCP ask tool, daemon
+  paths, scripts) funnels through it.
+- src/index.ts: the MCP ask tool refuses BEFORE channel.send. Ordering
+  matters: the handler posts the card first, then mints the registry entry —
+  a lib-only refusal would orphan a live "silence counts as yes" card with
+  no sweep machinery behind it (clicks hit "ask not found", buttons die only
+  on first tap). The pre-send check is the layer that makes the orphan
+  impossible; the chokepoint is the layer that covers every other surface.
+  on_expiry describe names the refusal so spawns compose fail-closed the
+  first time.
+- Machine wiring (not in repo): orchestrator .mcp.json env
+  CLANKER_NO_LAZY_CONSENSUS=1 (backup .bak-20261005-lazy) — read per-spawn,
+  live with zero restarts. Orchestrator CLAUDE.md lazy-consensus section
+  rewritten to REVOKED + mechanically enforced.
+- Grandfathering: zero pending lazy asks in the live registry at deploy.
+- Tests: +2 (refusal precedes side effects incl. directory creation;
+  fail-closed default unaffected; env-unset upstream mint preserved).
+  209/209.
+
+Peer note: default-off on merge — zero behavior change their side unless
+they set the env, which the standing mirror recommendation already covers.
