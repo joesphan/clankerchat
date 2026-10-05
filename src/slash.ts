@@ -110,6 +110,9 @@ export interface StatusFacts {
   /** Prompt-budget one-liner (promptmeter.promptsLine) — plan bills by
    *  prompt count (owner 2026-10-05); absent until the first meter sweep. */
   promptsLine?: string;
+  /** Provider 5h-quota one-liner (vendor monitor API, round 24.2) — the
+   *  near-real-time ground truth beside the local proxy; absent pre-poll. */
+  quotaLine?: string;
   /** Peer machine's last-run time (ISO), relayed by the lane heartbeat —
    *  multi-machine prompts phase 0 on the Discord card. Null-honest: no
    *  fresh lane facts (never probed, peer down) renders NO line rather than
@@ -148,6 +151,7 @@ export function renderStatusCard(f: StatusFacts): string {
   );
   if (f.servicesLine) lines.push(noMention(f.servicesLine));
   if (f.promptsLine) lines.push(noMention(f.promptsLine));
+  if (f.quotaLine) lines.push(noMention(f.quotaLine));
   // Peer recency line (phase 0): only when the heartbeat delivered a
   // parseable timestamp — absent, null, or garbage renders nothing, so the
   // card never claims peer freshness it doesn't have.

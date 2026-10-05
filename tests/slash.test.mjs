@@ -132,3 +132,23 @@ test("registerSlashCommands: one guild-scoped bulk overwrite carrying the spec",
   assert.deepEqual(calls[0].options.body, slashCommandSpec(), "registered body IS the spec");
   assert.deepEqual(out, []);
 });
+
+test("renderStatusCard: quotaLine renders when present, absent pre-poll (round 24.2)", () => {
+  const facts = {
+    bot: "fast-clank",
+    uptimeMs: 60_000,
+    active: 0,
+    maxConcurrent: 2,
+    queuedHuman: 0,
+    queuedBot: 0,
+    lastRunAgoMs: null,
+    spoolPending: 0,
+  };
+  const without = renderStatusCard(facts);
+  assert.doesNotMatch(without, /5h quota/, "no poll yet → no line, not a fake zero");
+  const with_ = renderStatusCard({ ...facts, quotaLine: "5h quota 10% (15770 calls/24h · 2373M tok)" });
+  assert.match(with_, /5h quota 10% \(15770 calls\/24h · 2373M tok\)/);
+  // Mention hygiene applies to the provider string like every other slot.
+  const evil = renderStatusCard({ ...facts, quotaLine: "5h quota @everyone%" });
+  assert.doesNotMatch(evil, /@everyone/);
+});
