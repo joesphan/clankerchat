@@ -25,6 +25,12 @@
 // - TRUNCATION IS RATE-LIMIT HYGIENE: input capped at 20k chars (≈5k tokens)
 //   so two concurrent T0 calls stay inside even free-tier 8K TPM; cached
 //   system prompt tokens don't count toward Groq rate limits.
+// - LENGTH-STOPPED OUTPUT IS A FRAGMENT, NEVER AN ANSWER: a completion that
+//   hit max_tokens is refused (code "truncated") so the caller escalates to
+//   the tier-1 spawn instead of posting half a sentence. Live incident
+//   2026-10-06 16:42Z: gpt-oss-120b spent its 300-token budget on hidden
+//   reasoning and surfaced a 215-char prompt-for-Joe cut mid-clause — which
+//   Joe was about to paste into his own Claude verbatim.
 
 export type T0Mode = "off" | "mock" | "live";
 
@@ -51,7 +57,14 @@ export interface T0Result {
 
 export class T0Refused extends Error {
   constructor(
-    public code: "mode-off" | "no-key" | "rate-limited" | "http-error" | "timeout" | "bad-shape",
+    public code:
+      | "mode-off"
+      | "no-key"
+      | "rate-limited"
+      | "http-error"
+      | "timeout"
+      | "bad-shape"
+      | "truncated",
     message: string,
   ) {
     super(message);
@@ -147,9 +160,16 @@ export async function t0Complete(c: T0Call): Promise<T0Result> {
       if (v) ratelimit[h] = v;
     }
     const body = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
+      choices?: { message?: { content?: string }; finish_reason?: string }[];
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
+    // Fragment gate (incident 2026-10-06 16:42Z): gpt-oss is a reasoning
+    // model — hidden reasoning tokens count against max_tokens, so a
+    // length-stopped answer is a mid-sentence cut, not a terse one. Refuse;
+    // the caller escalates to the tier-1 spawn, which answers for real.
+    const finish = body.choices?.[0]?.finish_reason ?? "stop";
+    if (finish === "length")
+      throw new T0Refused("truncated", `groq stopped at max_tokens (${MAX_OUT_TOKENS}) — incomplete generation refused, escalate to tier-1`);
     const text = body.choices?.[0]?.message?.content?.trim() ?? "";
     if (!text) throw new T0Refused("bad-shape", "groq returned no choice content");
     return { text, mode, model, usage: body.usage, ratelimit, took_ms: Date.now() - started, mock: false };
