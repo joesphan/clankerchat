@@ -1529,11 +1529,34 @@ function considerFetched(m: Message, botUser: User, threadName: string | null): 
     }
     return;
   }
-  const prompt = stripMention(m.content, botUser.id);
+  let prompt = stripMention(m.content, botUser.id);
+  // Text attachments (Discord converts >2000-char messages into message.txt)
+  // ARE the message text — download small text files and ride them inline.
+  // Only text/* content types, 64KB cap, one fetch each, never fatal.
+  const textAtts = plain.filter(
+    (a) =>
+      typeof a === "object" &&
+      a !== null &&
+      "filename" in a &&
+      /\.(txt|log|md|json|ya?ml|sh|py|js|ts|c|cpp|h)$/i.test(String(a.filename)) &&
+      Number(a.size) <= 65_536,
+  ) as { url: string; filename: string }[];
+  let textRode = "";
+  for (const ta of textAtts.slice(0, 2)) {
+    try {
+      const res = await fetch(ta.url, { signal: AbortSignal.timeout(15_000) });
+      if (res.ok) textRode += `\n\n--- attached ${ta.filename} ---\n${(await res.text()).slice(0, 60_000)}`;
+    } catch {
+      // attachment unreachable — the text-only trigger still rides
+    }
+  }
+  if (textRode && !prompt) {
+    prompt = `(message arrived as attachment${textAtts.length > 1 ? "s" : ""}; text below)`;
+  }
+  prompt += textRode;
   // Fork 8dfb5c1: an otherwise-eligible trigger with images but no text still
   // counts (owner ask: "read the image and determine if you need to step
   // in") — the sender gates above are unchanged, untagged randos stay silent.
-  const plain = plainAttachments(m);
   const carriesImages = imagesCarryTrigger({ attachments: plain });
   if (!prompt && !carriesImages) {
     log(`skip: trigger from ${m.author.username} in "${threadName ?? "(channel root)"}" had no text`);
