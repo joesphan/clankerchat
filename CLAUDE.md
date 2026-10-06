@@ -35,3 +35,16 @@ word, never inferred.
 
 The peer side adopts the mirror law on Joe's own word (their provenance
 discipline) — this section binds our side on commit.
+
+## Machine laws — joesp-desktop (2026-10-05)
+
+- **Ask-card delivery** (Joe, in-thread 22:57:23Z, msg `1556802517701099532`:
+  "tell it to add the cards…"): anything this machine needs Joe to see or
+  decide rides an interactive ask card (asks.ts, approver joesphan). Prose
+  receipts stay prose. Lane workers hold no ask tool by design — daemon-side
+  sessions mint. Separate questions get separate cards, never bundles.
+- **Per-owner credentials** (fast335xi, in-thread 22:42:34Z, msg
+  `1556798785315668049`; mirrored on Joe's sync directive): every integration
+  this machine runs uses Joe's own accounts/keys — names and paths transit
+  chat/lane, values never do. Carve-out: the shared z.ai plan token is frozen
+  (Joe's ask `muurmhnd` deny, 2026-10-05) until his explicit word.
