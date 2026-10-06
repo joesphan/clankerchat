@@ -17,7 +17,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { T0Refused, buildT0UserMsg, t0Complete, t0Mode } from "../dist/t0groq.js";
+import { T0Refused, buildT0UserMsg, t0Complete, t0Mode, T0_HANDOFF, isT0Handoff, SYSTEM_PROMPT } from "../dist/t0groq.js";
 
 const KEY_VARS = ["CLANKER_GROQ_API_KEY", "GROQ_API_KEY"];
 
@@ -131,4 +131,23 @@ test("live: finish_reason=stop passes through with text intact", async () => {
     assert.equal(r.mock, false);
   });
   globalThis.fetch = realFetch;
+});
+
+// Handoff law (incident 2026-10-06 17:04Z/17:20Z): the seat cannot route —
+// the old prompt had it CLAIM routing while the trigger died. Work class now
+// yields the sentinel; the send site escalates instead of posting.
+test("isT0Handoff: sentinel + legacy routing phrasing count, answers don't", () => {
+  assert.equal(isT0Handoff("[t0-handoff]"), true);
+  assert.equal(isT0Handoff(T0_HANDOFF), true);
+  assert.equal(isT0Handoff("Routing your request to the working session."), true);
+  assert.equal(isT0Handoff("routing this request to the working session"), true);
+  assert.equal(isT0Handoff("Routing the task to the working session."), true);
+  assert.equal(isT0Handoff("Got it."), false);
+  assert.equal(isT0Handoff("full answer"), false);
+  assert.equal(isT0Handoff(""), false);
+});
+
+test("system prompt: sentinel taught, routing claim gone (the seat can't route)", () => {
+  assert.ok(SYSTEM_PROMPT.includes(T0_HANDOFF));
+  assert.ok(!/routing it to the working session/i.test(SYSTEM_PROMPT));
 });
