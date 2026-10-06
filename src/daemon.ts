@@ -1510,7 +1510,7 @@ function drain(): void {
  *  path for the boot/relogin catch-ups, the resume-gap sweep, and the live
  *  gateway path (audit fix 5: those paths must agree, or a message one path
  *  skips the other re-processes). */
-function considerFetched(m: Message, botUser: User, threadName: string | null): void {
+async function considerFetched(m: Message, botUser: User, threadName: string | null): Promise<void> {
   if (m.webhookId) return; // B6: webhook spoof class never triggers (live-path rule, enforced on REST-fetched messages too)
   const tagged = isTrigger(m, botUser);
   const untagged = !tagged && isUntaggedThreadTrigger(m, botUser, threadName);
