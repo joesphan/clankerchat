@@ -26,9 +26,20 @@ Exception: a verify diff under active review is signal, not noise — read it.
   decide rides an interactive ask card (asks.ts, approver joesphan). Prose
   receipts stay prose. Lane workers hold no ask tool by design — daemon-side
   sessions mint. Separate questions get separate cards, never bundles.
-- **Per-owner credentials** (fast335xi, in-thread 22:42:34Z, msg
-  `1556798785315668049`; mirrored on Joe's sync directive): every integration
-  this machine runs uses Joe's own accounts/keys — names and paths transit
-  chat/lane, values never do. Carve-out: the shared z.ai plan token is frozen
-  (Joe's ask `muurmhnd` deny, 2026-10-05) until his explicit word.
 
+## Per-owner credentials law (owner-set 2026-10-05 22:42Z, msg 1556798785315668049)
+
+Every integration a machine runs — Spark gateway, Groq (tier-0 seat,
+groqscribe), and every coding-agent provider key — runs on THAT machine
+owner's own account and keys: Tyler's on tyler-cachy, Joe's on
+joesp-desktop. No shared, borrowed, or copied credentials across machines.
+Credential VALUES never transit Discord or the lane — key names, paths,
+and account ownership only; bot_file is not a credential channel.
+
+Known exception, same owner word: the coding-plan (Claude-shape) API key
+is shared by both machines and stays untouched on both for now — no swap,
+no rotation. Any change to that arrangement is Tyler's explicit future
+word, never inferred.
+
+The peer side adopts the mirror law on Joe's own word (their provenance
+discipline) — this section binds our side on commit.
