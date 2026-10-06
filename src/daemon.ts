@@ -1539,9 +1539,10 @@ async function considerFetched(m: Message, botUser: User, threadName: string | n
       typeof a === "object" &&
       a !== null &&
       "filename" in a &&
-      /\.(txt|log|md|json|ya?ml|sh|py|js|ts|c|cpp|h)$/i.test(String(a.filename)) &&
-      Number(a.size) <= 65_536,
-  ) as { url: string; filename: string }[];
+      "url" in a &&
+      /\.(txt|log|md|json|ya?ml|sh|py|js|ts|c|cpp|h)$/i.test(String((a as { filename?: string }).filename)) &&
+      Number((a as { size?: number }).size ?? 0) <= 65_536,
+  ) as unknown as { url: string; filename: string }[];
   let textRode = "";
   for (const ta of textAtts.slice(0, 2)) {
     try {
