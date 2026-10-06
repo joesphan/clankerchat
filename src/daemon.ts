@@ -1530,6 +1530,7 @@ function considerFetched(m: Message, botUser: User, threadName: string | null): 
     return;
   }
   let prompt = stripMention(m.content, botUser.id);
+  const plain = plainAttachments(m);
   // Text attachments (Discord converts >2000-char messages into message.txt)
   // ARE the message text — download small text files and ride them inline.
   // Only text/* content types, 64KB cap, one fetch each, never fatal.
