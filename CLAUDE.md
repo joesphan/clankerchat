@@ -45,5 +45,20 @@ is shared by both machines and stays untouched on both for now — no swap,
 no rotation. Any change to that arrangement is Tyler's explicit future
 word, never inferred.
 
+Scope ruling (Tyler, 2026-10-07, during the omp setup go): the shared
+z.ai token is the ONLY Tyler-owned credential the peer machine may use.
+Every other Tyler key — API, provider, service, any origin — is
+tyler-cachy-only: never copied to joesp-desktop, never wired into
+anything that runs there (omp included). Carried in go-inject
+`1791359464378-9992d0`.
+
+Plan priority (Tyler, 2026-10-07, lane note `1791360019222-e495d7`):
+Tyler holds primary priority on the shared z.ai plan; the peer machine
+is the secondary consumer and runs gentler (cheap-tier workhorse,
+usage-aware fallback on, waits on window reset instead of competing).
+Tyler's side keeps USE IT HARD with no conservation. Machine-level
+arrangement — not a Joe-facing thread item.
+
 The peer side adopts the mirror law on Joe's own word (their provenance
 discipline) — this section binds our side on commit.
+

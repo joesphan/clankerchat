@@ -59,8 +59,23 @@ export function sidecarAddress(sockPath: string): string {
 // the corruption class this rule exists to stop.
 const INVISIBLE = /[\u200B\u200C\u200D\u2060\u2063\uFEFF]/g;
 
+// Decision-hijacking phrases (JevAdvBench class, arXiv:2609.31142 — the
+// typed-decision analog holds for Laya): appended "expected label" or
+// observer-opinion text flipped ~12% of decisions and pushed ~38% of
+// confident-correct answers below routing thresholds — a DoS on the
+// cascade that forces spawns. Classifier state is UNTRUSTED Discord text,
+// so the phrases are stripped from the CLASSIFIER VIEW ONLY; the spawn
+// prompt keeps the raw text under its own UNTRUSTED_DATA law.
+const LABEL_INJECTION = [
+  /(?:expected|correct|intended|right)\s+(?:label|answer|option|choice|class)\b[^\n]*/gi,
+  /\bvalidation note\b[^\n]*/gi,
+  /\b(?:system|assistant|observer|annotator)\s+(?:note|says|said|label)\s*:?[^\n]*/gi,
+];
+
 export function sanitizeClassifierInput(text: string): string {
-  return text.replace(INVISIBLE, "").normalize("NFC");
+  let t = text.replace(INVISIBLE, "");
+  for (const re of LABEL_INJECTION) t = t.replace(re, " ");
+  return t.normalize("NFC");
 }
 
 // --- forced escalation (security + authority classes) ---------------------------
@@ -121,6 +136,29 @@ export interface LayaProbe {
 /** One NDJSON round-trip to the sidecar. Throws on connect/parse/timeout.
  * Default 5s: observed p95 1.7s under load (backtest 2026-10-05) — 2s was one
  * CPU spike from flap-failing to t1. Still trivially cheap next to a spawn. */
+// Calibration temperature (arXiv:2609.33843, preregistered): the shipped
+// laya-onnx checkpoint is uniformly UNDER-confident (signed confidence-
+// accuracy gap −0.214, ECE 0.204 out of the box) — the anomaly behind
+// short imperative work orders scoring in the chat half ("flash the usb"
+// p≈0.59). The study's disjointly fitted fix is softmax(z/0.469), dropping
+// ECE to 0.037. We re-derive the identical transform from probs
+// (softmax(ln(p)/T) ≡ softmax(z/T)). Default 1 = bit-for-bit today's
+// routing; CLANKER_LAYA_TEMP enables rescaling ONLY after our own backtest
+// shows the constant transfers to this domain's question schema — their
+// fit rode JevBench schemas, not ours.
+export function layaTemp(): number {
+  const t = Number(process.env.CLANKER_LAYA_TEMP);
+  return Number.isFinite(t) && t > 0 && t !== 1 ? t : 1;
+}
+
+function tempRescale(probs: number[], t: number): number[] {
+  const z = probs.map((p) => Math.log(Math.max(p, 1e-12)) / t);
+  const m = Math.max(...z); // max-shift keeps exp() in range
+  const e = z.map((v) => Math.exp(v - m));
+  const s = e.reduce((a, b) => a + b, 0);
+  return e.map((v) => v / s);
+}
+
 export function layaAsk(
   sockPath: string,
   payload: { text: string; question: string; options: string[] },
@@ -146,7 +184,8 @@ export function layaAsk(
         if (res.id !== id) return reject(new Error("laya sidecar id mismatch"));
         if (res.error) return reject(new Error(`laya sidecar: ${res.error}`));
         if (!Array.isArray(res.probs)) return reject(new Error("laya sidecar: no probs"));
-        resolve({ probs: res.probs, took_ms: Number(res.took_ms) || 0 });
+        const t = layaTemp();
+        resolve({ probs: t === 1 ? res.probs : tempRescale(res.probs, t), took_ms: Number(res.took_ms) || 0 });
       } catch (e) {
         reject(e instanceof Error ? e : new Error(String(e)));
       }
@@ -225,7 +264,11 @@ export async function decideTier0(i: Tier0Input, opts: { sockPath: string }): Pr
     // Disagreement veto (see TAU_LO comment): a task-verb hint blocks t0
     // unless the classifier is CONFIDENTLY chat. hint is the full heuristic
     // reason; only the task-verb shape vetoes (inconclusive never does).
-    const vetoed = hint === "heuristic:task-verb" && pTask >= TAU_LO;
+    // The tag marks the veto as LOAD-BEARING: at p ≥ τ_hi the band is t1
+    // on the probability alone, so the tag there is provenance noise (and
+    // would poison ledger analysis — "+task-veto" must mean "the veto
+    // flipped this band", nothing else).
+    const vetoed = hint === "heuristic:task-verb" && pTask >= TAU_LO && pTask < TAU_HI;
     return {
       band: pTask >= TAU_HI || vetoed ? "t1" : "t0",
       reason: `laya:p=${pTask.toFixed(3)}${vetoed ? "+task-veto" : ""}`,

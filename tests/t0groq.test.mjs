@@ -17,7 +17,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { T0Refused, buildT0UserMsg, t0Complete, t0Mode } from "../dist/t0groq.js";
+import { T0Refused, buildT0UserMsg, t0Complete, t0Mode, T0_HANDOFF, isT0Handoff, SYSTEM_PROMPT } from "../dist/t0groq.js";
 
 const KEY_VARS = ["CLANKER_GROQ_API_KEY", "GROQ_API_KEY"];
 
@@ -89,4 +89,65 @@ test("context and trigger both ride the user message", () => {
   const msg = buildT0UserMsg({ trigger: "what do you think", history: ["earlier: foo", "then: bar"], where: "epicNode" });
   assert.ok(msg.includes("earlier: foo"));
   assert.ok(msg.includes("what do you think"));
+});
+
+// Fragment gate (incident 2026-10-06 16:42Z): a length-stopped generation is
+// refused with code "truncated" — the caller escalates to tier-1 instead of
+// posting a mid-sentence cut. Live path exercised with an injected fetch —
+// still zero network.
+function fakeGroq(choicesBody) {
+  return async () => ({
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    json: async () => choicesBody,
+  });
+}
+
+test("live: finish_reason=length refuses (truncated) — a fragment is never an answer", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = fakeGroq({
+    choices: [{ message: { content: "Here's a concise prompt you can feed Claude on your Ciaserver:\n\n> \"Summarize" }, finish_reason: "length" }],
+    usage: { prompt_tokens: 400, completion_tokens: 300 },
+  });
+  await withEnv({ CLANKER_T0_MODE: "live", CLANKER_GROQ_API_KEY: "test-key" }, async () => {
+    await assert.rejects(
+      t0Complete({ trigger: "give me a prompt" }),
+      (e) => e instanceof T0Refused && e.code === "truncated",
+    );
+  });
+  globalThis.fetch = realFetch;
+});
+
+test("live: finish_reason=stop passes through with text intact", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = fakeGroq({
+    choices: [{ message: { content: "  full answer  " }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 10, completion_tokens: 5 },
+  });
+  await withEnv({ CLANKER_T0_MODE: "live", CLANKER_GROQ_API_KEY: "test-key" }, async () => {
+    const r = await t0Complete({ trigger: "hi" });
+    assert.equal(r.text, "full answer");
+    assert.equal(r.mock, false);
+  });
+  globalThis.fetch = realFetch;
+});
+
+// Handoff law (incident 2026-10-06 17:04Z/17:20Z): the seat cannot route —
+// the old prompt had it CLAIM routing while the trigger died. Work class now
+// yields the sentinel; the send site escalates instead of posting.
+test("isT0Handoff: sentinel + legacy routing phrasing count, answers don't", () => {
+  assert.equal(isT0Handoff("[t0-handoff]"), true);
+  assert.equal(isT0Handoff(T0_HANDOFF), true);
+  assert.equal(isT0Handoff("Routing your request to the working session."), true);
+  assert.equal(isT0Handoff("routing this request to the working session"), true);
+  assert.equal(isT0Handoff("Routing the task to the working session."), true);
+  assert.equal(isT0Handoff("Got it."), false);
+  assert.equal(isT0Handoff("full answer"), false);
+  assert.equal(isT0Handoff(""), false);
+});
+
+test("system prompt: sentinel taught, routing claim gone (the seat can't route)", () => {
+  assert.ok(SYSTEM_PROMPT.includes(T0_HANDOFF));
+  assert.ok(!/routing it to the working session/i.test(SYSTEM_PROMPT));
 });
