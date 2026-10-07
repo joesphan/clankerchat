@@ -1,8 +1,9 @@
 @echo off
 rem botlink serve launcher — started by Task Scheduler (clankerchat-botlink).
-rem Retries the bind: at boot the Tailscale interface may not be up yet.
+rem Loopback bind since the mesh retired: the cloudflared connector targets
+rem tcp://localhost:47421 (inbound leg via lane-peer.rapidracing.us).
 cd /d C:\Users\joesp\Documents\GitHub\clankerchat
-set CLANKER_BOTLINK_LISTEN=100.64.0.4:47421
+set CLANKER_BOTLINK_LISTEN=127.0.0.1:47421
 set CLANKER_BOTLINK_HOST_KEY=botlink-keys\host_key
 set CLANKER_BOTLINK_AUTHORIZED_KEYS=botlink-keys\authorized_keys
 set CLANKER_BOTLINK_SPOOL=botlink-spool
