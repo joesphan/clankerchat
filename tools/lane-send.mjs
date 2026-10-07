@@ -18,15 +18,17 @@ const opt = (name) => {
   return i >= 0 ? argv[i + 1] : undefined;
 };
 
-const envUrl = fs.readFileSync(path.join(ROOT, ".env"), "utf8")
-  .match(/^CLANKER_BOTLINK_PEER_HOSTKEY=(.+)$/m)?.[1]?.trim();
+const envFile = fs.readFileSync(path.join(ROOT, ".env"), "utf8");
+const envOf = (key) =>
+  process.env[key] ??
+  envFile.match(new RegExp(`^${key}=(.+)$`, "m"))?.[1]?.trim();
 
 const peer = {
-  host: process.env.CLANKER_BOTLINK_PEER_HOST ?? "100.64.0.1",
-  port: Number(process.env.CLANKER_BOTLINK_PEER_PORT ?? 47421),
+  host: envOf("CLANKER_BOTLINK_PEER_HOST") ?? "100.64.0.1",
+  port: Number(envOf("CLANKER_BOTLINK_PEER_PORT") ?? 47421),
   user: process.env.CLANKER_BOTLINK_USER ?? "clanker",
   privateKeyPem: fs.readFileSync(path.join(ROOT, "botlink-keys", "bot_key"), "utf8"),
-  expectedHostKey: process.env.CLANKER_BOTLINK_PEER_HOSTKEY ?? envUrl,
+  expectedHostKey: envOf("CLANKER_BOTLINK_PEER_HOSTKEY"),
 };
 
 const text = opt("text");
