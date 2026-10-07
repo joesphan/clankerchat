@@ -128,9 +128,21 @@ export function heuristicBand(text: string): { band: "t0" | "t1"; reason: string
 
 // --- sidecar client -------------------------------------------------------------
 
+/** Sidecar blend telemetry (present only when the sidecar runs a lexicon,
+ * 2026-10-07+). veto_path=true means probs carry p_laya verbatim — the
+ * disagreement veto's behavior is preserved bit-for-bit; false means probs
+ * carry the blended score. p_laya/s_lex let the shadow ledger backtest both
+ * scores against outcomes regardless of which one routed. */
+export interface LayaBlend {
+  veto_path: boolean;
+  p_laya: number;
+  s_lex: number;
+}
+
 export interface LayaProbe {
   probs: number[]; // aligned with the options array sent
   took_ms: number;
+  blended?: LayaBlend;
 }
 
 /** One NDJSON round-trip to the sidecar. Throws on connect/parse/timeout.
@@ -185,7 +197,20 @@ export function layaAsk(
         if (res.error) return reject(new Error(`laya sidecar: ${res.error}`));
         if (!Array.isArray(res.probs)) return reject(new Error("laya sidecar: no probs"));
         const t = layaTemp();
-        resolve({ probs: t === 1 ? res.probs : tempRescale(res.probs, t), took_ms: Number(res.took_ms) || 0 });
+        // blended passes through validated-but-opaque: it is telemetry for
+        // the ledger, never an input to routing — a malformed field must
+        // not fail a decision whose probs are fine.
+        const b = res.blended;
+        const blended =
+          b && typeof b === "object" &&
+          typeof b.veto_path === "boolean" && Number.isFinite(b.p_laya) && Number.isFinite(b.s_lex)
+            ? { veto_path: b.veto_path, p_laya: b.p_laya, s_lex: b.s_lex }
+            : undefined;
+        resolve({
+          probs: t === 1 ? res.probs : tempRescale(res.probs, t),
+          took_ms: Number(res.took_ms) || 0,
+          ...(blended ? { blended } : {}),
+        });
       } catch (e) {
         reject(e instanceof Error ? e : new Error(String(e)));
       }
@@ -236,6 +261,7 @@ export interface Tier0Decision {
   confident?: boolean; // τ_lo marker for the ledger
   latencyMs?: number;
   hint?: string; // heuristic band, logged even when Laya decides
+  blended?: LayaBlend; // sidecar blend telemetry (present only under a lexicon sidecar)
 }
 
 export const TIER0_QUESTION =
@@ -277,6 +303,7 @@ export async function decideTier0(i: Tier0Input, opts: { sockPath: string }): Pr
       confident: pTask < TAU_LO,
       latencyMs: probe.took_ms,
       hint,
+      ...(probe.blended ? { blended: probe.blended } : {}),
     };
   } catch {
     const fb = heuristicBand(clean);
