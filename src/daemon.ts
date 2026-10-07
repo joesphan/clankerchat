@@ -739,7 +739,7 @@ function mappedCwdFor(threadName: string): string | null {
 function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => void }): void {
   if (process.platform === "win32" && child.pid) {
     // shell:true spawns cmd.exe, so the real claude process is a child — kill the tree.
-    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
   } else {
     child.kill("SIGKILL");
   }
@@ -762,7 +762,9 @@ async function runClaude(
   timeoutMs: number,
 ): Promise<ClaudeRun> {
   return new Promise((resolve) => {
-    const child = spawn("claude", args, { cwd, shell: true });
+    // windowsHide: no console flash per worker/router/meta spawn (each was
+    // stealing focus from whatever Joe was typing in — 720+/day).
+    const child = spawn("claude", args, { cwd, shell: true, windowsHide: true });
     currentChild = child;
     children.add(child);
     let stdout = "";
