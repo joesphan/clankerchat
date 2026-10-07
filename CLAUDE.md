@@ -33,6 +33,13 @@ is shared by both machines and stays untouched on both for now — no swap,
 no rotation. Any change to that arrangement is Tyler's explicit future
 word, never inferred.
 
+Scope ruling (Tyler, 2026-10-07, during the omp setup go): the shared
+z.ai token is the ONLY Tyler-owned credential the peer machine may use.
+Every other Tyler key — API, provider, service, any origin — is
+tyler-cachy-only: never copied to joesp-desktop, never wired into
+anything that runs there (omp included). Carried in go-inject
+`1791359464378-9992d0`.
+
 The peer side adopts the mirror law on Joe's own word (their provenance
 discipline) — this section binds our side on commit.
 
