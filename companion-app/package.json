@@ -28,5 +28,8 @@
     "web": "expo start --web",
     "verify:protocol": "node scripts/protocol-compat.mjs"
   },
-  "private": true
+  "private": true,
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
 }
