@@ -203,6 +203,58 @@ test("threshold constants are the settled research bands", () => {
   assert.equal(TAU_LO, 0.3);
 });
 
+test("blended telemetry passes through to probe and decision; malformed never breaks routing", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tier0-blend-"));
+  const servers = [];
+  // fakeSidecar + an arbitrary extra response field (blended shape under test).
+  const blendSidecar = (sockPath, pTask, extra) => {
+    const server = net.createServer((conn) => {
+      let buf = "";
+      conn.on("data", (d) => {
+        buf += d.toString("utf8");
+        const nl = buf.indexOf("\n");
+        if (nl === -1) return;
+        const req = JSON.parse(buf.slice(0, nl));
+        buf = "";
+        conn.write(JSON.stringify({ id: req.id, probs: [pTask, 1 - pTask], took_ms: 5, ...(extra ?? {}) }) + "\n");
+      });
+    });
+    server.listen(sidecarAddress(sockPath));
+    servers.push(server);
+    return path.join(sockPath);
+  };
+  try {
+    // well-formed blended → carried verbatim onto probe AND decision
+    blendSidecar(path.join(dir, "ok.sock"), 0.08, {
+      blended: { veto_path: false, p_laya: 0.31, s_lex: 1.2044 },
+    });
+    const probe = await layaAsk(path.join(dir, "ok.sock"), { text: "x", question: TIER0_QUESTION, options: TIER0_OPTIONS });
+    assert.deepEqual(probe.blended, { veto_path: false, p_laya: 0.31, s_lex: 1.2044 });
+    const d = await decideTier0({ text: "hmm interesting" }, { sockPath: path.join(dir, "ok.sock") });
+    assert.deepEqual(d.blended, { veto_path: false, p_laya: 0.31, s_lex: 1.2044 });
+    assert.equal(d.band, "t0"); // blended p 0.08 < TAU_LO, no task verb
+
+    // malformed variants → dropped (telemetry must never fail a decision)
+    const bads = [{ veto_path: "yes", p_laya: 0.3, s_lex: 0.1 }, { veto_path: true }, { veto_path: true, p_laya: "0.3", s_lex: 0.1 }, null];
+    for (const [i, malformed] of bads.entries()) {
+      // one socket per sidecar: an assertion throw must never strand a listener
+      const sock = path.join(dir, `bad-${i}.sock`);
+      blendSidecar(sock, 0.5, { blended: malformed });
+      const r = await layaAsk(sock, { text: "x", question: TIER0_QUESTION, options: TIER0_OPTIONS });
+      assert.equal(r.blended, undefined, `expected drop for ${JSON.stringify(malformed)}`);
+      assert.equal(r.probs[0], 0.5);
+    }
+
+    // absent blended (pre-2026-10-07 sidecar shape) → undefined, no crash
+    blendSidecar(path.join(dir, "plain.sock"), 0.5);
+    const plain = await layaAsk(path.join(dir, "plain.sock"), { text: "x", question: TIER0_QUESTION, options: TIER0_OPTIONS });
+    assert.equal(plain.blended, undefined);
+  } finally {
+    for (const s of servers) s.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("calibration temperature rescales probs; default off is bit-for-bit", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tier0-temp-"));
   const srv = fakeSidecar(path.join(dir, "t.sock"), 0.59); // the "flash the usb" class
