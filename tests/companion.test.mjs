@@ -43,6 +43,11 @@ import {
   sasOfState,
   savePairingState,
 } from "../dist/pairing.js";
+// Lazy-consensus MECHANICS tests assert library capability (peer behavior);
+// the machine law CLANKER_NO_LAZY_CONSENSUS=1 would refuse every lazy mint —
+// the law-when-flagged is covered by the dedicated refusal tests. Run unrevoked.
+delete process.env.CLANKER_NO_LAZY_CONSENSUS;
+
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "clanker-comp-"));
 

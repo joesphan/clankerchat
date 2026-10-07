@@ -45,8 +45,12 @@ import crypto from "node:crypto";
  *  filesystem-unfriendly characters are stripped. */
 export function sidecarAddress(sockPath: string): string {
   if (process.platform !== "win32") return sockPath;
-  const name = path.basename(sockPath).replace(/[^a-zA-Z0-9_-]/g, "");
-  const tag = crypto.createHash("sha256").update(sockPath).digest("hex").slice(0, 8);
+  // Normalize before deriving: the same endpoint may reach the two ends with
+  // mixed separators (path.join backslashes vs template-literal forward
+  // slashes) — without this they hash to DIFFERENT pipes and never meet.
+  const norm = path.normalize(sockPath);
+  const name = path.basename(norm).replace(/[^a-zA-Z0-9_-]/g, "");
+  const tag = crypto.createHash("sha256").update(norm).digest("hex").slice(0, 8);
   return `\\\\.\\pipe\\cc-laya-${name}-${tag}`;
 }
 
