@@ -1,0 +1,5 @@
+﻿2026-10-04T10:53:24.8809355-07:00 watcher armed: daemon=15940 consumer=9888 deadline=10/04/2026 12:23:24
+2026-10-04T10:59:49.5443715-07:00 daemon idle - killed verified PID tree 15940; relaunching
+2026-10-04T10:59:52.6400545-07:00 daemon relaunched detached (routed-prompt sweep wiring live)
+2026-10-04T11:09:30.4981037-07:00 consumer PID 9888 gone or mismatched - wrapper will have respawned it from the edited file; consumer half done
+2026-10-04T11:09:30.5014772-07:00 watcher exit: daemonDone=True consumerDone=True

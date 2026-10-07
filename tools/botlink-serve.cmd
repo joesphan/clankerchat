@@ -7,6 +7,9 @@ set CLANKER_BOTLINK_HOST_KEY=botlink-keys\host_key
 set CLANKER_BOTLINK_AUTHORIZED_KEYS=botlink-keys\authorized_keys
 set CLANKER_BOTLINK_SPOOL=botlink-spool
 set CLANKER_BOTLINK_NAME=joesp-desktop
+rem Drift guard OFF at boot (round-15 law): this launcher treats exit 0 as done,
+rem so an armed guard (exit 0 on dist change) would drop the lane silently.
+set CLANKER_BOTLINK_DRIFT_GUARD=0
 set /a tries=0
 :loop
 "C:\Program Files\nodejs\node.exe" dist\botlink-server.js serve
