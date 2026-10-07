@@ -31,6 +31,24 @@
 // - FAIL-SAFE DELEGATE: every error path degrades to t1 (spawn as today).
 
 import net from "node:net";
+import path from "node:path";
+import crypto from "node:crypto";
+
+/** Windows transport shim (2026-10-05): AF_UNIX listen()/connect() on a
+ *  filesystem socket path refuses on win32 (EACCES) — the 3/272 r29 audit
+ *  fails. Node's named pipes are the native equivalent there. EVERY end of
+ *  the sidecar contract (the real listener, layaAsk's client, the test
+ *  fakeSidecar) must derive its address through this helper so both sides
+ *  always meet on the same name; POSIX passes through untouched, so the
+ *  unix-socket contract outside Windows is byte-identical. The sha256 tail
+ *  keeps distinct configured paths on distinct pipes even after the
+ *  filesystem-unfriendly characters are stripped. */
+export function sidecarAddress(sockPath: string): string {
+  if (process.platform !== "win32") return sockPath;
+  const name = path.basename(sockPath).replace(/[^a-zA-Z0-9_-]/g, "");
+  const tag = crypto.createHash("sha256").update(sockPath).digest("hex").slice(0, 8);
+  return `\\\\.\\pipe\\cc-laya-${name}-${tag}`;
+}
 
 // --- input sanitization --------------------------------------------------------
 
@@ -109,7 +127,7 @@ export function layaAsk(
   timeoutMs = 5_000,
 ): Promise<LayaProbe> {
   return new Promise((resolve, reject) => {
-    const sock = net.connect(sockPath);
+    const sock = net.connect(sidecarAddress(sockPath));
     const id = Math.random().toString(36).slice(2);
     let buf = "";
     const timer = setTimeout(() => {

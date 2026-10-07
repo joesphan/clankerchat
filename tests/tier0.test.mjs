@@ -30,6 +30,7 @@ import {
   forcedEscalationReason,
   heuristicBand,
   layaAsk,
+  sidecarAddress,
   sanitizeClassifierInput,
 } from "../dist/tier0.js";
 
@@ -98,7 +99,10 @@ function fakeSidecar(sockPath, pTask) {
       conn.write(JSON.stringify({ id: req.id, probs: [pTask, 1 - pTask], took_ms: 5 }) + "\n");
     });
   });
-  server.listen(sockPath);
+  // Same address derivation as layaAsk's client — on win32 both ends meet on
+  // a named pipe (AF_UNIX at a filesystem path refuses EACCES); POSIX is the
+  // untouched unix-socket contract.
+  server.listen(sidecarAddress(sockPath));
   return server;
 }
 
@@ -195,4 +199,14 @@ test("disagreement veto: task-verb hint blocks t0 unless Laya is confidently cha
 test("threshold constants are the settled research bands", () => {
   assert.equal(TAU_HI, 0.65);
   assert.equal(TAU_LO, 0.3);
+});
+
+test("sidecarAddress: win32 maps to a distinct named pipe; POSIX passes through byte-identical", () => {
+  const a = sidecarAddress("/tmp/laya-a.sock");
+  if (process.platform === "win32") {
+    assert.match(a, /^\\\\\.\\pipe\\cc-laya-/);
+    assert.notEqual(a, sidecarAddress("/tmp/laya-b.sock"), "distinct paths stay on distinct pipes");
+  } else {
+    assert.equal(a, "/tmp/laya-a.sock");
+  }
 });
