@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "clankerchat": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:\\Users\\joesp\\Documents\\GitHub\\clankerchat\\dist\\index.js"],
+      "env": {}
+    }
+  }
+}

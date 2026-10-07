@@ -14,15 +14,12 @@
  *          of the bot's messages mentions it automatically; an explicit
  *          @mention works too.
  *     Everything else is ignored; agents keep polling as usual.
- *   - A triggered message goes to a ROUTING stage: a small headless session
- *     with ListAgents/SendMessage that either wakes a matching live LOCAL
- *     session or picks the repo a worker should run in — the daemon.json
+ *   - A triggered message goes to a ROUTING stage (omp cutover 2026-10-07:
+ *     wake-a-live-session retired, `"wake": false`) — a small headless omp
+ *     run that picks the repo a worker should run in — the daemon.json
  *     `threads` map first, else inference over the folders under `reposRoot`.
- *     Successful inferences are written back to daemon.json (learned). A wake
- *     is only trusted if an answer lands in the thread within `wakeGraceMs`;
- *     otherwise the daemon spawns a worker fallback — an answer always lands.
- *     Set "wake": false to always spawn.
- *   - A worker is `claude -p` with the message piped on stdin, run in the
+ *     Successful inferences are written back to daemon.json (learned).
+ *   - A worker is `omp -p --mode json` with the message piped on stdin, run in the
  *     routed repo; it answers by calling the clankerchat MCP `send` tool
  *     itself — the daemon never parses or relays model output.
  *   - Workers are restricted by default: default permission mode plus an
@@ -128,15 +125,12 @@ const CONFIG_FILE = path.join(PROJECT_ROOT, "daemon.json");
 const STATE_FILE = path.join(PROJECT_ROOT, "daemon.state.json");
 const LOG_FILE = path.join(PROJECT_ROOT, "daemon.log");
 
-/** Workers may chat (all clankerchat tools) and read the repo — nothing else,
- *  unless daemon.json sets fullAuto. */
-const ALLOWED_TOOLS = [
-  "mcp__clankerchat__send",
-  "mcp__clankerchat__read",
-  "mcp__clankerchat__create_thread",
-  "mcp__clankerchat__list_threads",
-  "mcp__clankerchat__list_channels",
-];
+/** Workers run omp with the repo's clankerchat MCP mounted (project
+ * .mcp.json); daemon.json fullAuto switches omp to yolo approvals. */
+// Worker/router/meta agent = omp (full cutover 2026-10-07, Joe's card: Full
+// omp). Direct exe spawn — no shell, no cmd.exe layer, no console flash.
+const OMP_BIN =
+  process.env.OMP_BIN ?? "C:\\Users\\joesp\\Desktop\\omp-windows-x64.exe";
 
 // ---------------------------------------------------------------------------
 // Config + state
@@ -738,7 +732,7 @@ function mappedCwdFor(threadName: string): string | null {
 
 function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => void }): void {
   if (process.platform === "win32" && child.pid) {
-    // shell:true spawns cmd.exe, so the real claude process is a child — kill the tree.
+    // Direct omp spawn — tree-kill as a belt (grandchildren via MCP etc.).
     spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
   } else {
     child.kill("SIGKILL");
@@ -746,25 +740,25 @@ function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => void }): 
 }
 
 // ---------------------------------------------------------------------------
-// Headless claude plumbing — one spawn helper for router and workers
+// Headless omp plumbing — one spawn helper for router and workers
 // ---------------------------------------------------------------------------
 
-interface ClaudeRun {
+interface AgentRun {
   code: number | null;
   stdout: string;
   stderr: string;
 }
 
-async function runClaude(
+async function runOmp(
   args: string[],
   cwd: string,
   stdinText: string,
   timeoutMs: number,
-): Promise<ClaudeRun> {
+): Promise<AgentRun> {
   return new Promise((resolve) => {
     // windowsHide: no console flash per worker/router/meta spawn (each was
     // stealing focus from whatever Joe was typing in — 720+/day).
-    const child = spawn("claude", args, { cwd, shell: true, windowsHide: true });
+    const child = spawn(OMP_BIN, args, { cwd, windowsHide: true });
     currentChild = child;
     children.add(child);
     let stdout = "";
@@ -777,7 +771,7 @@ async function runClaude(
       if (stderr.length < MAX_STDERR) stderr += d.toString();
     });
     child.on("error", (err) => {
-      log(`spawn error: ${errText(err)} — is claude on PATH for this daemon?`);
+      log(`spawn error: ${errText(err)} — is omp present at ${OMP_BIN}?`);
       // Fork audit fix 4: 'error' can fire with no following 'close'
       // (ENOENT/EACCES — shell itself unspawnable). Settle now instead of
       // waiting out the hardFail net; settle-once finish() keeps a later
@@ -813,16 +807,30 @@ async function runClaude(
   });
 }
 
-/** Parses `claude -p --output-format json` output. */
+/** Parses `omp -p --mode json` NDJSON: session id from the session event,
+ *  result text from the LAST non-empty assistant message_end/turn_end. */
 function parseSessionResult(stdout: string): { sessionId?: string; result: string } {
-  const trimmed = stdout.trim();
-  try {
-    const parsed = JSON.parse(trimmed) as { session_id?: string; result?: string };
-    return { sessionId: parsed.session_id, result: parsed.result ?? "" };
-  } catch {
-    const m = /"session_id"\s*:\s*"([0-9a-f-]+)"/.exec(trimmed);
-    return { sessionId: m?.[1], result: "" };
+  let sessionId: string | undefined;
+  let result = "";
+  for (const line of stdout.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let j: unknown;
+    try {
+      j = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    const ev = j as { type?: string; id?: string; message?: { role?: string; content?: Array<{ text?: string }> } };
+    if (ev.type === "session" && typeof ev.id === "string") sessionId = ev.id;
+    if ((ev.type === "message_end" || ev.type === "turn_end") && ev.message?.role === "assistant") {
+      const text = (ev.message.content ?? [])
+        .map((c) => (typeof c.text === "string" ? c.text : ""))
+        .join("");
+      if (text) result = text; // last non-empty assistant text wins
+    }
   }
+  return { sessionId, result };
 }
 
 // ---------------------------------------------------------------------------
@@ -844,7 +852,7 @@ interface Job {
   noCoalesce?: boolean; // a distinct event (ask decision) — never superseded by a same-author re-send
   deliveryClass?: "ask-decision" | "auto-approval" | "phone-prompt"; // delivery-safety (A1 mirror): decided/claimed records — ALWAYS admitted, even past MAX_QUEUE. A cap-drop here strands the record: registry says decided/delivered, no run ever fires.
   phonePrompt?: { id: string; anchorId: string }; // round 5: promptId riding to the exit stamp; anchor = newest root message at claim time, the posted-check reference
-  canary?: string; // round 6: this run's leak tripwire, kept past runClaude for the exit-hook excerpt recheck
+  canary?: string; // round 6: this run's leak tripwire, kept past runOmp for the exit-hook excerpt recheck
   images?: PickedAttachment[]; // fork 8dfb5c1: trigger carried pickable image attachments — descriptions ride, files never do
 }
 
@@ -884,8 +892,7 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
     `Repo folders under ${config.reposRoot}: ${repoNames.join(", ") || "(none found)"}`,
     ``,
     `Steps:`,
-    `1. Call ListAgents once. If a LOCAL session (skip cloud/remote-control ones) clearly works on this exact project/thread AND is idle, wake it via SendMessage: "Overseer relay — answer in Discord thread '${job.threadName}' via mcp__clankerchat__send (sender '${name}'), starting the reply with the tag <@${job.fromId}> , max 30 words of prose (code blocks exempt), commands/paths in fenced code, then continue your work: ${job.prompt.slice(0, 500)}". Then set "woke" to that session's name.${job.rootChannel ? " (This job is a CHANNEL-ROOT post — do NOT wake; go straight to step 2 and reply woke=null.)" : ""}`,
-    `2. Otherwise pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals.`,
+    `1. Pick "cwd" for a worker — match where the TASK wants to run, not what the thread is about: the mapped path if given; else a repo folder ONLY when the task itself clearly targets that project (names it, or its files/paths clearly live in it). A task referencing paths outside every repo, or a generic disk/web/misc task, gets null — do NOT guess from the thread's topic. "confidence" is "high" only when the task explicitly names the project, "low" for weaker signals. (Wake-a-live-session is retired with the omp cutover — always reply "woke": null.)`,
     ``,
     job.untagged
       ? `This message was NOT tagged — the human just posted it in a project thread. If it is not an ask directed at this machine's agents (banter, acks like "ok"/"rebooted", humans talking to each other, FYIs), set "ignore": true and nothing else happens.`
@@ -896,17 +903,8 @@ function buildRouterPrompt(job: Job, mappedCwd: string | null): string {
 }
 
 async function runRouter(job: Job, mappedCwd: string | null): Promise<RouteDecision | null> {
-  const args = [
-    "-p",
-    "--output-format",
-    "json",
-    "--allowed-tools",
-    "ListAgents",
-    "SendMessage",
-    "--permission-mode",
-    "default",
-  ];
-  const run = await runClaude(args, config.reposRoot, buildRouterPrompt(job, mappedCwd), ROUTER_TIMEOUT_MS);
+  const args = ["-p", "--mode", "json"];
+  const run = await runOmp(args, config.reposRoot, buildRouterPrompt(job, mappedCwd), ROUTER_TIMEOUT_MS);
   if (run.code !== 0) {
     log(`router failed (exit ${run.code}): ${run.stderr.slice(0, 200)}`);
     return null;
@@ -1038,7 +1036,7 @@ function buildWorkerPrompt(
     sandboxed
       ? `Routing could not tell which project this task belongs to, so you are running in a neutral sandbox: ${cwd}. Do the task with general tools; touch other repos only if the task explicitly requires it.`
       : `Work in this repo: ${cwd}`,
-    `When done — or if you cannot or should not do the task — reply by calling the MCP tool mcp__clankerchat__send with sender "${name}" and ${replyTarget}. Keep the reply under 2000 chars; never paste secrets.`,
+    `When done — or if you cannot or should not do the task — reply by calling the MCP tool mcp__clankerchat_send with sender "${name}" and ${replyTarget}. Keep the reply under 2000 chars; never paste secrets.`,
     `Addressing rules (owner-set): only act on messages explicitly tagged for this machine — never respond to posts directed at other bots or humans. If you need something from another machine's bot, TAG it with mention markup and say you're waiting on its reply; don't passively watch threads.`,
     `Format for Discord: every command, path, snippet, or log excerpt goes in a fenced code block (triple backticks, language tag when known) or \`inline code\` — bare code gets mangled into goofy formatting by Discord markdown. HARD LIMIT: the reply is at most 30 words of prose, code blocks exempt — cut everything else, link or point at local files instead.`,
     `Your ONLY output channel is that thread: do not message, ping, or otherwise contact other sessions or processes on this machine — the human's interactive sessions must never be prompted because of you.`,
@@ -1126,8 +1124,8 @@ async function describeImages(paths: string[]): Promise<string[]> {
   const basenames = paths.map((p) => path.basename(p));
   const placeholders = basenames.map((b) => `(vision pre-pass produced no entry for ${b})`);
   try {
-    const run = await runClaude(
-      ["-p", "--strict-mcp-config", "--allowedTools", "Read"],
+    const run = await runOmp(
+      ["-p"],
       attachmentSpoolDir(),
       visionPassPrompt(paths),
       90_000,
@@ -1277,11 +1275,11 @@ async function metaSession(job: Job, question: string): Promise<void> {
     `--- meta question from ${job.from} ---`,
     question,
     ``,
-    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat__send with sender "${name}" and thread_name "${job.threadName}", starting with the tag <@${job.fromId}> then "overseer meta:". Never paste secrets. Format for Discord: commands/paths/snippets in fenced or inline code blocks — bare code gets mangled by Discord markdown. HARD LIMIT: 30 words of prose max, code blocks exempt.`,
+    `Answer in the "${job.threadName}" thread by calling mcp__clankerchat_send with sender "${name}" and thread_name "${job.threadName}", starting with the tag <@${job.fromId}> then "overseer meta:". Never paste secrets. Format for Discord: commands/paths/snippets in fenced or inline code blocks — bare code gets mangled by Discord markdown. HARD LIMIT: 30 words of prose max, code blocks exempt.`,
   ].join("\n");
-  const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS, "--permission-mode", "default"];
+  const args = ["-p", "--mode", "json"];
   const stopTyping = startTyping(job.threadId);
-  const run = await runClaude(args, PROJECT_ROOT, prompt, config.timeoutMs);
+  const run = await runOmp(args, PROJECT_ROOT, prompt, config.timeoutMs);
   stopTyping();
   const { result } = parseSessionResult(run.stdout);
   log(
@@ -1382,11 +1380,9 @@ async function dispatch(job: Job): Promise<void> {
     }
     if (!job.cwd && !sandboxed && routeConfidence === "high") rememberMapping(job.threadName, cwd);
 
-    const args = ["-p", "--output-format", "json", "--allowed-tools", ...ALLOWED_TOOLS];
+    const args = ["-p", "--mode", "json"];
     if (config.fullAuto) {
-      args.push("--dangerously-skip-permissions");
-    } else {
-      args.push("--permission-mode", "default");
+      args.push("--approval-mode", "yolo");
     }
     const sessionId = state.sessions[job.threadName];
     if (sessionId) args.push("--resume", sessionId);
@@ -1402,7 +1398,7 @@ async function dispatch(job: Job): Promise<void> {
     // line; the finish path deletes it so the answer supersedes it.
     const status = beginStatusLine(job.threadId, job.threadName);
     status.start();
-    const run = await runClaude(
+    const run = await runOmp(
       args,
       cwd,
       buildWorkerPrompt(job, cwd, sandboxed, canary, imageLines),
