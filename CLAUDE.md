@@ -26,6 +26,8 @@ Exception: a verify diff under active review is signal, not noise — read it.
   decide rides an interactive ask card (asks.ts, approver joesphan). Prose
   receipts stay prose. Lane workers hold no ask tool by design — daemon-side
   sessions mint. Separate questions get separate cards, never bundles.
+  Every card carries a one-line TLDR of what approve/deny means (Joe,
+  in-thread 18:05Z 2026-10-07: "always send you a card … with a tldr").
 
 ## Per-owner credentials law (owner-set 2026-10-05 22:42Z, msg 1556798785315668049)
 
