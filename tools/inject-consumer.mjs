@@ -79,6 +79,31 @@ function parseSessionId(out) {
   return null;
 }
 
+/** The model's OUTBOUND-FACING text: last non-empty assistant text in the
+ *  NDJSON stream. omp's stdout is the whole transcript — the user-message
+ *  echo and thinking blocks legitimately contain the canary-shaped prompt
+ *  (repro'd 2026-10-07), so only this slice is a leak signal. The own-post
+ *  scan (Discord side) stays the true outbound gate. */
+function finalText(out) {
+  let result = "";
+  for (const line of String(out).split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const j = JSON.parse(t);
+      const msg = j?.message;
+      if ((j?.type === "message_end" || j?.type === "turn_end") && msg?.role === "assistant") {
+        const text = (Array.isArray(msg.content) ? msg.content : [])
+          .filter((c) => c?.type === "text" && typeof c.text === "string")
+          .map((c) => c.text)
+          .join("");
+        if (text) result = text;
+      }
+    } catch { /* not this line */ }
+  }
+  return result;
+}
+
 function repoCwdFor(inj) {
   const want = inj.task?.repo;
   if (want) {
@@ -136,9 +161,11 @@ function runWorker(inj, cwd, resumeId) {
     child.on("close", (code) => {
       clearTimeout(kill);
       if (code !== 0) log(`worker FAILED exit ${code}${killed ? " (timeout kill)" : ""}: ${err.slice(0, 500) || out.slice(0, 300)}`);
-      // B5: the worker echoing its own tripwire in stdout/stderr is the cheapest
-      // leak signal — catches transforms/encodings no static signature list has.
-      resolve({ code, out, killed, canary, echoed: out.includes(canary) || err.includes(canary) });
+      // B5: the worker echoing its own tripwire in its REPLY text or stderr
+      // is the cheapest leak signal — catches transforms/encodings no static
+      // signature list has. Transcript echo (user message, thinking) is NOT
+      // a leak — omp streams those by design (see finalText).
+      resolve({ code, out, killed, canary, echoed: finalText(out).includes(canary) || err.includes(canary) });
     });
   });
 }
